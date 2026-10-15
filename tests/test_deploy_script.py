@@ -34,7 +34,13 @@ DOCKER_STUB = textwrap.dedent("""\
         case "$1" in
           up) [[ "${STUB_FAIL_UP_SHA:-}" == "$RELEASE_SHA" ]] && exit 1
               echo "$RELEASE_SHA" > "$STUB_DIR/running" ;;
-          ps) [[ -f "$STUB_DIR/db" ]] && echo abc123; exit 0 ;;
+          ps) if [[ "$*" == *--format* ]]; then
+                tag="${RELEASE_SHA}"; [[ -n "${STUB_WRONG_IMAGES:-}" ]] && tag=dev
+                for s in api discovery scheduler telegram migrate; do
+                  echo "internship-hunter-app:$tag"; done
+                for s in 1 2 3; do echo "internship-hunter-agent:$tag"; done
+                echo "redis:7-alpine"
+              else [[ -f "$STUB_DIR/db" ]] && echo abc123; fi; exit 0 ;;
           exec) [[ -n "${STUB_FAIL_DUMP:-}" ]] && exit 1; echo "-- sql dump" ;;
           *) exit 0 ;;
         esac ;;
@@ -274,3 +280,13 @@ def test_pruning_never_removes_current_or_previous(env):
         time.sleep(0.01)
     kept = {p.name for p in (env.base / "releases").iterdir()}
     assert shas[-1] in kept and shas[-2] in kept and len(kept) <= 6
+
+
+def test_stack_running_wrong_images_is_a_failed_deploy(env):
+    """Real-daemon finding: compose can silently fall back to a mutable tag if RELEASE_SHA
+    does not reach it. The script must verify what is actually running."""
+    assert env.deploy(SHA_A).returncode == 0
+    r = env.deploy(SHA_B, STUB_WRONG_IMAGES="1")
+    assert r.returncode == 1
+    assert "not running release" in r.stderr.decode()
+    assert env.current_link == SHA_A and env.state("current_sha") == SHA_A

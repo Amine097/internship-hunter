@@ -5,7 +5,7 @@ production host); **CI** = defined in GitHub Actions, *not yet executed* on GitH
 be done on the real server. Nothing marked S has been done.
 
 ## Code / CI
-- [x] **L** `ruff check .` clean; `pytest` 145 passed on Python 3.12 with real PostgreSQL 17 + Redis 7
+- [x] **L** `ruff check .` clean; `pytest` 149 passed on Python 3.12 with real PostgreSQL 17 + Redis 7
 - [ ] **CI** same on GitHub (`lint-test`, with `CI_REQUIRE_SERVICES=1` so nothing can skip)
 - [x] **L** `pip-audit` no known vulnerabilities; [ ] **CI**
 - [x] **L** gitleaks (2 commits) no leaks; [ ] **CI** full history
@@ -36,7 +36,11 @@ be done on the real server. Nothing marked S has been done.
 - [x] **L** rollback uses loaded images, never builds or loads
 - [x] **L** concurrent deploy refused; backup failure aborts before any change
 - [x] **L** rootful daemon refused
-- [ ] **L** one real (rootful, local) deploy + rollback with real images — see PR description
+- [x] **L** real signed bundles on a real (rootful, local, `HUNTER_ALLOW_ROOTFUL=1`) daemon:
+      deploy #1, deploy #2 with pg_dump backup, rollback, and a deliberately broken release
+      (restored automatically); running images verified to be the exact SHA tags
+- [x] **L** finding from that run: compose silently ran `:dev` images when `RELEASE_SHA` did
+      not reach it -> script now passes an env-file and verifies running images
 - [ ] **S** rootless Docker on the production host; real deploy, health check and rollback
 - [ ] **S** no inbound port 22 from the Internet; ACL limits `tag:ci` to `:22`
 

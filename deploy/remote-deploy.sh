@@ -23,9 +23,13 @@ die() { echo "deploy: $1" >&2; exit "${2:-1}"; }
 state() { echo "$BASE/state/$1"; }
 
 compose() { # compose <sha> <args...>
-  local sha="$1"; shift
+  # RELEASE_SHA is passed as an env-file *and* env var so no env-forwarding quirk can make
+  # compose fall back to a mutable tag (activate() additionally verifies what is running).
+  local sha="$1" relenv; shift
+  relenv="$BASE/state/release-$sha.env"
+  printf 'RELEASE_SHA=%s\n' "$sha" > "$relenv"
   (cd "$BASE/releases/$sha" && RELEASE_SHA="$sha" \
-     docker compose -p "$PROJECT" --env-file "$BASE/shared/.env" "$@")
+     docker compose -p "$PROJECT" --env-file "$BASE/shared/.env" --env-file "$relenv" "$@")
 }
 
 health_check() {
@@ -42,7 +46,19 @@ activate() { # activate <sha>: start (never build) the release, then verify heal
     || { echo "deploy: image internship-hunter-agent:$sha is not loaded" >&2; return 3; }
   compose "$sha" config -q || return 1
   compose "$sha" up -d --no-build --remove-orphans --wait --wait-timeout 300 || return 1
+  verify_running_images "$sha" || return 1
   health_check || return 1
+}
+
+verify_running_images() { # every first-party container must run exactly this release's images
+  local sha="$1" images bad n
+  images="$(compose "$sha" ps --format '{{.Image}}')" || return 1
+  bad="$(grep '^internship-hunter-' <<<"$images" | grep -v ":$sha\$" || true)"
+  n="$(grep -c "^internship-hunter-.*:$sha\$" <<<"$images" || true)"
+  if [[ -n "$bad" || "$n" -lt 7 ]]; then
+    echo "deploy: containers are not running release $sha (found: ${bad:-only $n matching})" >&2
+    return 1
+  fi
 }
 
 set_current() { ln -sfn "$BASE/releases/$1" "$BASE/current.new" && mv -Tf "$BASE/current.new" "$BASE/current"; }
