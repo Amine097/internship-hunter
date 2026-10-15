@@ -5,9 +5,27 @@ on:
   pull_request:
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  checks:
+  lint-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env: {POSTGRES_USER: test, POSTGRES_PASSWORD: test, POSTGRES_DB: hunter_test}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test" --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://test:test@localhost:5432/hunter_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,4 +35,70 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: pip install -e '.[dev]'
       - run: ruff check hunter tests
-      - run: pytest -q
+      - run: pytest -q -ra
+      - name: Redis service reachable
+        run: python -c "import redis; assert redis.Redis().ping()"
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install . pip-audit
+      - run: pip-audit --skip-editable
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: gitleaks (full history)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 \
+            detect --source /repo --redact --verbose
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose file with placeholder values
+        run: |
+          sed 's/REPLACE_WITH.*/ci-placeholder-value/' .env.example > ci.env
+          docker compose --env-file ci.env config -q
+          rm ci.env
+      - name: Lint Dockerfiles
+        run: |
+          docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 --ignore DL3013 - < docker/app.Dockerfile
+          docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 --ignore DL3013 --ignore DL3016 - < docker/agent.Dockerfile
+      - name: Build images (no push)
+        run: |
+          docker build -f docker/app.Dockerfile -t hunter-app:ci .
+          docker build -f docker/agent.Dockerfile -t hunter-agent:ci .
+      - name: Smoke-test the stack (demo mode, throwaway secrets)
+        run: |
+          {
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
+            echo "REDIS_PASSWORD=$(openssl rand -hex 24)"
+            echo "ADMIN_TOKEN=$(openssl rand -hex 24)"
+            echo "AGENT_MODE=demo"
+          } > .env
+          docker compose up -d --build --wait --wait-timeout 240
+          curl -fsS http://127.0.0.1:8000/health | grep '"submission_enabled":false'
+          curl -fsS http://127.0.0.1:8000/ready
+          TOKEN=$(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)
+          curl -fsS -H "X-Admin-Token: $TOKEN" http://127.0.0.1:8000/profiles | grep internship-summer-2027
+          curl -fsS -X POST -H "X-Admin-Token: $TOKEN" http://127.0.0.1:8000/scan/1
+          for i in $(seq 1 40); do
+            curl -fsS -H "X-Admin-Token: $TOKEN" http://127.0.0.1:8000/scans | grep -q '"state":"finished"' && break
+            sleep 3
+          done
+          curl -fsS -H "X-Admin-Token: $TOKEN" http://127.0.0.1:8000/scans | grep '"state":"finished"'
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=80
+      - if: always()
+        run: docker compose down -v

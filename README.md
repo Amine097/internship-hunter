@@ -22,13 +22,14 @@ Jobs and scan traces are persisted in PostgreSQL. RQ/Redis coordinates workloads
 
 ```bash
 cp .env.example .env
-python3 -c 'import secrets; print(secrets.token_urlsafe(40))' # password: paste in .env
-python3 -c 'import secrets; print(secrets.token_urlsafe(40))' # admin token: paste in .env
+# generate three independent values (Postgres, Redis, admin token) and paste into .env:
+for i in 1 2 3; do python3 -c 'import secrets; print(secrets.token_urlsafe(40))'; done
 # Set TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_ID; do NOT commit .env.
 docker compose config -q
 docker compose up -d --build
 docker compose ps
 curl -fsS http://127.0.0.1:8000/health
+curl -fsS http://127.0.0.1:8000/ready
 curl -fsS -H "X-Admin-Token: $(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)" \
   http://127.0.0.1:8000/profiles
 ```
@@ -36,13 +37,13 @@ curl -fsS -H "X-Admin-Token: $(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)" \
 If `docker compose config -q` reports an unset password, first update `.env`.
 Telegram: message `/profiles` and `/scan` to your bot in a **private chat**.
 The `POST /scan/{id}` endpoint queues one profile by numerical ID; `/scan` in
-Telegram queues **all enabled** profiles. Review `/scans`, `/jobs`, `/agents`.
+Telegram queues **all enabled** profiles. Review `/scans`, `/jobs`, `/agents` (also available as Telegram commands).
 
 ### Add permitted real job boards
 
 Update `config/sources.yaml` to list known Greenhouse board handles and Lever site
 handles. Board identifiers are obtained from the employer's own public job board.
-Restart the stack after updating. In V1 we intentionally do **not** automatically
+Config is baked into the image: redeploy (`docker compose up -d --build`) after updating. In V1 we intentionally do **not** automatically
 crawl job boards, Google, LinkedIn or Workday. No fabricated jobs appear.
 
 `/scan` verifies the three agents are invoked and tests ingestion from the list
@@ -72,7 +73,7 @@ When all three work:
 
 ```bash
 # edit .env: AGENT_MODE=cli
-docker compose up -d --force-recreate
+docker compose up -d --force-recreate   # unverified: see docs/deployment.md
 # /scan again in Telegram
 ```
 
@@ -83,16 +84,16 @@ runs; the orchestrator does not silently generate model results.
 ### Tests and CI
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
 ruff check hunter tests
-pytest -q
+pytest -q           # set TEST_DATABASE_URL to also run the PostgreSQL test
 ```
 
-CI (`.github/workflows/ci.yaml`) checks lint and unit tests, without secrets or
-paid model calls. **No deploy on push**: deployment to a home server needs a
-separate authenticated runner, approved later. Never expose SSH to the Internet.
+CI (`.github/workflows/ci.yaml`): lint, tests (PostgreSQL + Redis services), pip-audit,
+gitleaks, compose validation, hadolint, image builds, and a compose smoke test. No secrets or
+paid model calls. Deployment is a separate **manual** workflow over Tailscale; see
+`docs/deployment.md` and `docs/acceptance-checklist.md`. Never expose SSH to the Internet.
 
 ### Create your private GitHub repository
 
@@ -117,6 +118,7 @@ If your GitHub already has a repo called `internship-hunter`, use another name.
 ## Security notes
 
 - `.env`, volumes, account cookies and secrets must never be committed.
+- Redis requires a password; agents are on a network without PostgreSQL and receive no DB or admin credentials.
 - API is bound to `127.0.0.1:8000`, not exposed to the LAN / public Internet.
   Use SSH forwarding (`ssh -L 8000:127.0.0.1:8000 host`) or private Tailscale.
 - API requires `X-Admin-Token`. Bot accepts only `TELEGRAM_ALLOWED_USER_ID` in a private chat.
@@ -140,6 +142,6 @@ If your GitHub already has a repo called `internship-hunter`, use another name.
    appear with stable IDs and no duplicates upon repeated scans.
 7. CI runs unit tests without secrets and never submits a candidature.
 
-**Validation status**: source code and offline tests may be verified in the authoring
-container. Server/Docker/Telegram, internet ATS and CLI authorization checks require
-running on your hardware; they are not claimed to have been executed here.
+**Validation status**: unit/integration tests run against SQLite and fakeredis. Docker
+startup, PostgreSQL, real Telegram, internet ATS and CLI checks have *not* been executed
+(see `docs/acceptance-checklist.md`).

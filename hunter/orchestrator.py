@@ -26,9 +26,17 @@ def enqueue_scan(profile_id: int) -> int:
         db.add(scan)
         db.flush()
         scan_id = scan.id
-    Queue("discovery", connection=redis_connection()).enqueue(
-        run_scan, scan_id, job_timeout=300, result_ttl=3600,
-    )
+    try:
+        Queue("discovery", connection=redis_connection()).enqueue(
+            run_scan, scan_id, job_timeout=300, result_ttl=3600,
+        )
+    except Exception as exc:  # e.g. Redis down: never leave a phantom "queued" scan behind
+        with session_scope() as db:
+            scan = db.get(Scan, scan_id)
+            scan.state = "failed"
+            scan.error = f"enqueue failed: {type(exc).__name__}"
+            scan.finished_at = datetime.now(timezone.utc)
+        raise RuntimeError("Could not enqueue scan; is Redis reachable?") from exc
     return scan_id
 
 
@@ -68,6 +76,8 @@ def _run_scan(scan_id: int) -> dict:
             state = "finished"
         else:
             state = "failed" if rq_job.is_failed else "timeout"
+            if not rq_job.is_failed:
+                rq_job.cancel()  # do not let a late agent run pollute a later scan
             output = {"error": "Agent did not complete; inspect worker logs"}
         reports.append({"agent": agent, "state": state, "output": output})
 

@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -12,8 +13,7 @@ class Settings(BaseSettings):
     admin_token: str = ""
     telegram_bot_token: str = ""
     telegram_allowed_user_id: str = ""
-    agent_mode: str = "demo"
-    enable_fixtures: bool = False
+    agent_mode: Literal["demo", "cli"] = "demo"
     scan_cron: str = "0 7,13,20 * * *"
     tz: str = "Europe/Zurich"
     profiles_path: str = "config/search_profiles.yaml"

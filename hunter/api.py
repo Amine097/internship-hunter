@@ -2,14 +2,19 @@
 import secrets
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
+from hunter import orchestrator
 from hunter.db import session_scope
 from hunter.models import AgentRun, Application, Job, Scan, SearchProfile
 from hunter.orchestrator import enqueue_scan
+from hunter.policy import SUBMISSION_ENABLED
 from hunter.settings import get_settings
 
-app = FastAPI(title="Internship Hunter", version="0.1.0")
+app = FastAPI(
+    title="Internship Hunter", version="0.1.0",
+    docs_url=None, redoc_url=None, openapi_url=None,  # no unauthenticated schema
+)
 
 
 def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
@@ -23,7 +28,22 @@ def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "submission_enabled": False, "mode": get_settings().agent_mode}
+    return {
+        "status": "ok", "submission_enabled": SUBMISSION_ENABLED,
+        "mode": get_settings().agent_mode,
+    }
+
+
+@app.get("/ready")
+def ready():
+    """Dependency check for deploy smoke tests: PostgreSQL and Redis must both answer."""
+    try:
+        with session_scope() as db:
+            db.execute(text("SELECT 1"))
+        orchestrator.redis_connection().ping()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=type(exc).__name__) from exc
+    return {"status": "ready"}
 
 
 @app.get("/status", dependencies=[Depends(require_admin)])
@@ -34,7 +54,7 @@ def status():
             "jobs": db.scalar(select(func.count()).select_from(Job)),
             "scans": db.scalar(select(func.count()).select_from(Scan)),
             "applications": db.scalar(select(func.count()).select_from(Application)),
-            "submission_enabled": False,
+            "submission_enabled": SUBMISSION_ENABLED,
         }
 
 
@@ -83,4 +103,6 @@ def scan(profile_id: int):
         scan_id = enqueue_scan(profile_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"scan_id": scan_id, "state": "queued"}

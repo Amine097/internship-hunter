@@ -1,141 +1,164 @@
 name: internship-hunter
+
+# Network layout (credential / data isolation):
+#   data  -> postgres, migrate, api, discovery, scheduler, telegram
+#   queue -> redis, api, discovery, scheduler, telegram, agent-* (agents never see PostgreSQL)
+x-redis-url: &redis-url redis://:${REDIS_PASSWORD:?set_REDIS_PASSWORD}@redis:6379/0
 x-db-env: &db-env
   DATABASE_URL: postgresql+psycopg://hunter:${POSTGRES_PASSWORD:?set_POSTGRES_PASSWORD}@postgres:5432/hunter
-  REDIS_URL: redis://redis:6379/0
+  REDIS_URL: *redis-url
   PROFILES_PATH: /app/config/search_profiles.yaml
   SOURCES_PATH: /app/config/sources.yaml
+  AGENT_MODE: ${AGENT_MODE:-demo}
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 256
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
 x-app: &app
+  <<: *hardening
+  image: internship-hunter-app:local
   build:
     context: .
     dockerfile: docker/app.Dockerfile
-  environment: *db-env
+  mem_limit: 256m
+  cpus: 0.5
+  networks: [data, queue]
+x-agent: &agent
+  <<: *hardening
+  image: internship-hunter-agent:local
+  build:
+    context: .
+    dockerfile: docker/agent.Dockerfile
+  command: ["python", "-m", "hunter.worker"]
+  mem_limit: 768m
+  cpus: 1.0
+  networks: [queue]
   depends_on:
-    postgres:
-      condition: service_healthy
     redis:
       condition: service_healthy
-  restart: unless-stopped
 
 services:
   postgres:
     image: postgres:17-alpine
+    <<: *hardening
+    read_only: false            # postgres writes to its data dir and /var/run
+    cap_drop: []                # its entrypoint drops privileges itself
     environment:
       POSTGRES_USER: hunter
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set_POSTGRES_PASSWORD}
       POSTGRES_DB: hunter
     volumes: [postgres_data:/var/lib/postgresql/data]
+    networks: [data]
+    mem_limit: 512m
     healthcheck:
       test: [CMD-SHELL, "pg_isready -U hunter -d hunter"]
       interval: 5s
       timeout: 5s
       retries: 12
-    restart: unless-stopped
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    <<: *hardening
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\" --maxmemory 128mb --maxmemory-policy noeviction"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set_REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set_REDIS_PASSWORD}
     volumes: [redis_data:/data]
+    networks: [queue]
+    mem_limit: 192m
     healthcheck:
       test: [CMD, redis-cli, ping]
       interval: 5s
       retries: 10
-    restart: unless-stopped
   migrate:
     <<: *app
-    command: ["python", "-m", "hunter.db"]
     restart: "no"
+    command: ["python", "-m", "hunter.db"]
+    environment: *db-env
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
   api:
     <<: *app
+    command: ["uvicorn", "hunter.api:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       <<: *db-env
       ADMIN_TOKEN: ${ADMIN_TOKEN:?set_ADMIN_TOKEN}
-    command: ["uvicorn", "hunter.api:app", "--host", "0.0.0.0", "--port", "8000"]
-    ports: ["127.0.0.1:8000:8000"]
+    ports: ["127.0.0.1:8000:8000"]   # loopback only; reach it over Tailscale / SSH forward
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
       interval: 10s
       retries: 5
   discovery:
     <<: *app
     command: ["python", "-m", "hunter.worker"]
     environment:
-      DATABASE_URL: postgresql+psycopg://hunter:${POSTGRES_PASSWORD:?set_POSTGRES_PASSWORD}@postgres:5432/hunter
-      REDIS_URL: redis://redis:6379/0
-      PROFILES_PATH: /app/config/search_profiles.yaml
-      SOURCES_PATH: /app/config/sources.yaml
+      <<: *db-env
       HUNTER_QUEUE: discovery
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
   scheduler:
     <<: *app
+    command: ["python", "-m", "hunter.scheduler"]
     environment:
       <<: *db-env
       SCAN_CRON: ${SCAN_CRON:-0 7,13,20 * * *}
       TZ: ${TZ:-Europe/Zurich}
-    command: ["python", "-m", "hunter.scheduler"]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
   telegram:
     <<: *app
+    command: ["python", "-m", "hunter.telegram"]
     environment:
       <<: *db-env
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
-    command: ["python", "-m", "hunter.telegram"]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+  # Agents get only Redis + their own credential volume: no DB URL, no admin/Telegram tokens.
   agent-claude-1:
-    <<: *app
-    build:
-      context: .
-      dockerfile: docker/agent.Dockerfile
-    command: ["python", "-m", "hunter.worker"]
+    <<: *agent
     environment:
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: *redis-url
       HUNTER_QUEUE: claude-1
       HUNTER_AGENT_NAME: claude-1
       CLAUDE_CONFIG_DIR: /home/hunter/.claude
       AGENT_MODE: ${AGENT_MODE:-demo}
     volumes: [claude1_home:/home/hunter]
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
   agent-claude-2:
-    <<: *app
-    build:
-      context: .
-      dockerfile: docker/agent.Dockerfile
-    command: ["python", "-m", "hunter.worker"]
+    <<: *agent
     environment:
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: *redis-url
       HUNTER_QUEUE: claude-2
       HUNTER_AGENT_NAME: claude-2
       CLAUDE_CONFIG_DIR: /home/hunter/.claude
       AGENT_MODE: ${AGENT_MODE:-demo}
     volumes: [claude2_home:/home/hunter]
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
   agent-codex:
-    <<: *app
-    build:
-      context: .
-      dockerfile: docker/agent.Dockerfile
-    command: ["python", "-m", "hunter.worker"]
+    <<: *agent
     environment:
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: *redis-url
       HUNTER_QUEUE: codex
       HUNTER_AGENT_NAME: codex
+      CODEX_HOME: /home/hunter/.codex
       AGENT_MODE: ${AGENT_MODE:-demo}
     volumes: [codex_home:/home/hunter]
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
+
+networks:
+  data: {internal: true}
+  queue: {}
 volumes:
   postgres_data:
   redis_data:

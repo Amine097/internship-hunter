@@ -1,0 +1,63 @@
+# Manual production deploy over Tailscale. Never triggered by push.
+# Needs: GitHub environment "production" with required reviewers, and the secrets/variables
+# listed in docs/deployment.md. Nothing here is configured yet.
+name: Deploy (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA on main to deploy (full 40-char SHA)
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.v.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0, ref: main}
+      - id: v
+        env: {REF: "${{ inputs.ref }}"}
+        run: |
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "ref must be a full SHA"; exit 1; }
+          git merge-base --is-ancestor "$REF" origin/main || { echo "SHA is not on main"; exit 1; }
+          echo "sha=$REF" >> "$GITHUB_OUTPUT"
+      - name: Require a successful CI run for this SHA
+        env: {GH_TOKEN: "${{ github.token }}", SHA: "${{ steps.v.outputs.sha }}"}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/workflows/ci.yaml/runs?head_sha=$SHA&status=success" \
+            --jq '.total_count' | grep -vq '^0$' || { echo "no green CI run for $SHA"; exit 1; }
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: production        # manual approval gate lives here
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: "${{ needs.verify.outputs.sha }}"}
+      - uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+      - name: Prepare SSH (host key pinned, forced-command key)
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Ship release archive and deploy
+        env:
+          TARGET: ${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_TAILNET_HOST }}
+          SHA: ${{ needs.verify.outputs.sha }}
+        run: |
+          git archive --format=tar.gz "$SHA" | \
+            ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              "$TARGET" "deploy $SHA"
