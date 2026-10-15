@@ -14,7 +14,7 @@ def duration_decision(
     offered_min: int | None,
     offered_max: int | None,
 ) -> Decision:
-    if offered_min is None or offered_max is None:
+    if offered_min is None or offered_max is None or offered_min > offered_max:
         return "uncertain"
     if requested_min is None or requested_max is None:
         return "eligible"
@@ -37,6 +37,8 @@ def dates_decision(
         return "eligible"
     if offered_earliest is None and offered_latest is None:
         return "uncertain"
+    if offered_earliest and offered_latest and offered_earliest > offered_latest:
+        return "uncertain"  # reversed range is a data error, never a rejection
     low = offered_earliest or offered_latest
     high = offered_latest or offered_earliest
     if requested_latest is not None and low > requested_latest:

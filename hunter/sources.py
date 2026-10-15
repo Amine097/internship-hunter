@@ -1,6 +1,8 @@
 """Public ATS discovery only; no authentication, scraping bypass or submissions."""
 import hashlib
+import json
 import re
+import time
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -83,35 +85,59 @@ def _normalize(kind: str, token: str, job: dict) -> dict | None:
     }
 
 
+MAX_BODY_BYTES = 8 * 1024 * 1024
+
+
+def _get_json(client: httpx.Client, url: str):
+    """GET with a hard body cap, so a hostile or broken board cannot exhaust memory."""
+    with client.stream("GET", url) as response:
+        response.raise_for_status()
+        body = bytearray()
+        for chunk in response.iter_bytes():
+            body += chunk
+            if len(body) > MAX_BODY_BYTES:
+                raise ValueError("ATS response too large")
+    return json.loads(body)
+
+
 def fetch_source(source: dict, client: httpx.Client) -> list[dict]:
     kind = source["kind"]
     token = source["token"]
     if kind not in ("greenhouse", "lever") or not allowed_board_name(token):
         raise ValueError("Invalid source")
     if kind == "greenhouse":
-        response = client.get(
-            f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
+        data = _get_json(
+            client, f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
         )
-        response.raise_for_status()
-        postings = response.json().get("jobs", [])
+        postings = data.get("jobs", []) if isinstance(data, dict) else None
     else:
-        response = client.get(f"https://api.lever.co/v0/postings/{token}?mode=json")
-        response.raise_for_status()
-        postings = response.json()
+        postings = _get_json(client, f"https://api.lever.co/v0/postings/{token}?mode=json")
     if not isinstance(postings, list):
         raise ValueError("Unexpected ATS response shape")
     jobs = (_normalize(kind, token, p) for p in postings if isinstance(p, dict))
     return [j for j in jobs if j is not None]
 
 
-def fetch_all(sources: list[dict]) -> tuple[list[dict], list[str]]:
+def make_client(transport: httpx.BaseTransport | None = None) -> httpx.Client:
+    return httpx.Client(timeout=12.0, follow_redirects=False, transport=transport)
+
+
+def fetch_all(
+    sources: list[dict], deadline: float | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[list[dict], list[str]]:
+    """``deadline`` is a ``time.monotonic()`` value; later sources are skipped and reported."""
     found: dict[str, dict] = {}
     errors: list[str] = []
-    with httpx.Client(timeout=12.0, follow_redirects=False) as client:
+    with make_client(transport) as client:
         for source in sources:
+            label = f"{source.get('kind')}:{source.get('token')}"
+            if deadline is not None and time.monotonic() > deadline:
+                errors.append(f"{label}: skipped (scan deadline)")
+                continue
             try:
                 for job in fetch_source(source, client):
                     found[job["canonical_key"]] = job
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-                errors.append(f"{source.get('kind')}:{source.get('token')}: {type(exc).__name__}")
+                errors.append(f"{label}: {type(exc).__name__}")
     return list(found.values()), errors

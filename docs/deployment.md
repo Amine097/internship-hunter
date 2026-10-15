@@ -1,75 +1,108 @@
 # Deployment design (Tailscale, GitHub-hosted CI/CD)
 
-Status: **designed, not yet exercised.** No secrets are configured, nothing has been deployed,
-and `deploy.yaml` has never run. Treat every step below as unverified until the acceptance
-checklist (`docs/acceptance-checklist.md`) has been executed on the real server.
+Status: **designed and partly exercised, not enabled.** `deploy.yaml` is disabled until the
+repository variable `DEPLOY_ENABLED` is `true`, and has never run. The server-side script has
+been tested with stubbed Docker (`tests/test_deploy_script.py`) and once against a real local
+Docker daemon (see "Evidence" in the PR description). No secrets are configured.
 
 ## Principles
 
-- SSH is **never** published to the Internet. `sshd` listens on the Tailscale interface only
-  (or use Tailscale SSH); the router/firewall exposes no port 22.
+- SSH is **never** published to the Internet; `sshd` listens on the Tailscale interface only.
 - **No self-hosted runner** on the shared server. GitHub-hosted runners join the tailnet as an
-  ephemeral node tagged `tag:ci` for the duration of one deploy job.
-- The server holds **no GitHub credentials**. CI ships a `git archive` tarball of one verified
-  commit; the server never pulls.
-- The CI SSH key is a *forced command* key: it can run `deploy <sha>` or `rollback` and nothing
-  else (no shell, no port forwarding, no pty).
-- Developer agents (Claude Code / Codex on your workstation) get **no** access to the server,
-  the deploy key, or the Docker socket. The `agent-*` containers get no Docker socket either.
-- Production deploys are manual (`workflow_dispatch`), gated by a protected GitHub environment
-  with required reviewers, and only accept a SHA that is on `main` with a green CI run.
+  ephemeral `tag:ci` node for one job.
+- The server holds **no GitHub credentials** and **never builds**. CI builds images, tags them
+  by commit SHA, signs a manifest, and ships one bundle; the server verifies and loads it.
+- The SSH key is a *forced command* key: `deploy` (bundle on stdin) or `rollback`, nothing else.
+- **Two independent keys**: the SSH key (reaches the server) and the release-signing key
+  (authorises content). The server only trusts the signing key's public half
+  (`shared/allowed_signers`), so a stolen SSH key alone cannot deploy arbitrary code.
+- **Rootless Docker is mandatory** for the deploy user: the script refuses a rootful daemon
+  (exit 5). A docker-group member is root-equivalent on a shared host.
+- Developer agents (Claude Code/Codex on your workstation) get no server access, no deploy or
+  signing key, and no Docker socket. No container mounts the Docker socket.
+- Deploys are manual (`workflow_dispatch`) behind a protected `production` environment.
+
+## Bundle and verification
+
+`deploy/make-bundle.sh <sha> <key> out.tar` produces `manifest`, `manifest.sig`,
+`source.tar.gz` (`git archive`) and `images.tar.gz` (`docker save` of
+`internship-hunter-{app,agent}:<sha>`). `remote-deploy.sh` then:
+
+1. takes the deploy lock (`flock`; a concurrent deploy exits 4) and checks rootless Docker;
+2. caps the bundle size and accepts exactly the four expected members;
+3. verifies the SSH signature (`ssh-keygen -Y verify`, namespace `hunter-release`);
+4. parses the manifest strictly and verifies both SHA-256 hashes;
+5. refuses a validly signed but **older** bundle than the running release (replay/downgrade);
+6. rejects archives with absolute or `..` paths; unpacks to `releases/<sha>`;
+7. `docker load`s the images (never `build`);
+8. takes a `pg_dump` backup and aborts on failure, before any change;
+9. switches `current`, runs `compose up -d --no-build --wait`, then checks `/ready` and
+   `submission_enabled == false`;
+10. on **any** failure restores the previous release; on success records `current_sha` /
+    `previous_sha` and prunes old releases (never current or previous).
+
+`rollback` re-activates `previous_sha` from already-loaded images: no build, no network, no
+registry. It does not downgrade the database (see `docs/backup-restore.md`).
 
 ## Flow
 
 ```
-you -> Actions "Deploy (manual)" (input: full SHA)
-     -> verify: SHA ancestor of main, green ci.yaml run for that SHA
-     -> environment "production" approval
-     -> runner joins tailnet (tag:ci, ephemeral, OAuth client)
-     -> git archive | ssh hunter-deploy@<tailnet-host> "deploy <sha>"
-     -> forced command: unpack to releases/<sha>, switch `current`, compose up --wait,
-        check /ready and submission_enabled=false, prune old releases
+you -> Actions "Deploy (manual)" (action=deploy, ref=<full SHA>)
+     -> verify: run from main, SHA ancestor of main, green ci.yaml run for that SHA
+     -> build: images + signed bundle (secret RELEASE_SIGNING_KEY)
+     -> environment "production" approval (required reviewers)
+     -> runner joins tailnet (tag:ci) -> ssh hunter-deploy@host "deploy" < bundle.tar
 ```
-
-Rollback: run the same forced command with `rollback` (switches to `previous`).
 
 ## One-time server setup (manual, by you)
 
-1. Create an unprivileged user `hunter-deploy`. Preferred: give it **rootless Docker**
-   (`dockerd-rootless-setuptool.sh install`) so the deploy key is not root-equivalent. Adding a
-   user to the `docker` group is root-equivalent on a *shared* host and should be avoided.
-2. `mkdir -p /opt/internship-hunter/{releases,shared,deploy}`; install `deploy/remote-deploy.sh`
-   to `/opt/internship-hunter/deploy/` (root-owned, mode 755, **not** writable by the deploy
-   user, because it is the forced command).
-3. Create `/opt/internship-hunter/shared/.env` (mode 600, owner `hunter-deploy`) from
-   `.env.example` with three independent long random values. Never commit it.
-4. `~hunter-deploy/.ssh/authorized_keys`:
+1. User `hunter-deploy` with **rootless Docker** (`dockerd-rootless-setuptool.sh install`).
+2. `mkdir -p /opt/internship-hunter/{releases,state,staging,shared,backups,deploy}`; install
+   `deploy/remote-deploy.sh` into `/opt/internship-hunter/deploy/` **root-owned and not
+   writable by the deploy user** (it is the forced command).
+3. `shared/.env` (mode 600) from `.env.example`: **six** independent random values
+   (Postgres, Redis, admin, three agent tokens). Never commit it.
+4. `shared/allowed_signers`: `release ssh-ed25519 AAAA…` (public half of the signing key).
+   Generate with `ssh-keygen -t ed25519 -N '' -f release_signing_key`; keep the private half
+   only as the GitHub secret.
+5. `authorized_keys`:
    `restrict,command="/opt/internship-hunter/deploy/remote-deploy.sh" ssh-ed25519 AAAA… ci-deploy`
-5. Tailscale: tag the server `tag:hunter-prod`, create an OAuth client scoped to `tag:ci`.
-   ACL (only CI → deploy SSH, nothing else):
+6. Tailscale ACL: `tag:ci` may reach only `tag:hunter-prod:22`.
    ```json
    {"tagOwners": {"tag:ci": ["autogroup:admin"], "tag:hunter-prod": ["autogroup:admin"]},
     "acls": [{"action": "accept", "src": ["tag:ci"], "dst": ["tag:hunter-prod:22"]}]}
    ```
-6. Resource guard: the compose file caps each container (memory/CPU/pids); total budget is
-   ~3.5 GB of RAM. Check against the other Docker services on the host before first start.
+7. Resource budget: containers are capped at ~3.2 GB total (see `compose.yaml`); check it
+   against the other services on the host first.
 
 ## GitHub configuration (manual)
 
 | Kind | Name | Value |
 |---|---|---|
-| Environment | `production` | required reviewers, restrict to `main` |
+| Variable (repo) | `DEPLOY_ENABLED` | leave unset/`false` until the gates below pass |
+| Environment | `production` | required reviewers; **deployment branches: `main` only** |
 | Secret (env) | `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET` | Tailscale OAuth client for `tag:ci` |
-| Secret (env) | `DEPLOY_SSH_KEY` | private key of the forced-command key |
-| Secret (env) | `DEPLOY_KNOWN_HOSTS` | server host key line (pin it; do not TOFU) |
+| Secret (env) | `DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS` | forced-command key; pinned host key |
+| Secret (env) | `RELEASE_SIGNING_KEY` | private signing key (not the SSH key) |
 | Variable (env) | `DEPLOY_USER`, `DEPLOY_TAILNET_HOST` | `hunter-deploy`, MagicDNS name |
 
-Also enable branch protection on `main` (require the `CI` checks) and secret scanning.
+`workflow_dispatch` runs the workflow file of the *selected* branch; the environment's
+"main only" rule is what stops a branch-edited workflow from reaching the secrets.
+Also: branch protection on `main` requiring all CI jobs, and secret scanning.
+
+## Go-live gates (all must be true before setting `DEPLOY_ENABLED`)
+
+- [ ] CI is green on `main`, including the `docker` job (real daemon) and `lint-test`
+      without skips.
+- [ ] `docs/acceptance-checklist.md` server section executed on the real host.
+- [ ] Rootless Docker confirmed on the host; script refusal tested once.
+- [ ] Provider terms for unattended CLI use confirmed (otherwise stay in `AGENT_MODE=demo`).
+- [ ] Backup copied off-host once and `deploy/verify-restore.sh` run on the server.
+- [ ] Rollback rehearsed on the server with two real releases.
 
 ## Agent credentials
 
-Each agent has its own named volume and its own container; none sees the others' volume or
-the database. Log in once per container (interactive, from your own terminal):
+Log in once per container, interactively, from your own terminal:
 
 ```bash
 docker compose run --rm --no-deps -it agent-claude-1 claude
@@ -77,14 +110,11 @@ docker compose run --rm --no-deps -it agent-claude-2 claude
 docker compose run --rm --no-deps -it agent-codex codex login
 ```
 
-Do not switch to `AGENT_MODE=cli` until each subscription's terms allow unattended CLI use
-(the README flags this as unconfirmed) and the CLI flags used in `hunter/agents.py` have been
-smoke-tested against the pinned CLI versions in `docker/agent.Dockerfile`.
+Each login lands in that agent's own named volume. Do not switch to `AGENT_MODE=cli` before
+the provider terms are confirmed and the CLI flags in `hunter/agents.py` are smoke-tested.
 
 ## Known gaps
 
-- Redis is shared by all workers: an agent container could read other queues' payloads (search
-  profiles only; no secrets are enqueued). Per-agent Redis ACL users are a follow-up.
-- No lockfile / digest-pinned base images yet; no Alembic migrations (`create_all` only);
-  no backup/restore job; no alerting.
-- Config files are baked into the image, so editing `config/*.yaml` requires a redeploy.
+See "Threats considered and residual risk" in `docs/security-architecture.md`, plus:
+no dependency lockfile, no base-image digest pinning, no off-host backup, no alerting,
+and the per-release signing key has no rotation procedure yet.

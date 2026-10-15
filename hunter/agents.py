@@ -48,7 +48,7 @@ def parse_plan(raw: str, agent: str) -> dict:
     data = json.loads(fenced.group(1) if fenced else text)
     if not isinstance(data, dict) or not isinstance(data.get("queries"), list):
         raise ValueError("Agent must return a JSON object containing queries")
-    queries = [q[:160] for q in data["queries"] if isinstance(q, str) and q.strip()][:15]
+    queries = [q.strip()[:160] for q in data["queries"] if isinstance(q, str) and q.strip()][:15]
     return {"agent": agent, "mode": "cli", "queries": queries}
 
 
@@ -64,7 +64,7 @@ def run_plan(agent: str, profile: dict) -> dict:
         return demo_plan(agent, profile)
     if settings.agent_mode != "cli":
         raise ValueError("AGENT_MODE must be demo or cli")
-    if os.environ.get("HUNTER_AGENT_NAME") != agent:
+    if settings.hunter_agent_name != agent:
         raise ValueError("Agent cannot run using another worker's credentials")
 
     prompt = (
@@ -96,7 +96,3 @@ def run_plan(agent: str, profile: dict) -> dict:
             env=cli_env(),
         )
         return parse_plan(result_file.read_text(encoding="utf-8"), agent)
-
-
-def agent_task(agent: str, profile: dict) -> dict:
-    return run_plan(agent, profile)

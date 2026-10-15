@@ -7,11 +7,14 @@ permissions:
   contents: read
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # never cancel runs on main: every main SHA must be able to earn a green run to be deployable
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CI_REQUIRE_SERVICES: "1"   # tests that need PostgreSQL/Redis fail instead of skipping
 jobs:
   lint-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17-alpine
@@ -26,25 +29,34 @@ jobs:
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 12
     env:
       TEST_DATABASE_URL: postgresql+psycopg://test:test@localhost:5432/hunter_test
+      TEST_REDIS_URL: redis://localhost:6379/0
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
-          python-version: "3.12"
+          python-version: "3.12"        # same minor as docker/*.Dockerfile
           cache: pip
           cache-dependency-path: pyproject.toml
+      - run: python --version | grep -q '^Python 3\.12\.'
       - run: pip install -e '.[dev]'
-      - run: ruff check hunter tests
-      - run: pytest -q -ra
-      - name: Redis service reachable
-        run: python -c "import redis; assert redis.Redis().ping()"
+      - run: ruff check .
+      - run: pytest -q -rs
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: |
+          docker run --rm -v "$PWD/deploy:/mnt:ro" koalaman/shellcheck:v0.10.0 -x \
+            /mnt/remote-deploy.sh /mnt/smoke-test.sh /mnt/verify-restore.sh /mnt/make-bundle.sh
 
   dependency-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with: {python-version: "3.12"}
       - run: pip install . pip-audit
       - run: pip-audit --skip-editable
@@ -53,52 +65,47 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with: {fetch-depth: 0}
-      - name: gitleaks (full history)
-        run: |
+      - run: |
           docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.18.4 \
             detect --source /repo --redact --verbose
 
   docker:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - name: Validate compose file with placeholder values
-        run: |
-          sed 's/REPLACE_WITH.*/ci-placeholder-value/' .env.example > ci.env
-          docker compose --env-file ci.env config -q
-          rm ci.env
-      - name: Lint Dockerfiles
-        run: |
-          docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 --ignore DL3013 - < docker/app.Dockerfile
-          docker run --rm -i hadolint/hadolint:v2.12.0 hadolint --ignore DL3008 --ignore DL3013 --ignore DL3016 - < docker/agent.Dockerfile
-      - name: Build images (no push)
-        run: |
-          docker build -f docker/app.Dockerfile -t hunter-app:ci .
-          docker build -f docker/agent.Dockerfile -t hunter-agent:ci .
-      - name: Smoke-test the stack (demo mode, throwaway secrets)
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Generate throwaway secrets
         run: |
           {
-            echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
-            echo "REDIS_PASSWORD=$(openssl rand -hex 24)"
-            echo "ADMIN_TOKEN=$(openssl rand -hex 24)"
+            for k in POSTGRES_PASSWORD REDIS_PASSWORD ADMIN_TOKEN AGENT_TOKEN_CLAUDE_1 \
+                     AGENT_TOKEN_CLAUDE_2 AGENT_TOKEN_CODEX; do
+              echo "$k=$(openssl rand -hex 24)"
+            done
             echo "AGENT_MODE=demo"
           } > .env
-          docker compose up -d --build --wait --wait-timeout 240
-          curl -fsS http://127.0.0.1:8000/health | grep '"submission_enabled":false'
-          curl -fsS http://127.0.0.1:8000/ready
-          TOKEN=$(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)
-          curl -fsS -H "X-Admin-Token: $TOKEN" http://127.0.0.1:8000/profiles | grep internship-summer-2027
-          curl -fsS -X POST -H "X-Admin-Token: $TOKEN" http://127.0.0.1:8000/scan/1
-          for i in $(seq 1 40); do
-            curl -fsS -H "X-Admin-Token: $TOKEN" http://127.0.0.1:8000/scans | grep -q '"state":"finished"' && break
-            sleep 3
+          echo "ADMIN_TOKEN=$(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)" >> "$GITHUB_ENV"
+      - name: Validate compose file
+        run: docker compose config -q
+      - name: Lint Dockerfiles
+        run: |
+          for f in app agent; do
+            docker run --rm -i hadolint/hadolint:v2.12.0 hadolint \
+              --ignore DL3008 --ignore DL3013 --ignore DL3016 - < docker/$f.Dockerfile
           done
-          curl -fsS -H "X-Admin-Token: $TOKEN" http://127.0.0.1:8000/scans | grep '"state":"finished"'
+      - name: Build, start and wait for healthchecks (real daemon)
+        run: docker compose up -d --build --wait --wait-timeout 420
+      - name: Smoke + isolation + attack-injection test
+        run: deploy/smoke-test.sh
+      - name: Backup restores into a scratch database
+        run: deploy/verify-restore.sh
+      - name: Containers run as expected users
+        run: |
+          docker compose exec -T redis id -u | grep -vx 0
+          docker compose exec -T agent-codex id -u | grep -vx 0
       - name: Logs on failure
         if: failure()
-        run: docker compose logs --no-color --tail=80
+        run: docker compose logs --no-color --tail=100
       - if: always()
         run: docker compose down -v

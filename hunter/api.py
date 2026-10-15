@@ -41,8 +41,8 @@ def ready():
         with session_scope() as db:
             db.execute(text("SELECT 1"))
         orchestrator.redis_connection().ping()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=type(exc).__name__) from exc
+    except Exception as exc:  # no detail: this endpoint is unauthenticated
+        raise HTTPException(status_code=503, detail="not ready") from exc
     return {"status": "ready"}
 
 

@@ -1,10 +1,10 @@
+import time
 from datetime import date
 
 import httpx
-import pytest
 
 from hunter.policy import dates_decision
-from hunter.sources import fetch_all, fetch_source
+from hunter.sources import fetch_all, fetch_source, make_client
 
 D = date
 
@@ -48,21 +48,49 @@ def test_fields_clipped_to_column_sizes():
     assert "\x00" not in job["description"]
 
 
-def test_unexpected_shape_is_reported_not_raised(monkeypatch):
-    def handler(request):
-        return httpx.Response(200, json={"error": "x"})
-
-    real = httpx.Client
-    monkeypatch.setattr(
-        "hunter.sources.httpx.Client",
-        lambda **kw: real(transport=httpx.MockTransport(handler), **kw),
-    )
-    jobs, errors = fetch_all([{"kind": "lever", "token": "o"}])
+def test_unexpected_shape_is_reported_not_raised():
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json={"error": "x"}))
+    jobs, errors = fetch_all([{"kind": "lever", "token": "o"}], transport=transport)
     assert jobs == [] and errors == ["lever:o: ValueError"]
 
 
-def test_greenhouse_redirect_not_followed():
-    with pytest.raises(httpx.HTTPStatusError):
-        c = httpx.Client(transport=httpx.MockTransport(
-            lambda r: httpx.Response(302, headers={"location": "http://internal/"})))
-        fetch_source({"kind": "greenhouse", "token": "o"}, c)
+def test_oversized_ats_body_is_rejected(monkeypatch):
+    monkeypatch.setattr("hunter.sources.MAX_BODY_BYTES", 1000)
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, content=b"[" + b"1," * 2000))
+    jobs, errors = fetch_all([{"kind": "lever", "token": "o"}], transport=transport)
+    assert jobs == [] and errors == ["lever:o: ValueError"]
+
+
+def test_scan_deadline_skips_remaining_sources():
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json=[]))
+    jobs, errors = fetch_all(
+        [{"kind": "lever", "token": "a"}, {"kind": "lever", "token": "b"}],
+        deadline=time.monotonic() - 1, transport=transport,
+    )
+    assert jobs == [] and len(errors) == 2 and all("deadline" in e for e in errors)
+
+
+def test_fetch_all_client_does_not_follow_redirects():
+    """Tests the client fetch_all really builds, not httpx's default."""
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": "http://169.254.169.254/"})
+
+    assert make_client().follow_redirects is False
+    jobs, errors = fetch_all([{"kind": "greenhouse", "token": "o"}],
+                             transport=httpx.MockTransport(handler))
+    assert jobs == [] and errors == ["greenhouse:o: HTTPStatusError"]
+    assert len(seen) == 1  # the redirect target was never requested
+
+
+def test_reversed_ranges_are_uncertain_not_rejected():
+    from hunter.policy import duration_decision
+    assert dates_decision(D(2027, 7, 1), D(2027, 8, 1), D(2027, 9, 1), D(2027, 7, 1)) == \
+        "uncertain"
+    assert duration_decision(2, 3, 6, 2) == "uncertain"
+
+
+def test_no_requested_dates_means_no_constraint():
+    assert dates_decision(None, None, D(2027, 1, 1), None) == "eligible"

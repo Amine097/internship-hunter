@@ -1,7 +1,9 @@
 # Internship Hunter — bootstrap 0.1.0
 
 Private, self-hosted, **read-only** internship / part-time job discovery bootstrap.
-Three agents (Claude #1, Claude #2, Codex) plan searches in parallel. The discovery
+Three agents (Claude #1, Claude #2, Codex) plan searches in parallel; each runs in its own
+container behind a small HTTP planner and has **no** Redis/PostgreSQL access
+(see `docs/security-architecture.md`). The discovery
 worker collects only from explicitly configured, public Greenhouse and Lever APIs.
 Jobs and scan traces are persisted in PostgreSQL. RQ/Redis coordinates workloads.
 
@@ -22,8 +24,8 @@ Jobs and scan traces are persisted in PostgreSQL. RQ/Redis coordinates workloads
 
 ```bash
 cp .env.example .env
-# generate three independent values (Postgres, Redis, admin token) and paste into .env:
-for i in 1 2 3; do python3 -c 'import secrets; print(secrets.token_urlsafe(40))'; done
+# six independent values: Postgres, Redis, admin token, and one inbound token per agent:
+for i in 1 2 3 4 5 6; do python3 -c 'import secrets; print(secrets.token_urlsafe(40))'; done
 # Set TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USER_ID; do NOT commit .env.
 docker compose config -q
 docker compose up -d --build
@@ -84,14 +86,15 @@ runs; the orchestrator does not silently generate model results.
 ### Tests and CI
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
+python3.12 -m venv .venv && . .venv/bin/activate   # CI and images use 3.12
 pip install -e '.[dev]'
 ruff check hunter tests
-pytest -q           # set TEST_DATABASE_URL to also run the PostgreSQL test
+pytest -q           # set TEST_DATABASE_URL / TEST_REDIS_URL to also run the real-service tests
 ```
 
 CI (`.github/workflows/ci.yaml`): lint, tests (PostgreSQL + Redis services), pip-audit,
-gitleaks, compose validation, hadolint, image builds, and a compose smoke test. No secrets or
+gitleaks, shellcheck, hadolint, image builds, and a real-daemon compose smoke/isolation test
+(`deploy/smoke-test.sh`). No secrets or
 paid model calls. Deployment is a separate **manual** workflow over Tailscale; see
 `docs/deployment.md` and `docs/acceptance-checklist.md`. Never expose SSH to the Internet.
 
@@ -118,7 +121,7 @@ If your GitHub already has a repo called `internship-hunter`, use another name.
 ## Security notes
 
 - `.env`, volumes, account cookies and secrets must never be committed.
-- Redis requires a password; agents are on a network without PostgreSQL and receive no DB or admin credentials.
+- Redis requires a password and uses JSON serialization with a job allowlist; agents have no Redis/DB access and cannot reach each other (`docs/security-architecture.md`).
 - API is bound to `127.0.0.1:8000`, not exposed to the LAN / public Internet.
   Use SSH forwarding (`ssh -L 8000:127.0.0.1:8000 host`) or private Tailscale.
 - API requires `X-Admin-Token`. Bot accepts only `TELEGRAM_ALLOWED_USER_ID` in a private chat.

@@ -1,6 +1,17 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -22,8 +33,19 @@ class SearchProfile(Base):
     filters: Mapped[dict] = mapped_column(JSON)
 
 
+ACTIVE_STATES = ("queued", "running")
+
+
 class Scan(Base):
     __tablename__ = "scans"
+    __table_args__ = (
+        # At most one active scan per profile: concurrent /scan calls cannot pile up.
+        Index(
+            "uq_scans_one_active_per_profile", "profile_id", unique=True,
+            postgresql_where=text("state IN ('queued', 'running')"),
+            sqlite_where=text("state IN ('queued', 'running')"),
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     profile_id: Mapped[int] = mapped_column(ForeignKey("search_profiles.id"))
     state: Mapped[str] = mapped_column(String(30), default="queued")

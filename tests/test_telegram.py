@@ -40,14 +40,14 @@ def test_help_states_submission_disabled():
 
 def test_scan_all_and_single():
     assert handle_command("/scan", "/scan").startswith("Queued scans: [")
-    assert handle_command("/scan", "/scan 1").startswith("Scan queued: #")
+    assert "queued or already running" in handle_command("/scan", "/scan 1")
     assert "Usage" in handle_command("/scan", "/scan abc")
     assert "unavailable" in handle_command("/scan", "/scan 999")
 
 
 def test_bot_suffix_command():
     _, text = process_update(update("/scan@HunterBot 1"), OWNER)
-    assert text.startswith("Scan queued")
+    assert "queued or already running" in text
 
 
 def test_status_agents_jobs_empty_states():
@@ -66,10 +66,11 @@ def test_handler_failure_does_not_crash(monkeypatch):
 
 
 def test_scan_reports_redis_outage(monkeypatch):
-    from hunter import orchestrator
 
     def broken():
         raise ConnectionError("down")
 
-    monkeypatch.setattr(orchestrator, "redis_connection", broken)
+    from hunter import queueing
+    monkeypatch.setattr(queueing, "redis_connection", broken)
     assert "Redis unreachable" in handle_command("/scan", "/scan 1")
+    assert "Could not queue" in handle_command("/scan", "/scan")
