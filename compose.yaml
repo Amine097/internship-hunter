@@ -1,0 +1,144 @@
+name: internship-hunter
+x-db-env: &db-env
+  DATABASE_URL: postgresql+psycopg://hunter:${POSTGRES_PASSWORD:?set_POSTGRES_PASSWORD}@postgres:5432/hunter
+  REDIS_URL: redis://redis:6379/0
+  PROFILES_PATH: /app/config/search_profiles.yaml
+  SOURCES_PATH: /app/config/sources.yaml
+x-app: &app
+  build:
+    context: .
+    dockerfile: docker/app.Dockerfile
+  environment: *db-env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: hunter
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set_POSTGRES_PASSWORD}
+      POSTGRES_DB: hunter
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U hunter -d hunter"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+  migrate:
+    <<: *app
+    command: ["python", "-m", "hunter.db"]
+    restart: "no"
+  api:
+    <<: *app
+    environment:
+      <<: *db-env
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set_ADMIN_TOKEN}
+    command: ["uvicorn", "hunter.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      retries: 5
+  discovery:
+    <<: *app
+    command: ["python", "-m", "hunter.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://hunter:${POSTGRES_PASSWORD:?set_POSTGRES_PASSWORD}@postgres:5432/hunter
+      REDIS_URL: redis://redis:6379/0
+      PROFILES_PATH: /app/config/search_profiles.yaml
+      SOURCES_PATH: /app/config/sources.yaml
+      HUNTER_QUEUE: discovery
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  scheduler:
+    <<: *app
+    environment:
+      <<: *db-env
+      SCAN_CRON: ${SCAN_CRON:-0 7,13,20 * * *}
+      TZ: ${TZ:-Europe/Zurich}
+    command: ["python", "-m", "hunter.scheduler"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  telegram:
+    <<: *app
+    environment:
+      <<: *db-env
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
+    command: ["python", "-m", "hunter.telegram"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  agent-claude-1:
+    <<: *app
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+    command: ["python", "-m", "hunter.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      HUNTER_QUEUE: claude-1
+      HUNTER_AGENT_NAME: claude-1
+      CLAUDE_CONFIG_DIR: /home/hunter/.claude
+      AGENT_MODE: ${AGENT_MODE:-demo}
+    volumes: [claude1_home:/home/hunter]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  agent-claude-2:
+    <<: *app
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+    command: ["python", "-m", "hunter.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      HUNTER_QUEUE: claude-2
+      HUNTER_AGENT_NAME: claude-2
+      CLAUDE_CONFIG_DIR: /home/hunter/.claude
+      AGENT_MODE: ${AGENT_MODE:-demo}
+    volumes: [claude2_home:/home/hunter]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  agent-codex:
+    <<: *app
+    build:
+      context: .
+      dockerfile: docker/agent.Dockerfile
+    command: ["python", "-m", "hunter.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      HUNTER_QUEUE: codex
+      HUNTER_AGENT_NAME: codex
+      AGENT_MODE: ${AGENT_MODE:-demo}
+    volumes: [codex_home:/home/hunter]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+volumes:
+  postgres_data:
+  redis_data:
+  claude1_home:
+  claude2_home:
+  codex_home:

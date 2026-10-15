@@ -1,0 +1,9 @@
+# Fill with real company job-board handles (not generic company names).
+# No source is scanned until explicitly configured.
+# Examples of shape (placeholders must be replaced):
+# sources:
+#   - kind: greenhouse
+#     token: "company-board-token"
+#   - kind: lever
+#     token: "company-site-token"
+sources: []

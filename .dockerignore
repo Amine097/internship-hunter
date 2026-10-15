@@ -1,0 +1,16 @@
+# Prevent accidental transfer of local secrets and workspace data to Docker build daemon
+.env
+.env.*
+!.env.example
+.git
+.github
+.venv
+__pycache__
+**/__pycache__
+.pytest_cache
+.ruff_cache
+*.log
+*.db
+*.sqlite*
+credentials/
+artifacts/

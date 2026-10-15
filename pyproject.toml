@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "internship-hunter"
+version = "0.1.0"
+description = "Private, self-hosted multi-agent internship discovery — safe bootstrap milestone"
+requires-python = ">=3.12"
+dependencies = [
+ "fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1",
+ "sqlalchemy>=2.0,<3", "psycopg[binary]>=3.2,<4",
+ "redis>=5,<7", "rq>=2,<3", "apscheduler>=3.10,<4",
+ "httpx>=0.27,<1", "pydantic>=2.8,<3", "pydantic-settings>=2.5,<3", "PyYAML>=6,<7",
+]
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+[tool.ruff]
+line-length = 100
+[tool.ruff.lint]
+select = ["E", "F", "I"]
