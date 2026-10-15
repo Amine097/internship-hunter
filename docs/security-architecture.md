@@ -86,6 +86,13 @@ The V1 work queue is now one PostgreSQL table (`tasks`). Nothing in it is execut
 - Clock assumption: leases are minutes long and use the workers' clocks; workers must be
   NTP-synced (they share one host in this deployment).
 
+## Resource sessions (host helper)
+
+A privileged host-side helper may stop an admin-approved set of containers of the *existing*
+rootful daemon. It is a separate trust zone with five fixed operations, a root-owned policy
+and an independent watchdog; the application reaches it only through one Unix socket that
+only the session controller holds. See `docs/resource-sessions.md`.
+
 ## Evidence
 
 See `docs/acceptance-checklist.md` for what was executed locally versus what exists only as CI.

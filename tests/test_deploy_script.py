@@ -32,7 +32,7 @@ DOCKER_STUB = textwrap.dedent("""\
       compose)
         shift
         accept=""
-        while [[ "$1" == -p || "$1" == --env-file ]]; do
+        while [[ "$1" == -p || "$1" == --env-file || "$1" == -f ]]; do
           if [[ "$1" == --env-file ]]; then
             v="$(sed -n 's/^HUNTER_ACCEPT_SCHEMA_REVISION=//p' "$2" 2>/dev/null)"
             [[ -n "$v" ]] && accept="$v"
@@ -57,7 +57,7 @@ DOCKER_STUB = textwrap.dedent("""\
             echo "$RELEASE_SHA" > "$STUB_DIR/running" ;;
           ps) if [[ "$*" == *--format* ]]; then
                 tag="${RELEASE_SHA}"; [[ "${STUB_WRONG_IMAGES:-}" == "$RELEASE_SHA" ]] && tag=dev
-                for s in api discovery scheduler telegram migrate; do
+                for s in api discovery scheduler telegram session-controller migrate; do
                   echo "internship-hunter-app:$tag"; done
                 for s in 1 2 3; do echo "internship-hunter-agent:$tag"; done
                 for s in 1 2 3; do echo "internship-hunter-egress:$tag"; done
@@ -506,3 +506,11 @@ def test_toggle_back_to_the_newer_release_after_rollback(env):
     r = env.run("rollback")                                         # A -> B: db == B's head
     assert r.returncode == 0 and env.current_link == SHA_B
     assert env.run("rollback").returncode == 0                      # B -> A again (declared)
+
+
+def test_rsm_override_is_used_only_when_the_operator_enabled_it(env):
+    assert env.deploy(SHA_A).returncode == 0
+    assert "compose.rsm.yaml" not in env.log
+    (env.base / "shared" / "rsm.enabled").write_text("")
+    assert env.deploy(SHA_B).returncode == 0
+    assert "-f compose.yaml -f compose.rsm.yaml" in env.log

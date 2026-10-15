@@ -38,20 +38,30 @@ def test_help_states_submission_disabled():
     assert "submission disabled" in handle_command("/help", "/help")
 
 
-def test_scan_all_and_single():
-    assert handle_command("/scan", "/scan").startswith("Queued scans: [")
-    assert "queued or already running" in handle_command("/scan", "/scan 1")
+def test_scan_requests_approval_and_never_starts_anything():
+    from sqlalchemy import func, select
+
+    from hunter.db import session_scope
+    from hunter.models import ResourceSession, Scan
+    text = handle_command("/scan", "/scan")
+    assert "Approval requested" in text and "nothing has started" in text
     assert "Usage" in handle_command("/scan", "/scan abc")
     assert "unavailable" in handle_command("/scan", "/scan 999")
+    assert "Approval requested" in handle_command("/scan", "/scan 1")
+    with session_scope() as db:
+        assert db.scalar(select(func.count()).select_from(Scan)) == 0
+        states = list(db.scalars(select(ResourceSession.state)))
+    assert states == ["pending", "pending"]
 
 
 def test_bot_suffix_command():
     _, text = process_update(update("/scan@HunterBot 1"), OWNER)
-    assert "queued or already running" in text
+    assert "Approval requested" in text
 
 
 def test_status_agents_jobs_empty_states():
-    assert "No scan yet" in handle_command("/status", "/status")
+    assert "Session: none yet" in handle_command("/status", "/status")
+    assert "No scan yet" in handle_command("/scans", "/scans")
     assert "No agent run" in handle_command("/agents", "/agents")
     assert "No jobs yet" in handle_command("/jobs", "/jobs")
     assert "Unknown" in handle_command("/apply", "/apply")

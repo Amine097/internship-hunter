@@ -38,6 +38,11 @@ ACTIVE_STATES = ("queued", "running")
 SCAN_STATES = ("queued", "running", "finished", "partial", "failed", "cancelled")
 TASK_STATES = ("queued", "running", "completed", "failed", "cancelled")
 TASK_KINDS = ("scan",)  # a closed set: there is no dynamic dispatch anywhere
+SESSION_STATES = ("pending", "declined", "expired", "accepted", "reserving", "running",
+                  "restoring", "restore_failed", "completed", "failed", "blocked")
+# While any of these holds, no other session may start (unique ``lock_key``).
+SESSION_ACTIVE = ("accepted", "reserving", "running", "restoring", "restore_failed")
+SESSION_TERMINAL = ("declined", "expired", "completed", "failed", "blocked")
 
 
 def _in(column: str, values: tuple[str, ...]) -> str:
@@ -136,3 +141,63 @@ class Task(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ResourceSession(Base):
+    """One approved-or-not request to run a resource-intensive research session.
+
+    The Telegram bot only ever moves ``pending`` -> ``accepted``/``declined`` (owner-checked,
+    nonce-bound, single-use, expiring). Everything after acceptance is driven by the session
+    controller, which is the only component that may talk to the host broker.
+    """
+    __tablename__ = "resource_sessions"
+    __table_args__ = (
+        CheckConstraint(_in("state", SESSION_STATES), name="ck_resource_sessions_state"),
+        CheckConstraint(_in("trigger", ("scheduled", "manual", "api")),
+                        name="ck_resource_sessions_trigger"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    trigger: Mapped[str] = mapped_column(String(12))
+    slot_key: Mapped[str | None] = mapped_column(String(32), unique=True)
+    profile_ids: Mapped[list | None] = mapped_column(JSON)
+    state: Mapped[str] = mapped_column(String(16), default="pending")
+    nonce: Mapped[str] = mapped_column(String(32))
+    lock_key: Mapped[str | None] = mapped_column(String(8), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    prompt_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    restore_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    restore_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    scan_ids: Mapped[list] = mapped_column(JSON, default=list)
+    broker: Mapped[dict] = mapped_column(JSON, default=dict)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class RsmCommand(Base):
+    """Owner-issued out-of-band commands (e.g. /restore) for the session controller."""
+    __tablename__ = "rsm_commands"
+    __table_args__ = (CheckConstraint(_in("command", ("emergency_restore",)),
+                                      name="ck_rsm_commands_command"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    command: Mapped[str] = mapped_column(String(24))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class Notification(Base):
+    """Outbox: components write, the Telegram bot delivers (at-least-once, then marks sent)."""
+    __tablename__ = "notifications"
+    __table_args__ = (CheckConstraint(_in("kind", ("info", "alert")),
+                                      name="ck_notifications_kind"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8), default="info")
+    text: Mapped[str] = mapped_column(Text)
+    session_id: Mapped[str | None] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

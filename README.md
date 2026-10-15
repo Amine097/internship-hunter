@@ -112,6 +112,14 @@ gh repo create internship-hunter --private --source=. --remote=origin --push
 
 If your GitHub already has a repo called `internship-hunter`, use another name.
 
+## Approval and resource sessions
+
+Scheduled (07:00, 13:00, 20:00 Europe/Zurich) and manual (`/scan`, `POST /scan/{id}`)
+research runs are **requests**: Telegram asks you to Accept or Decline, an unanswered prompt
+expires, and nothing starts without approval. With the optional host helper
+(`docs/resource-sessions.md`) acceptance also reserves RAM by temporarily stopping
+administrator-approved containers and restores them afterwards.
+
 ## Defaults (saved in config/search_profiles.yaml)
 
 - `internship-summer-2027`: start **2027-07-01 through 2027-08-01**, duration **2–3 months**, Switzerland prioritized with Europe secondary.

@@ -113,6 +113,18 @@ services:
     networks: [data]
     depends_on:
       migrate: {condition: service_completed_successfully}
+  # Drives approved research sessions: talks to PostgreSQL only (and, when the optional
+  # compose.rsm.yaml override is used, to the host broker socket). It is the ONLY service that
+  # may ever hold that socket. No Docker socket, no agent networks.
+  session-controller:
+    <<: *app
+    command: ["python", "-m", "hunter.session_controller"]
+    environment:
+      <<: *db-env
+      RSM_ENABLED: "false"
+    networks: [data]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
   telegram:
     <<: *app
     command: ["python", "-m", "hunter.telegram"]

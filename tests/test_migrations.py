@@ -61,7 +61,7 @@ def test_legacy_pre_alembic_database_is_stamped_then_upgraded(fresh_db):
                   {"e": True})
     db_module.run_migrations()
     with fresh_db.connect() as c:
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0003"
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0004"
         assert c.execute(text("SELECT count(*) FROM search_profiles")).scalar() == 1  # data kept
         assert "tasks" in inspect(c).get_table_names()
 

@@ -102,3 +102,41 @@ def test_images_are_tagged_by_release_not_mutable_local():
     for name in ("api", "discovery", *AGENTS, *PROXIES.values()):
         assert "${RELEASE_SHA" in SERVICES[name]["image"], name
         assert ":local" not in SERVICES[name]["image"]
+
+
+RSM = yaml.safe_load((ROOT / "compose.rsm.yaml").read_text())["services"]
+
+
+def test_broker_socket_is_confined_to_the_session_controller():
+    assert set(RSM) == {"session-controller"}
+    mounts = [v for v in RSM["session-controller"]["volumes"]]
+    assert mounts == ["/run/hunter-rsm:/run/hunter-rsm"]
+    # nothing in the base file may mount a host path at all
+    for name, svc in SERVICES.items():
+        for v in svc.get("volumes", []):
+            assert not str(v).startswith("/"), (name, v)
+            assert "hunter-rsm" not in str(v), (name, v)
+    for name in [*AGENTS, *PROXIES.values(), "api", "discovery", "telegram", "scheduler",
+                 "postgres", "migrate"]:
+        assert "hunter-rsm" not in yaml.safe_dump(SERVICES[name]), name
+
+
+def test_no_docker_socket_anywhere_including_the_override():
+    text = (ROOT / "compose.yaml").read_text() + (ROOT / "compose.rsm.yaml").read_text()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "docker.sock" not in code and "/var/run/docker" not in code
+
+
+def test_session_controller_has_database_only_and_no_agent_or_egress_reach():
+    svc = SERVICES["session-controller"]
+    assert svc["networks"] == ["data"]
+    assert "ports" not in svc
+    assert not SECRET_KEYS - {"DATABASE_URL"} & set(svc["environment"])
+    assert not any(k.startswith("AGENT_TOKEN") for k in svc["environment"])
+    assert svc["read_only"] is True and svc["cap_drop"] == ["ALL"]
+    assert svc["environment"]["RSM_ENABLED"] == "false"     # opt-in only via the override
+
+
+def test_broker_is_disabled_unless_the_override_is_used():
+    assert SERVICES["session-controller"]["environment"]["RSM_ENABLED"] == "false"
+    assert RSM["session-controller"]["environment"]["RSM_ENABLED"] == "true"

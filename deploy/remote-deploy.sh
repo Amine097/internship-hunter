@@ -38,8 +38,12 @@ compose() { # compose <sha> <args...>   (optional env: ACCEPT_SCHEMA_REVISION)
     [[ -n "${ACCEPT_SCHEMA_REVISION:-}" ]] \
       && printf 'HUNTER_ACCEPT_SCHEMA_REVISION=%s\n' "$ACCEPT_SCHEMA_REVISION"
   } > "$relenv"
+  local files=(-f compose.yaml)
+  # opt-in: connect the session controller to the host broker (docs/resource-sessions.md)
+  [[ -f "$BASE/shared/rsm.enabled" ]] && files+=(-f compose.rsm.yaml)
   (cd "$BASE/releases/$sha" && RELEASE_SHA="$sha" \
-     docker compose -p "$PROJECT" --env-file "$BASE/shared/.env" --env-file "$relenv" "$@")
+     docker compose -p "$PROJECT" "${files[@]}" --env-file "$BASE/shared/.env" \
+       --env-file "$relenv" "$@")
 }
 
 actual_db_revision() { # actual_db_revision <sha>: what the database REALLY says (never state files)
@@ -78,7 +82,7 @@ verify_running_images() { # every first-party container must run exactly this re
   images="$(compose "$sha" ps --format '{{.Image}}')" || return 1
   bad="$(grep '^internship-hunter-' <<<"$images" | grep -v ":$sha\$" || true)"
   n="$(grep -c "^internship-hunter-.*:$sha\$" <<<"$images" || true)"
-  if [[ -n "$bad" || "$n" -lt 10 ]]; then
+  if [[ -n "$bad" || "$n" -lt 11 ]]; then
     echo "deploy: containers are not running release $sha (found: ${bad:-only $n matching})" >&2
     return 1
   fi

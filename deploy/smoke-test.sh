@@ -35,13 +35,59 @@ ok "ready (PostgreSQL reachable, schema matches)"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' "$API/profiles")" == 401 ]] || fail "unauthenticated /profiles"
 ok "admin routes reject a missing token"
 
-id="$(api -X POST "$API/scan/1" | python3 -c 'import sys,json; print(json.load(sys.stdin)["scan_id"])')"
-again="$(api -X POST "$API/scan/1" | python3 -c 'import sys,json; print(json.load(sys.stdin)["scan_id"])')"
-[[ "$id" == "$again" ]] || [[ "$(wait_scan "$id")" != timeout ]] || fail "idempotent scheduling"
+# Every scan needs the owner's approval. The smoke test plays the owner by calling the same
+# function the Telegram callback calls, inside the controller container.
+session_state() { exec_in session-controller python - "$1" <<'PY' | tr -d '\r'
+import sys
+from hunter.db import session_scope
+from hunter.models import ResourceSession
+with session_scope() as db:
+    print(db.get(ResourceSession, sys.argv[1]).state)
+PY
+}
+decide() { # decide <session_id> <accept|decline>
+  exec_in session-controller python - "$1" "$2" <<'PY' | tr -d '\r'
+import sys
+from hunter import sessions
+from hunter.db import session_scope
+from hunter.models import ResourceSession
+sid, what = sys.argv[1], sys.argv[2]
+with session_scope() as db:
+    nonce = db.get(ResourceSession, sid).nonce
+print(sessions.decide(sid, nonce, what == "accept").outcome)
+PY
+}
+wait_session() { # wait_session <session_id> <state...>
+  local sid="$1"; shift
+  for _ in $(seq 1 90); do
+    cur="$(session_state "$sid")"
+    for want in "$@"; do [[ "$cur" == "$want" ]] && { echo "$cur"; return; }; done
+    sleep 2
+  done
+  echo "timeout($cur)"
+}
+scan_count() { api "$API/scans" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))'; }
+
+sid="$(api -X POST "$API/scan/1" | python3 -c 'import sys,json; r=json.load(sys.stdin); assert r["state"]=="pending_approval"; print(r["session_id"])')"
+sleep 6
+[[ "$(session_state "$sid")" == pending && "$(scan_count)" == 0 ]] \
+  || fail "a scan started (or the request vanished) without approval"
+ok "POST /scan only requests approval: nothing started while pending"
+[[ "$(decide "$sid" accept)" == accepted ]] || fail "accept was not applied"
+[[ "$(decide "$sid" accept)" == already_handled ]] || fail "double accept was applied twice"
+[[ "$(wait_session "$sid" completed failed blocked)" == completed ]] \
+  || fail "session $sid did not complete (state $(session_state "$sid"))"
+id="$(api "$API/scans" | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])')"
 [[ "$(wait_scan "$id")" == finished ]] || fail "scan $id did not finish"
 runs="$(api "$API/scans" | python3 -c "import sys,json; s=[x for x in json.load(sys.stdin) if x['id']==$id][0]; print(sum(a['state']=='finished' and a['output']['mode']=='demo' for a in s['agents']))")"
 [[ "$runs" == 3 ]] || fail "expected 3 finished demo agent runs, got $runs"
-ok "scan $id finished through the PostgreSQL queue with three isolated demo agents"
+ok "approved session $sid ran scan $id with three isolated demo agents and completed"
+
+dec="$(api -X POST "$API/scan/2" | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')"
+[[ "$(decide "$dec" decline)" == declined ]] || fail "decline was not applied"
+sleep 4
+[[ "$(session_state "$dec")" == declined ]] || fail "declined session changed state"
+ok "declined request stays declined; no scan started"
 
 # 2. the queue is a table: nothing executable can be forged -----------------------------------
 out="$(exec_in discovery python - <<'PY'
@@ -103,6 +149,11 @@ PY
 )"
 [[ "$code" == 401 ]] || fail "agent runner accepted an unauthenticated plan request ($code)"
 ok "agent runner rejects unauthenticated calls"
+
+ctl_mounts="$(docker inspect --format '{{range .Mounts}}{{.Source}} {{end}}' \
+  "$("${COMPOSE[@]}" ps -q session-controller)")"
+[[ "$ctl_mounts" != *hunter-rsm* ]] || fail "session-controller holds the broker socket in demo"
+ok "demo stack: session-controller has no broker socket and RSM is disabled"
 
 # 4. egress policy ----------------------------------------------------------------------------
 connect() { # connect <agent> <proxy> <host> <port> -> HTTP status of CONNECT, or "error"
@@ -189,7 +240,9 @@ fi
 ok "only loopback-published ports"
 
 # 5. the worker survives and keeps serving -------------------------------------------------
-id="$(api -X POST "$API/scan/2" | python3 -c 'import sys,json; print(json.load(sys.stdin)["scan_id"])')"
-[[ "$(wait_scan "$id")" == finished ]] || fail "second profile scan did not finish"
-ok "second scan finished"
+sid2="$(api -X POST "$API/scan/2" | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')"
+[[ "$(decide "$sid2" accept)" == accepted ]] || fail "second accept"
+[[ "$(wait_session "$sid2" completed failed blocked)" == completed ]] \
+  || fail "second session did not complete"
+ok "second approved session completed"
 echo "SMOKE TEST PASSED"

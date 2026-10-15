@@ -1,15 +1,20 @@
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from hunter.orchestrator import enqueue_all_profiles
+from hunter import sessions
 from hunter.settings import get_settings
 
 
 def scheduled_scan() -> None:
-    queued, errors = enqueue_all_profiles()
-    print(f"scheduled scans queued={queued} errors={errors}", flush=True)
+    """07:00 / 13:00 / 20:00: ask the owner. Nothing runs, and no container changes, unless
+    the owner accepts; an unanswered prompt expires."""
+    settings = get_settings()
+    slot = datetime.now(ZoneInfo(settings.tz)).strftime("%Y-%m-%dT%H")
+    sid, created = sessions.request_session("scheduled", slot_key=f"sched-{slot}")
+    print(f"scheduled approval request {sid[:8]} slot={slot} created={created}", flush=True)
 
 
 def main():

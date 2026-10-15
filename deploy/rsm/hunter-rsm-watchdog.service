@@ -1,0 +1,39 @@
+# INDEPENDENT restoration safety net: does not depend on the broker, the application,
+# PostgreSQL, Telegram or the rootless daemon. Run every 30 s by the timer.
+[Unit]
+Description=Internship Hunter RSM watchdog (restores containers after deadline/silence)
+After=docker.service
+
+[Service]
+Type=oneshot
+User=hunter-rsm
+Group=hunter-rsm
+SupplementaryGroups=docker
+Environment=PYTHONPATH=/opt/hunter-rsm/src PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m hunter.rsm watchdog \
+  --policy /etc/hunter-rsm/policy.json --state-dir /var/lib/hunter-rsm
+TimeoutStartSec=900
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/hunter-rsm
+ReadOnlyPaths=/etc/hunter-rsm
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io
+UMask=0027

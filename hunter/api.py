@@ -5,9 +5,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from sqlalchemy import func, select, text
 
 from hunter import db as database
+from hunter import sessions
 from hunter.db import session_scope
 from hunter.models import AgentRun, Application, Job, Scan, SearchProfile
-from hunter.orchestrator import enqueue_scan
 from hunter.policy import SUBMISSION_ENABLED
 from hunter.settings import get_settings
 
@@ -101,8 +101,11 @@ def agents():
 
 @app.post("/scan/{profile_id}", dependencies=[Depends(require_admin)])
 def scan(profile_id: int):
-    try:
-        scan_id = enqueue_scan(profile_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"scan_id": scan_id, "state": "queued"}
+    """Requests a research session for one profile. It is NOT started here: like every other
+    entry point it needs the owner's approval in Telegram."""
+    with session_scope() as db:
+        profile = db.get(SearchProfile, profile_id)
+        if profile is None or not profile.enabled:
+            raise HTTPException(status_code=404, detail="Search profile not found or disabled")
+    sid, _ = sessions.request_session("api", [profile_id])
+    return {"session_id": sid, "state": "pending_approval"}

@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     agent_token_claude_1: str = ""
     agent_token_claude_2: str = ""
     agent_token_codex: str = ""
+    # Resource sessions (host broker). Disabled until the host helper is installed.
+    rsm_enabled: bool = False
+    rsm_socket: str = "/run/hunter-rsm/rsm.sock"
+    approval_ttl_seconds: int = 900          # an unanswered prompt expires; never auto-launches
+    session_max_seconds: int = 2400          # controller cap; the broker's cap is the backstop
     profiles_path: str = "config/search_profiles.yaml"
     sources_path: str = "config/sources.yaml"
 

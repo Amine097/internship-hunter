@@ -1,0 +1,52 @@
+# Host-side Resource Session Manager broker. Installed and updated BY THE ADMINISTRATOR
+# (root-owned files under /opt/hunter-rsm); never by the application's deploy pipeline.
+[Unit]
+Description=Internship Hunter Resource Session Manager (broker)
+Documentation=file:///opt/hunter-rsm/docs/resource-sessions.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=hunter-rsm
+Group=hunter-rsm
+# Access to the ROOTFUL Docker socket is the privilege this unit exists to confine.
+SupplementaryGroups=docker
+Environment=PYTHONPATH=/opt/hunter-rsm/src PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m hunter.rsm serve \
+  --policy /etc/hunter-rsm/policy.json --state-dir /var/lib/hunter-rsm \
+  --socket /run/hunter-rsm/rsm.sock --socket-group __HUNTER_ROOTLESS_PRIMARY_GROUP__ \
+  --allowed-uid __HUNTER_ROOTLESS_UID__
+Restart=always
+RestartSec=2
+RuntimeDirectory=hunter-rsm
+RuntimeDirectoryMode=0750
+StateDirectory=hunter-rsm
+StateDirectoryMode=0750
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/hunter-rsm
+ReadOnlyPaths=/etc/hunter-rsm
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

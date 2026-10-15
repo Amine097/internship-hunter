@@ -98,3 +98,21 @@ Derived checks (also run in CI against the Docker runner, without the rootless a
 
 ## CLI mode (only after provider terms are confirmed) — all **S**
 - [ ] Each CLI logged in separately; one scan yields three `cli` runs
+
+## Resource sessions (Telegram-approved reservation) - see docs/resource-sessions.md
+- [x] **L** broker unit suite with a fake Docker (dependency order, snapshot/restore, restart
+      policies, crash mid-stop AND mid-restore, watchdog deadline/silence, reboot recovery,
+      missing/recreated container, busy probes, unlisted dependents, protected names)
+- [x] **L** hostile-protocol suite: unknown ops/extra keys/names/oversize -> zero Docker calls
+- [x] **L** REAL Docker with DISPOSABLE `hv-rsm-test-*` containers: order, restart policies,
+      bystander untouched, helper process SIGKILLed mid-session -> watchdog restores,
+      boot-recovery command, unlisted namespace dependent blocks
+- [x] **L** approval flow: decline, expiry, double accept, simultaneous accepts, second
+      session refused, owner-only callbacks, replay/forgery, scan failure, timeout (scans
+      cancelled), broker unreachable, lost reply while stopping, controller crash + resume,
+      restore failure -> single explicit alert -> `/restore`
+- [x] **L** compose: broker socket only in `session-controller` (opt-in override), no Docker
+      socket anywhere, agents/proxies/bot have no path to the helper
+- [ ] **CI** all of the above on GitHub (RSM integration needs the runner's Docker)
+- [ ] **S** installation and acceptance tests A1-A16 of docs/resource-sessions.md on the
+      real host (nothing in this section has run on your server)

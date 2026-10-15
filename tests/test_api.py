@@ -44,9 +44,18 @@ def test_profiles_and_status(client):
     assert status["submission_enabled"] is False
 
 
-def test_scan_endpoint(client):
-    assert client.post("/scan/1", headers=H).json()["state"] == "queued"
+def test_scan_endpoint_requests_approval_and_starts_nothing(client):
+    r = client.post("/scan/1", headers=H).json()
+    assert r["state"] == "pending_approval" and r["session_id"]
     assert client.post("/scan/999", headers=H).status_code == 404
+    from sqlalchemy import func, select
+
+    from hunter.db import session_scope
+    from hunter.models import ResourceSession, Scan, Task
+    with session_scope() as db:
+        assert db.scalar(select(func.count()).select_from(Scan)) == 0     # nothing queued
+        assert db.scalar(select(func.count()).select_from(Task)) == 0
+        assert db.scalar(select(ResourceSession.state)) == "pending"
 
 
 def test_ready_checks_dependencies(client):
