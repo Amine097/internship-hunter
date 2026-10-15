@@ -36,7 +36,7 @@ def run_forever(queue: TaskQueue | None = None, stop: threading.Event | None = N
         if claim is None:
             stop.wait(poll)
             continue
-        handler(queue, claim)
+        handler(queue, claim, stop=stop)
         processed += 1
     return processed
 

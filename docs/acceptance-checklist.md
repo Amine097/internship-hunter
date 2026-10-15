@@ -61,6 +61,15 @@ revision; **S** = must be done on the real server. Nothing marked S has been don
 - [ ] **S** provider hostname lists confirmed against the pinned CLI versions (UNVERIFIED);
       behaviour under rootless Docker (slirp4netns/pasta)
 
+## Rootless-host isolation (run `SMOKE_EXPECT_ROOTLESS=1 deploy/smoke-test.sh` on the server)
+Derived checks (also run in CI against the Docker runner, without the rootless assertion):
+- [x] **L** no container mounts the Docker socket or runs privileged; daemon is rootless (**S**)
+- [x] **L** the egress proxy (the only container with an outbound route) cannot reach its
+      gateway/host on ssh, the Docker API, postgres or the API port
+- [x] **L** only loopback-published ports; proxy refuses tailnet (100.64/10, 100.100.100.100),
+      RFC1918, link-local, loopback literals and `localhost`
+- [ ] **S** the same three, on the rootless production host, plus Tailscale ACL review
+
 ## Server (demo mode) — all **S**
 - [ ] `ss -tlnp`: only the API on loopback; Telegram from owner works, others get no reply
 - [ ] Container memory totals within budget; other host services unaffected

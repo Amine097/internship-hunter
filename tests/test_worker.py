@@ -18,7 +18,7 @@ def test_run_forever_processes_then_stops(database, run_tasks):
     orchestrator.enqueue_scan(1)
     seen, stop = [], threading.Event()
 
-    def handler(queue, claim):
+    def handler(queue, claim, **kw):
         seen.append(claim.scan_id)
         stop.set()
 

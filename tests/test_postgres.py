@@ -231,18 +231,61 @@ def test_heartbeat_keeps_a_slow_task_alive_and_silence_does_not(pg_db):
             q.fence(db, silent)
 
 
-def test_fence_serialises_with_the_reaper(pg_db):
-    """The fence takes the task row lock: a concurrent reap skips it instead of racing."""
+def test_reaper_skips_a_row_locked_by_a_fencing_worker_even_with_an_expired_lease(pg_db):
+    """The strong version. The lease is EXPIRED by the clock while the worker is mid-
+    transaction (fence taken, not yet committed). Only the row lock stands between the
+    reaper and a double execution; SKIP LOCKED must make the reaper leave the row alone, and
+    the worker's completion must win."""
     q = TaskQueue(lease=timedelta(seconds=1))
     make_tasks(1, q)
     claim = q.claim()
-    time.sleep(0.2)
-    with session_scope() as db:
-        q.fence(db, claim)                           # renews + locks until commit
-        assert TaskQueue().reap() == {"retried": 0, "failed": 0, "expired_in_queue": 0}
+    session_ctx = session_scope()
+    db = session_ctx.__enter__()
+    try:
+        q.fence(db, claim)                   # renews to now+1s and takes the row lock
+        time.sleep(1.4)                      # the renewed lease is now expired
+        reaper_result = TaskQueue().reap()   # separate connection, real clock
+        assert reaper_result == {"retried": 0, "failed": 0, "expired_in_queue": 0}
         q.complete(db, claim)
-    with session_scope() as db:
-        assert db.scalar(select(Task.state)) == "completed"
+    finally:
+        session_ctx.__exit__(None, None, None)
+    with session_scope() as s:
+        t = s.scalar(select(Task))
+        assert (t.state, t.attempts) == ("completed", 1)
+    assert TaskQueue().reap() == {"retried": 0, "failed": 0, "expired_in_queue": 0}
+
+
+def test_expired_worker_loses_to_an_in_flight_reaper_without_writing(pg_db):
+    """Reverse ordering: the reaper has taken the expired row and is still inside its
+    transaction when the stale worker tries to fence and write. The worker must fail with
+    LeaseLost, its write must not land, and the reaper's outcome must stand."""
+    q = TaskQueue(lease=timedelta(seconds=1))
+    make_tasks(1, q)
+    claim = q.claim()
+    time.sleep(1.2)                                  # lease expired
+    holding, release = threading.Event(), threading.Event()
+
+    def slow_reaper():
+        with session_scope() as db:
+            t = db.scalar(select(Task).with_for_update())
+            db.execute(text("UPDATE tasks SET state='queued', lease_token=NULL, "
+                            "lease_expires_at=NULL WHERE id=:i"), {"i": t.id})
+            holding.set()
+            release.wait(5)                          # commit only when told to
+
+    th = threading.Thread(target=slow_reaper)
+    th.start()
+    assert holding.wait(5)
+    threading.Timer(0.5, release.set).start()
+    with pytest.raises(LeaseLost):
+        with session_scope() as db:
+            q.fence(db, claim)                       # expired: refused, never blocks into a write
+            db.execute(text("UPDATE scans SET state='finished'"))   # must never be reached
+    th.join()
+    with session_scope() as s:
+        t = s.scalar(select(Task))
+        assert (t.state, t.lease_token) == ("queued", None)
+        assert s.scalar(select(Scan.state)) != "finished"   # the stale worker wrote nothing
 
 
 def test_database_constraints_reject_forged_tasks(pg_db):

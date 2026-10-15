@@ -185,3 +185,53 @@ def test_forged_rows_cannot_execute_anything(q, monkeypatch):
                         lambda queue, claim, **k: seen.append(claim.kind))
     orchestrator.process_claim(q, q.claim())
     assert seen == ["scan"] and task_of(sid).scan_id == sid
+
+
+def test_shutdown_before_work_releases_without_consuming_an_attempt(q):
+    import threading
+    sid = orchestrator.enqueue_scan(1, q)
+    claim = q.claim()
+    stop = threading.Event()
+    stop.set()                                    # SIGTERM arrived right after the claim
+    orchestrator.process_claim(q, claim, stop=stop)
+    t = task_of(sid)
+    assert (t.state, t.attempts) == ("queued", 0)
+    assert scan_state(sid) == "queued"
+    again = q.claim()
+    assert again.attempt == 1                     # a routine deploy did not burn a retry
+    with pytest.raises(LeaseLost):
+        q.heartbeat(claim)                        # the stopped worker no longer owns it
+
+
+def test_shutdown_between_phases_keeps_results_consistent(q, agent_fleet, monkeypatch):
+    import threading
+    sid = orchestrator.enqueue_scan(1, q)
+    claim = q.claim()
+    stop = threading.Event()
+    original = orchestrator.run_agents
+
+    def agents_then_sigterm(filters, client_factory=None):
+        out = original(filters, client_factory)
+        stop.set()                                # SIGTERM while the agents were running
+        return out
+
+    monkeypatch.setattr(orchestrator, "run_agents", agents_then_sigterm)
+    orchestrator.process_claim(q, claim, stop=stop)
+    t = task_of(sid)
+    assert (t.state, t.attempts) == ("queued", 0) and scan_state(sid) == "queued"
+    monkeypatch.setattr(orchestrator, "run_agents", original)
+    assert orchestrator.process_claim(q, q.claim())["state"] == "finished"
+    with session_scope() as db:
+        assert len(list(db.scalars(select(AgentRun).where(AgentRun.scan_id == sid)))) == 3
+
+
+def test_shutdown_does_not_hide_a_lost_lease(q, clock):
+    import threading
+    sid = orchestrator.enqueue_scan(1, q)
+    claim = q.claim()
+    clock.advance(500)
+    q.reap()
+    stop = threading.Event()
+    stop.set()
+    orchestrator.process_claim(q, claim, stop=stop)   # must not resurrect or double-release
+    assert task_of(sid).state == "queued" and task_of(sid).attempts == 1

@@ -27,24 +27,42 @@ showed up *during* rollback. Policy now:
    release's head with the new manifest. Not declared compatible → refused (exit 9) *before*
    backup, load or switch. The operator may knowingly use `deploy-irreversible`; a backup is
    mandatory and `rollback` is then refused with the manual-recovery procedure below.
-5. **Unknown revisions are never silently ignored.** `hunter.db` raises `SchemaMismatch`
+5. **The real database decides, not state files.** Before accepting anything, restore and
+   rollback read `alembic_version` from PostgreSQL (`psql` through the running stack). The
+   target release may be told to accept revision *R* only if **all** hold: *R* is what the
+   database actually says; *R* is the head of the release being left; and that release's own
+   **signed** `rollback_compatible` list names the target's head. Any other revision —
+   including one that a stale `state/` file claims — is refused. This covers the automatic
+   restore after a failed deploy (the new release may already have migrated) and an explicit
+   rollback alike.
+6. **Unknown revisions are never silently ignored.** `hunter.db` raises `SchemaMismatch`
    (and `/ready` returns 503) for a revision it does not know. The only exception is an
    explicit `HUNTER_ACCEPT_SCHEMA_REVISION=<that exact revision>`, which *only the deploy
    script* sets, *only* during a rollback it has verified is compatible; in that mode the
    release neither migrates nor seeds data.
-6. **Rollback is verified, not assumed.** It re-activates the previous images, then checks
+7. **Rollback is verified, not assumed.** It re-activates the previous images, then checks
    running images, `/ready` (schema), and `submission_enabled=false`. If any check fails it
    re-activates the release it came from, exits 6 and prints the recovery procedure — it
    never reports success on an unverified rollback.
 
-Caveat: the accept protocol exists from the release that introduced it onward. A rollback
-*to* an older release (one without `HUNTER_ACCEPT_SCHEMA_REVISION` support) onto a newer
-schema is not supported and the script treats that pairing as unverified.
+**Protocol baseline.** The accept protocol exists from revision `0003` onward
+(`accept_protocol_since` in `compat.json`). Older releases refuse any newer schema, so they
+can never be listed in `rollback_compatible_with`; `deploy/schema_info.py` (run at build and
+again at signing) and `tests/test_schema_compat.py` reject such a declaration.
 
-### Migration failure
+**The signing job recomputes this metadata** from the source archive (text parsing only,
+nothing executed) and writes the signed manifest itself; a build job that reports a different
+`schema_head`/`rollback_compatible` is refused (`tests/test_sign_bundle.py`).
 
-PostgreSQL DDL is transactional, so a failing migration leaves the schema at the previous
-revision; the deploy restores the previous release automatically (exit 1). If the restore
+### Migration failure and failed health check after migrating
+
+PostgreSQL DDL is transactional, so a *failing* migration leaves the schema at the previous
+revision and the previous release is restored as is (exit 1). A migration that *succeeds*
+but whose release then fails its health check leaves the schema at the new head: the
+previous release is restored with that exact revision explicitly accepted (only when the
+bundle's signed declaration covers it; this was the reviewer's reproduced failure, now
+`test_regression_restore_after_compatible_migration_and_failed_healthcheck`). For an
+`irreversible` deploy nothing is accepted and the outcome is exit 10 + manual recovery. If the restore
 *also* fails (e.g. non-transactional DDL left a half-applied change) the script exits 10 with
 the latest backups and the procedure below. Never run `alembic downgrade` in production.
 

@@ -1,6 +1,8 @@
 #!/bin/sh
-# Allow-list forward proxy for ONE agent. Only CONNECT to :443 on listed hostnames succeeds;
-# everything else (other hosts, IP literals, other ports, plain HTTP) is refused.
+# Allow-list forward proxy for ONE agent. Only CONNECT to <listed-host>:443 succeeds;
+# everything else (other hosts, IP literals, other ports, plain-HTTP forwarding) is refused.
+# Mechanism: filtering is applied to the request target ("host:443" for CONNECT, a full
+# "http://host/..." URL for forwarding), and the allow patterns only match "host:443".
 # EGRESS_ALLOW: comma-separated exact hostnames, e.g. "api.anthropic.com,claude.ai".
 set -eu
 : "${EGRESS_ALLOW:?EGRESS_ALLOW must list the permitted hostnames}"
@@ -13,7 +15,7 @@ for host in $EGRESS_ALLOW; do
   case "$host" in
     ''|*[!A-Za-z0-9.-]*) echo "invalid hostname in EGRESS_ALLOW: '$host'" >&2; exit 1 ;;
   esac
-  printf '^%s$\n' "$(printf '%s' "$host" | sed 's/\./\\./g')" >> "$allow"
+  printf '^%s:443$\n' "$(printf '%s' "$host" | sed 's/\./\\./g')" >> "$allow"
 done
 IFS=$old_ifs
 cat > "$conf" <<CONF
@@ -27,6 +29,6 @@ ConnectPort 443
 FilterDefaultDeny Yes
 Filter "$allow"
 FilterType ere
-FilterURLs Off
+FilterURLs On
 CONF
 exec tinyproxy -d -c "$conf"

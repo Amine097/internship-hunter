@@ -164,6 +164,26 @@ class TaskQueue:
                 return "failed"
         raise LeaseLost(f"task {task_id}: state changed concurrently")
 
+    def release(self, db, claim: Claim) -> None:
+        """Graceful shutdown: hand the task back WITHOUT consuming an attempt.
+
+        A routine deploy stops workers; that must not use up the bounded retries meant for
+        crashes. (A worker that is SIGKILLed after the grace period still goes through lease
+        expiry and does consume one.)
+        """
+        now = self.now()
+        rows = db.execute(
+            update(Task).where(Task.id == claim.task_id, Task.lease_token == claim.token,
+                               Task.state == "running")
+            .values(state="queued", lease_token=None, lease_expires_at=None, available_at=now,
+                    attempts=max(claim.attempt - 1, 0),
+                    last_error="released: worker shutting down")
+        ).rowcount
+        if rows != 1:
+            raise LeaseLost(f"task {claim.task_id}: cannot release, lease lost")
+        db.execute(update(Scan).where(Scan.id == claim.scan_id, Scan.state == "running")
+                   .values(state="queued"))
+
     def cancel_running(self, db, claim: Claim) -> None:
         self._terminal(db, claim, "cancelled", "cancelled")
         db.execute(update(Scan).where(Scan.id == claim.scan_id, Scan.state == "running")

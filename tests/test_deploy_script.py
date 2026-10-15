@@ -14,7 +14,8 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "remote-deploy.sh"
+SCRIPT = Path(os.environ.get("HUNTER_DEPLOY_SCRIPT") or
+              Path(__file__).resolve().parents[1] / "deploy" / "remote-deploy.sh")
 pytestmark = pytest.mark.skipif(
     not (shutil.which("ssh-keygen") and shutil.which("flock")), reason="needs ssh-keygen+flock")
 
@@ -30,10 +31,30 @@ DOCKER_STUB = textwrap.dedent("""\
       image) if [[ "$2" == inspect ]]; then grep -qx "$3" "$STUB_DIR/images"; else exit 0; fi ;;
       compose)
         shift
-        while [[ "$1" == -p || "$1" == --env-file ]]; do shift 2; done
+        accept=""
+        while [[ "$1" == -p || "$1" == --env-file ]]; do
+          if [[ "$1" == --env-file ]]; then
+            v="$(sed -n 's/^HUNTER_ACCEPT_SCHEMA_REVISION=//p' "$2" 2>/dev/null)"
+            [[ -n "$v" ]] && accept="$v"
+          fi
+          shift 2
+        done
         case "$1" in
-          up) [[ " ${STUB_FAIL_UP_SHA:-} " == *" $RELEASE_SHA "* ]] && exit 1
-              echo "$RELEASE_SHA" > "$STUB_DIR/running" ;;
+          up)
+            # --- model of "migrate then start" against a stateful schema -------------------
+            head="$(cat "$PWD/STUB_SCHEMA_HEAD" 2>/dev/null || echo 0001)"
+            db="$(cat "$STUB_DIR/db_rev" 2>/dev/null || true)"
+            [[ " ${STUB_FAIL_UP_SHA:-} " == *" $RELEASE_SHA "* ]] && exit 1
+            if [[ -z "$db" || "$db" < "$head" ]]; then
+              [[ " ${STUB_FAIL_MIGRATE_SHA:-} " == *" $RELEASE_SHA "* ]] && exit 1  # txn DDL
+              echo "$head" > "$STUB_DIR/db_rev"
+            elif [[ "$db" > "$head" ]]; then
+              if [[ "$accept" != "$db" ]]; then
+                echo "SchemaMismatch: database at $db unknown to release $head" >&2
+                exit 1
+              fi
+            fi
+            echo "$RELEASE_SHA" > "$STUB_DIR/running" ;;
           ps) if [[ "$*" == *--format* ]]; then
                 tag="${RELEASE_SHA}"; [[ "${STUB_WRONG_IMAGES:-}" == "$RELEASE_SHA" ]] && tag=dev
                 for s in api discovery scheduler telegram migrate; do
@@ -42,7 +63,11 @@ DOCKER_STUB = textwrap.dedent("""\
                 for s in 1 2 3; do echo "internship-hunter-egress:$tag"; done
                 echo "postgres:17-alpine"
               else [[ -f "$STUB_DIR/db" ]] && echo abc123; fi; exit 0 ;;
-          exec) [[ -n "${STUB_FAIL_DUMP:-}" ]] && exit 1; echo "-- sql dump" ;;
+          exec)
+            if [[ "$*" == *psql* ]]; then
+              [[ -f "$STUB_DIR/db_rev" ]] && cat "$STUB_DIR/db_rev"; exit 0
+            fi
+            [[ -n "${STUB_FAIL_DUMP:-}" ]] && exit 1; echo "-- sql dump" ;;
           *) exit 0 ;;
         esac ;;
     esac
@@ -91,6 +116,10 @@ class Env:
             ti = tarfile.TarInfo("../evil" if evil_path else "compose.yaml")
             ti.size = len(data)
             t.addfile(ti, io.BytesIO(data))
+            head_bytes = head.encode()
+            hi = tarfile.TarInfo("STUB_SCHEMA_HEAD")
+            hi.size = len(head_bytes)
+            t.addfile(hi, io.BytesIO(head_bytes))
             if symlink:
                 link = tarfile.TarInfo("shared-env")
                 link.type = tarfile.SYMTYPE
@@ -385,3 +414,95 @@ def test_legacy_bundle_without_schema_fields_is_rejected(env):
     legacy = (f"sha={SHA_A}\nsource_sha256={'0' * 64}\nimages_sha256={'0' * 64}\n"
               f"created=1900000001\n").encode()
     assert raw and legacy  # structure documented; strict parser covered by extra_line test
+
+
+# --- MEDIUM-1 regression: restore after the database was already migrated -------------------
+
+def set_db(env, rev):
+    (env.stub / "db_rev").write_text(rev)
+
+
+def db_rev(env):
+    return (env.stub / "db_rev").read_text().strip()
+
+
+def test_regression_restore_after_compatible_migration_and_failed_healthcheck(env):
+    """Release A on 0003; B migrates to 0004 then fails its health check. The automatic
+    restore must start A against the real 0004 schema (it used to exit 10 with SchemaMismatch)."""
+    assert env.deploy(SHA_A, head="0003", compat="").returncode == 0
+    assert db_rev(env) == "0003"
+    r = env.deploy(SHA_B, head="0004", compat="0003", STUB_FAIL_HEALTH_SHA=SHA_B)
+    err = r.stderr.decode()
+    assert r.returncode == 1, err                      # deploy failed, but cleanly restored
+    assert "RESTORE ALSO FAILED" not in err and "restored" in err
+    assert db_rev(env) == "0004"                       # the migration really happened
+    assert (env.stub / "running").read_text().strip() == SHA_A
+    assert env.current_link == SHA_A and env.state("current_sha") == SHA_A
+    assert env.state("db_head") == "0004"              # reflects the real database
+    # A was told to accept exactly the revision the database is at, and nothing else
+    assert "HUNTER_ACCEPT_SCHEMA_REVISION=0004" in last_up_env(env, SHA_A)
+
+
+def test_restore_accepts_nothing_when_the_declaration_does_not_cover_the_target(env):
+    """Irreversible deploy (previous head NOT declared compatible) that then fails health:
+    the old release must not be force-started on the unknown schema."""
+    assert env.deploy(SHA_A, head="0003", compat="").returncode == 0
+    r = env.deploy(SHA_B, command="deploy-irreversible", head="0004", compat="",
+                   STUB_FAIL_HEALTH_SHA=SHA_B)
+    assert r.returncode == 10 and "MANUAL RECOVERY" in r.stderr.decode()
+    assert "ACCEPT" not in last_up_env(env, SHA_A)
+    assert db_rev(env) == "0004"
+
+
+def test_restore_without_migration_needs_no_acceptance(env):
+    assert env.deploy(SHA_A, head="0003", compat="").returncode == 0
+    r = env.deploy(SHA_B, head="0004", compat="0003", STUB_FAIL_MIGRATE_SHA=SHA_B)
+    assert r.returncode == 1 and db_rev(env) == "0003"   # transactional DDL: unchanged
+    assert env.current_link == SHA_A
+    assert "ACCEPT" not in last_up_env(env, SHA_A)
+
+
+def test_rollback_reads_the_database_not_a_stale_state_file(env):
+    assert env.deploy(SHA_A, head="0003", compat="").returncode == 0
+    assert env.deploy(SHA_B, head="0004", compat="0003").returncode == 0
+    (env.base / "state" / "db_head").write_text("0001\n")          # stale/corrupt state
+    r = env.run("rollback")
+    assert r.returncode == 0, r.stderr.decode()
+    assert "HUNTER_ACCEPT_SCHEMA_REVISION=0004" in last_up_env(env, SHA_A)
+    assert env.state("db_head") == "0004"                           # repaired from reality
+
+
+def test_rollback_refuses_an_unexpected_database_revision(env):
+    assert env.deploy(SHA_A, head="0003", compat="").returncode == 0
+    assert env.deploy(SHA_B, head="0004", compat="0003").returncode == 0
+    set_db(env, "0009")                                             # not B's head, not A's
+    r = env.run("rollback")
+    assert r.returncode == 9 and env.current_link == SHA_B
+    assert "ACCEPT" not in last_up_env(env, SHA_A)
+    assert "unreadable" not in r.stderr.decode() and "0009" in r.stderr.decode()
+
+
+def test_rollback_after_database_restored_to_previous_schema_needs_no_acceptance(env):
+    assert env.deploy(SHA_A, head="0003", compat="").returncode == 0
+    assert env.deploy(SHA_B, head="0004", compat="0003").returncode == 0
+    set_db(env, "0003")                       # operator restored a backup taken before B
+    r = env.run("rollback")
+    assert r.returncode == 0 and env.current_link == SHA_A
+    assert "ACCEPT" not in last_up_env(env, SHA_A)
+
+
+def test_rollback_is_refused_when_database_cannot_be_read(env):
+    assert env.deploy(SHA_A, head="0003", compat="").returncode == 0
+    assert env.deploy(SHA_B, head="0004", compat="0003").returncode == 0
+    (env.stub / "db_rev").unlink()
+    r = env.run("rollback")
+    assert r.returncode == 9 and env.current_link == SHA_B
+
+
+def test_toggle_back_to_the_newer_release_after_rollback(env):
+    assert env.deploy(SHA_A, head="0003", compat="").returncode == 0
+    assert env.deploy(SHA_B, head="0004", compat="0003").returncode == 0
+    assert env.run("rollback").returncode == 0                      # B -> A (accept 0004)
+    r = env.run("rollback")                                         # A -> B: db == B's head
+    assert r.returncode == 0 and env.current_link == SHA_B
+    assert env.run("rollback").returncode == 0                      # B -> A again (declared)

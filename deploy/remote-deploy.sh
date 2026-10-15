@@ -42,6 +42,32 @@ compose() { # compose <sha> <args...>   (optional env: ACCEPT_SCHEMA_REVISION)
      docker compose -p "$PROJECT" --env-file "$BASE/shared/.env" --env-file "$relenv" "$@")
 }
 
+actual_db_revision() { # actual_db_revision <sha>: what the database REALLY says (never state files)
+  local rev
+  rev="$(compose "$1" exec -T postgres psql -U hunter -d hunter -qAt \
+          -c 'SELECT version_num FROM alembic_version' 2>/dev/null | tr -d '\r' | head -1)" || true
+  [[ "$rev" =~ ^[0-9A-Za-z_]{1,32}$ ]] && printf '%s' "$rev"
+  return 0
+}
+
+# accept_revision <db_now> <target_head> <leaving_head> <leaving_compat_csv>
+# Prints the revision the TARGET release may be told to accept ("" = none needed).
+# Returns 1 when the target must not be started against this database.
+#   - db already at the target's own head       -> nothing to accept
+#   - db at the head of the release we are leaving AND that release's SIGNED declaration
+#     lists the target's head                   -> accept exactly that revision
+#   - anything else (unknown / unexpected)      -> refuse; never accept arbitrary revisions
+accept_revision() {
+  local db_now="$1" target_head="$2" leaving_head="$3" leaving_compat="$4"
+  if [[ -z "$db_now" ]]; then return 1; fi
+  if [[ "$db_now" == "$target_head" ]]; then printf ''; return 0; fi
+  if [[ "$db_now" == "$leaving_head" && -n "$target_head" \
+        && ",$leaving_compat," == *",$target_head,"* ]]; then
+    printf '%s' "$db_now"; return 0
+  fi
+  return 1
+}
+
 health_check() {
   curl -fsS --retry 10 --retry-delay 3 --retry-connrefused http://127.0.0.1:8000/ready >/dev/null
   curl -fsS http://127.0.0.1:8000/health | grep -q '"submission_enabled":false'
@@ -106,20 +132,21 @@ MSG
 }
 
 do_rollback() {
-  local current previous cur_head prev_head db_head accept=""
+  local current previous cur_head prev_head db_now accept leaving_compat
   current="$(read_state current_sha)"; previous="$(read_state previous_sha)"
   cur_head="$(read_state current_head)"; prev_head="$(read_state previous_head)"
-  db_head="$(read_state db_head)"
   [[ "$previous" =~ ^[0-9a-f]{40}$ ]] || die "no previous release recorded" 3
   [[ -d "$BASE/releases/$previous" ]] || die "previous release directory missing" 3
-  if [[ "$(read_state rollback_ok)" != 1 ]]; then
-    echo "deploy: rollback refused: the database schema ($db_head) is not known to be" \
-         "compatible with $previous (head ${prev_head:-unknown})." >&2
+  # the declaration that matters is the one SIGNED INTO the release we are leaving
+  leaving_compat="$(read_state "compat-$current")"
+  db_now="$(actual_db_revision "$current")"
+  if ! accept="$(accept_revision "$db_now" "$prev_head" "$cur_head" "$leaving_compat")"; then
+    echo "deploy: rollback refused: database is at '${db_now:-unreadable}'; $previous (head" \
+         "'${prev_head:-unknown}') is not covered by the signed declaration of $current" \
+         "(head '${cur_head:-unknown}', compatible with '${leaving_compat:-nothing}')." >&2
     manual_recovery
     exit 9
   fi
-  # A newer-but-compatible schema is accepted explicitly, never silently.
-  [[ -n "$db_head" && "$db_head" != "$prev_head" ]] && accept="$db_head"
   export ACCEPT_SCHEMA_REVISION="$accept"
   if ! activate "$previous"; then
     echo "deploy: rollback target $previous failed verification; re-activating $current" >&2
@@ -133,10 +160,8 @@ do_rollback() {
   echo "$current" > "$(state previous_sha)"
   echo "$prev_head" > "$(state current_head)"
   echo "$cur_head" > "$(state previous_head)"
-  # going forward again is always safe (the DB is at that release's head); going back again
-  # is only safe if the DB schema matches the other release's head
-  if [[ "$db_head" == "$cur_head" ]]; then echo 1 > "$(state rollback_ok)"; else echo 0 > "$(state rollback_ok)"; fi
-  echo "rolled back to $previous (verified: images, health, schema; DB revision ${db_head:-unknown} accepted)"
+  echo "$db_now" > "$(state db_head)"
+  echo "rolled back to $previous (verified: images, health, schema; DB revision ${db_now} ${accept:+accepted explicitly})"
 }
 
 do_deploy() { # do_deploy <normal|irreversible>
@@ -230,15 +255,29 @@ do_deploy() { # do_deploy <normal|irreversible>
   if ! ( set_current "$sha" && activate "$sha" ); then
     echo "deploy: $sha failed (migration, start or health check); restoring ${previous:-<none>}" >&2
     if [[ -n "$previous" ]]; then
+      # The new release may already have migrated the database. Read the REAL revision and
+      # let the previous release accept it only if this bundle's signed declaration says so.
+      local db_now accept
+      db_now="$(actual_db_revision "$sha")"
+      if accept="$(accept_revision "$db_now" "$run_head" "$new_head" "$compat")"; then
+        export ACCEPT_SCHEMA_REVISION="$accept"
+        [[ -n "$accept" ]] && echo "deploy: database already at $db_now; $previous will accept it (declared compatible)" >&2
+      else
+        echo "deploy: database is at '${db_now:-unreadable}', which $previous may not accept" >&2
+        export ACCEPT_SCHEMA_REVISION=""
+      fi
       set_current "$previous"
       if ! activate "$previous"; then
         echo "deploy: RESTORE ALSO FAILED" >&2
         manual_recovery
         exit 10
       fi
+      echo "$db_now" > "$(state db_head)"
+      echo "deploy: restored $previous (verified: images, health, schema)" >&2
     fi
     exit 1
   fi
+  printf '%s' "$compat" > "$(state "compat-$sha")"
   [[ -n "$previous" && "$previous" != "$sha" ]] && {
     echo "$previous" > "$(state previous_sha)"
     echo "$run_head" > "$(state previous_head)"

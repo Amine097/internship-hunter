@@ -94,6 +94,7 @@ services:
   discovery:
     <<: *app
     command: ["python", "-m", "hunter.worker"]
+    stop_grace_period: 150s   # finish/release the current scan before SIGKILL (agents <= 110s)
     environment:
       <<: *db-env
       AGENT_TOKEN_CLAUDE_1: ${AGENT_TOKEN_CLAUDE_1:?set_AGENT_TOKEN_CLAUDE_1}

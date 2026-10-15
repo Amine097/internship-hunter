@@ -42,9 +42,10 @@ The V1 work queue is now one PostgreSQL table (`tasks`). Nothing in it is execut
 2. **Egress is enforced by topology, not by proxy variables.** Agent networks are `internal`
    (no gateway): the only reachable address besides the orchestrator is the agent's own
    egress proxy. `HTTPS_PROXY` is merely how the CLI finds it; ignoring it yields "network
-   unreachable", not a bypass. The proxy (tinyproxy, non-root) allows `CONNECT` to `:443` on
-   exact hostnames only, default-deny; IP literals, other ports, look-alike domains and other
-   providers' hosts are refused. The lists are policy, kept in `compose.yaml`/`.env`.
+   unreachable", not a bypass. The proxy (tinyproxy, non-root) is **CONNECT-only**: filtering
+   matches the request target, and the allow patterns are `^<host>:443$`, so plain-HTTP
+   forwarding (even to an allowed host), other ports, IP literals, look-alike domains and
+   other providers' hosts are all refused (checked in `deploy/smoke-test.sh`). The lists are policy, kept in `compose.yaml`/`.env`.
 3. **Task leases and fencing** (`hunter/taskqueue.py`). A task is claimed in one short
    transaction under `FOR UPDATE SKIP LOCKED` and gets a random `lease_token` and expiry;
    a heartbeat thread renews it. Every write a worker makes to a scan's results happens in a

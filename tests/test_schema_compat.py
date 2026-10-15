@@ -119,3 +119,30 @@ def test_lint_catches_a_contracting_migration(tmp_path):
                    "def upgrade():\n    op.drop_column('scans', 'error')\n"
                    "def downgrade():\n    pass\n")
     assert FORBIDDEN.search(_upgrade_body(bad))
+
+
+# --- accept-protocol baseline (compat.json must not promise what old releases cannot do) ---
+
+def test_compat_json_does_not_list_releases_without_the_accept_protocol():
+    since = COMPAT["accept_protocol_since"]
+    assert since == "0003"                      # first release implementing the protocol
+    assert "0002" not in COMPAT["rollback_compatible_with"]
+    assert "0001" not in COMPAT["rollback_compatible_with"]
+    assert since in _chain()
+
+
+def test_every_declared_revision_is_at_or_after_the_protocol_baseline():
+    sys.path.insert(0, str(ROOT / "deploy"))
+    import schema_info
+    assert schema_info.info(ROOT)["rollback_compatible"] == COMPAT["rollback_compatible_with"]
+
+
+def test_schema_info_rejects_pre_protocol_declarations(tmp_path):
+    import shutil
+    tree = tmp_path / "t"
+    shutil.copytree(ROOT / "hunter" / "migrations", tree / "hunter" / "migrations")
+    (tree / "hunter" / "migrations" / "compat.json").write_text(json.dumps(
+        {"accept_protocol_since": "0003", "rollback_compatible_with": ["0002"]}))
+    r = subprocess.run([sys.executable, str(ROOT / "deploy" / "schema_info.py"), str(tree)],
+                       capture_output=True, text=True)
+    assert r.returncode == 1 and "predates accept_protocol_since" in r.stderr

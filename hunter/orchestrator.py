@@ -149,8 +149,19 @@ def _store_jobs(db, scan_id: int, jobs: list[dict]) -> None:
             db.add(ScanJob(scan_id=scan_id, job_id=job.id))
 
 
-def execute_scan(queue: TaskQueue, claim: Claim, client_factory=None, transport=None) -> dict:
-    """Runs one claimed scan. Raises LeaseLost / TaskCancelled if ownership ends."""
+class Shutdown(Exception):
+    """The worker was asked to stop; the task goes back to the queue, attempt unconsumed."""
+
+
+def _check_stop(stop) -> None:
+    if stop is not None and stop.is_set():
+        raise Shutdown
+
+
+def execute_scan(queue: TaskQueue, claim: Claim, client_factory=None, transport=None,
+                 stop=None) -> dict:
+    """Runs one claimed scan. Raises LeaseLost / TaskCancelled / Shutdown if it must end."""
+    _check_stop(stop)
     with session_scope() as db:
         scan = db.get(Scan, claim.scan_id)
         filters = dict(db.get(SearchProfile, scan.profile_id).filters)
@@ -166,6 +177,7 @@ def execute_scan(queue: TaskQueue, claim: Claim, client_factory=None, transport=
                 db.add(AgentRun(scan_id=claim.scan_id, agent=r["agent"], state=r["state"],
                                 output=r["output"]))
 
+        _check_stop(stop)  # between the two slow phases: the cheapest safe place to yield
         sources = read_sources(get_settings().sources_path)
         jobs, errors = fetch_all(sources, deadline=time.monotonic() + ATS_BUDGET_S,
                                  transport=transport)
@@ -186,13 +198,20 @@ def execute_scan(queue: TaskQueue, claim: Claim, client_factory=None, transport=
             "sources": len(sources), "errors": errors}
 
 
-def process_claim(queue: TaskQueue, claim: Claim, **kw) -> dict | None:
+def process_claim(queue: TaskQueue, claim: Claim, stop=None, **kw) -> dict | None:
     """Worker entry point for one claimed task; never raises for expected conditions."""
     if claim.kind != "scan":  # unreachable (DB CHECK), kept as defence in depth
         queue.fail_or_retry(claim, "unsupported task kind")
         return None
     try:
-        return execute_scan(queue, claim, **kw)
+        return execute_scan(queue, claim, stop=stop, **kw)
+    except Shutdown:
+        try:
+            with session_scope() as db:
+                queue.release(db, claim)
+            log.info("released task %s on shutdown (attempt not consumed)", claim.task_id)
+        except LeaseLost:
+            pass
     except LeaseLost as exc:
         log.warning("lease lost, abandoning task %s: %s", claim.task_id, exc)
     except TaskCancelled:

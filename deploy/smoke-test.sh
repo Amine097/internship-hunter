@@ -2,6 +2,7 @@
 # End-to-end smoke, isolation and egress test against a RUNNING stack (demo mode, throwaway
 # secrets). Usage: ADMIN_TOKEN=... deploy/smoke-test.sh [docker compose args, e.g. -p x]
 # SMOKE_EXTERNAL=0 skips the checks that need real Internet access (allowed-host CONNECT).
+# SMOKE_EXPECT_ROOTLESS=1 additionally asserts the Docker daemon is rootless (production host).
 set -Eeuo pipefail
 : "${ADMIN_TOKEN:?set ADMIN_TOKEN}"
 API="${API_URL:-http://127.0.0.1:8000}"
@@ -112,12 +113,28 @@ PY
 }
 denied() { [[ "$1" != 200 ]] && return 0 || return 1; }
 for t in "example.com 443" "1.1.1.1 443" "169.254.169.254 443" "10.0.0.1 443" "host.docker.internal 443" \
+         "100.64.0.1 443" "100.100.100.100 443" "192.168.0.1 443" "172.16.0.1 443" \
+         "127.0.0.1 443" "localhost 443" \
          "api.anthropic.com 22" "api.anthropic.com.evil.example 443" "api.openai.com 443"; do
   read -r host port <<<"$t"
   denied "$(connect agent-claude-1 egress-claude-1 "$host" "$port")" || fail "claude-1 proxy allowed $host:$port"
 done
 denied "$(connect agent-codex egress-codex api.anthropic.com 443)" || fail "codex proxy allowed anthropic"
-ok "proxy refuses other hosts, IP literals, metadata/LAN addresses, other ports and look-alikes"
+ok "proxy refuses other hosts, IP literals, tailnet/LAN/metadata/loopback addresses, other ports and look-alikes"
+
+plain="$(exec_in agent-codex python - <<'PY' | tr -d '\r'
+import socket
+try:
+    s = socket.create_connection(("egress-codex", 3128), timeout=8)
+    s.sendall(b"GET http://api.openai.com/ HTTP/1.1\r\nHost: api.openai.com\r\nConnection: close\r\n\r\n")
+    print(s.recv(64).split(b" ")[1].decode())
+except Exception:
+    print("error")
+PY
+)"
+[[ "$plain" != 200 && "$plain" != 301 && "$plain" != 404 && "$plain" != 400 ]] \
+  || fail "proxy forwarded a plain-HTTP request to an allowed host (status $plain)"
+ok "proxy is CONNECT-only: plain HTTP forwarding to an allowed host is refused ($plain)"
 if [[ "$EXTERNAL" == 1 ]]; then
   [[ "$(connect agent-claude-1 egress-claude-1 api.anthropic.com 443)" == 200 ]] \
     || fail "claude-1 cannot reach its provider"
@@ -125,6 +142,34 @@ if [[ "$EXTERNAL" == 1 ]]; then
     || fail "codex cannot reach its provider"
   ok "legitimate provider access still works (CONNECT api.anthropic.com / api.openai.com)"
 fi
+
+# 4b. host isolation (the checks that matter most on a rootless production host) ----------------
+# (1) Docker control surface: no container holds the Docker socket or runs privileged
+bad="$("${COMPOSE[@]}" ps -q | xargs -r docker inspect --format \
+  '{{.Name}} priv={{.HostConfig.Privileged}} sock={{range .Mounts}}{{.Source}} {{end}}' \
+  | grep -E 'priv=true|docker\.sock' || true)"
+[[ -z "$bad" ]] || fail "container with Docker socket or privileged: $bad"
+if [[ "${SMOKE_EXPECT_ROOTLESS:-0}" == 1 ]]; then
+  docker info --format '{{.SecurityOptions}}' | grep -q rootless || fail "Docker daemon is not rootless"
+  ok "Docker daemon is rootless"
+fi
+ok "no container mounts the Docker socket or runs privileged"
+# (2) the only container with an outbound route cannot reach host-side services
+gw="$(exec_in egress-codex sh -c "ip route | awk '/default/ {print \$3; exit}'" | tr -d '\r')"
+if [[ -n "$gw" ]]; then
+  for port in 22 2375 2376 5432 8000; do
+    if exec_in egress-codex nc -z -w 3 "$gw" "$port" >/dev/null 2>&1; then
+      fail "egress proxy container can reach host/gateway $gw:$port"
+    fi
+  done
+  ok "egress proxy cannot reach its gateway/host on ssh, docker API, postgres or the API port"
+fi
+# (3) no listening port other than the published loopback API on the host side
+published="$("${COMPOSE[@]}" ps --format '{{.Publishers}}' | grep -v '^\[\]$' | grep -v '^$' || true)"
+if grep -E '0\.0\.0\.0|::' <<<"$published" | grep -vq '^$'; then
+  fail "a service is published on all interfaces: $published"
+fi
+ok "only loopback-published ports"
 
 # 5. the worker survives and keeps serving -------------------------------------------------
 id="$(api -X POST "$API/scan/2" | python3 -c 'import sys,json; print(json.load(sys.stdin)["scan_id"])')"

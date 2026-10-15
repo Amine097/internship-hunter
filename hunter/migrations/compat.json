@@ -1,4 +1,5 @@
 {
-  "_comment": "Revisions of PREVIOUS releases whose code still works on the schema at this release's head (expand-only migrations). Rollback to a release whose head is not listed is refused. See docs/backup-restore.md.",
-  "rollback_compatible_with": ["0002"]
+  "_comment": "accept_protocol_since: the first revision whose release implements HUNTER_ACCEPT_SCHEMA_REVISION. rollback_compatible_with: previous heads that still work on THIS release's head (expand-only migrations). Releases older than accept_protocol_since can never be listed: they refuse any newer revision. See docs/backup-restore.md.",
+  "accept_protocol_since": "0003",
+  "rollback_compatible_with": []
 }

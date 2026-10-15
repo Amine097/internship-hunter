@@ -31,7 +31,9 @@ Docker daemon (see "Evidence" in the PR description). No secrets are configured.
 `deploy/build-artifacts.sh` (no secrets) produces `source.tar.gz` (`git archive`),
 `images.tar.gz` (`docker save` of `internship-hunter-{app,agent,egress}:<sha>`) and a
 6-line `manifest` (sha, hashes, created, `schema_head`, `rollback_compatible`);
-`deploy/sign-bundle.sh` verifies and signs it. `deploy/make-bundle.sh` does both locally. `remote-deploy.sh` then:
+`deploy/sign-bundle.sh` recomputes the schema metadata from the source archive (text parsing
+only), checks commit id, member types and script modes, and writes + signs the manifest
+itself. `deploy/make-bundle.sh` does both locally. `remote-deploy.sh` then:
 
 0. accepts only regular files/directories in the bundle and the source archive (no
    symlinks, hard links or devices);
@@ -99,6 +101,14 @@ you -> Actions "Deploy (manual)" (action=deploy, ref=<full SHA>)
 `workflow_dispatch` runs the workflow file of the *selected* branch; the environment's
 "main only" rule is what stops a branch-edited workflow from reaching the secrets.
 Also: branch protection on `main` requiring all CI jobs, and secret scanning.
+
+## Stopping workers (routine deploys)
+
+`docker compose` sends SIGTERM and waits `stop_grace_period: 150s` for `discovery`. A worker
+that is stopping checks between the agent and ATS phases and hands the task back with
+`release()` — **without consuming an attempt** — so routine deployments do not exhaust the
+three retries reserved for crashes. Only a worker killed after the grace period goes through
+lease expiry and spends one.
 
 ## Go-live gates (all must be true before setting `DEPLOY_ENABLED`)
 
