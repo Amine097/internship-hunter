@@ -110,12 +110,24 @@ that is stopping checks between the agent and ATS phases and hands the task back
 three retries reserved for crashes. Only a worker killed after the grace period goes through
 lease expiry and spends one.
 
+## Host isolation depends on the host (what CI cannot prove)
+
+On a rootful Docker host every container can reach services the host listens on at the
+bridge gateway address. GitHub-hosted runners are such hosts (`sshd` on `0.0.0.0:22`), so the
+CI `docker` job runs `deploy/smoke-test.sh` with `SMOKE_HOST_ISOLATION=report` and prints
+what is reachable. On the production host the same script **must** pass with the default
+`enforce` mode and `SMOKE_EXPECT_ROOTLESS=1`; that requires rootless Docker and `sshd` bound
+to the Tailscale interface only. Whether rootless Docker's slirp4netns/pasta gateway exposes
+host loopback on your setup is **unverified** until that run.
+
 ## Go-live gates (all must be true before setting `DEPLOY_ENABLED`)
 
 - [ ] CI is green on `main`, including the `docker` job (real daemon) and `lint-test`
       without skips.
 - [ ] `docs/acceptance-checklist.md` server section executed on the real host.
 - [ ] Rootless Docker confirmed on the host; script refusal tested once.
+- [ ] `SMOKE_EXPECT_ROOTLESS=1 deploy/smoke-test.sh` passes **in enforce mode** on the host
+      (the CI run only reports host exposure).
 - [ ] Provider terms for unattended CLI use confirmed (otherwise stay in `AGENT_MODE=demo`).
 - [ ] Backup copied off-host once and `deploy/verify-restore.sh` run on the server.
 - [ ] Rollback rehearsed on the server with two real releases.

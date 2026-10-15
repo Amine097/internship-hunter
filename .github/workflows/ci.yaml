@@ -96,6 +96,10 @@ jobs:
       - name: Build, start and wait for healthchecks (real daemon)
         run: docker compose up -d --build --wait --wait-timeout 420
       - name: Smoke + isolation + egress + forged-task test
+        env:
+          # GitHub-hosted runners are rootful with sshd on all interfaces, so the
+          # proxy->host probe is reported, not enforced. It is enforced on the server.
+          SMOKE_HOST_ISOLATION: report
         run: deploy/smoke-test.sh
       - name: Backup restores into a scratch database
         run: deploy/verify-restore.sh

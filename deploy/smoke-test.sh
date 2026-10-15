@@ -3,6 +3,11 @@
 # secrets). Usage: ADMIN_TOKEN=... deploy/smoke-test.sh [docker compose args, e.g. -p x]
 # SMOKE_EXTERNAL=0 skips the checks that need real Internet access (allowed-host CONNECT).
 # SMOKE_EXPECT_ROOTLESS=1 additionally asserts the Docker daemon is rootless (production host).
+# SMOKE_HOST_ISOLATION=enforce (default) | report
+#   The proxy->host-gateway probe depends on the HOST, not on this repository: on a rootful
+#   Docker host any container can reach services the host listens on at the bridge gateway
+#   (e.g. sshd on 0.0.0.0, as on GitHub-hosted runners). CI therefore runs "report" and prints
+#   what is reachable; the production smoke test MUST run "enforce" (docs/deployment.md).
 set -Eeuo pipefail
 : "${ADMIN_TOKEN:?set ADMIN_TOKEN}"
 API="${API_URL:-http://127.0.0.1:8000}"
@@ -155,14 +160,26 @@ if [[ "${SMOKE_EXPECT_ROOTLESS:-0}" == 1 ]]; then
 fi
 ok "no container mounts the Docker socket or runs privileged"
 # (2) the only container with an outbound route cannot reach host-side services
+HOST_ISOLATION="${SMOKE_HOST_ISOLATION:-enforce}"
+[[ "$HOST_ISOLATION" == enforce || "$HOST_ISOLATION" == report ]] \
+  || fail "SMOKE_HOST_ISOLATION must be enforce or report"
 gw="$(exec_in egress-codex sh -c "ip route | awk '/default/ {print \$3; exit}'" | tr -d '\r')"
 if [[ -n "$gw" ]]; then
+  reachable=""
   for port in 22 2375 2376 5432 8000; do
     if exec_in egress-codex nc -z -w 3 "$gw" "$port" >/dev/null 2>&1; then
-      fail "egress proxy container can reach host/gateway $gw:$port"
+      reachable="$reachable $port"
     fi
   done
-  ok "egress proxy cannot reach its gateway/host on ssh, docker API, postgres or the API port"
+  if [[ -z "$reachable" ]]; then
+    ok "egress proxy cannot reach its gateway/host ($gw) on ssh, docker API, postgres or API port"
+  elif [[ "$HOST_ISOLATION" == enforce ]]; then
+    fail "egress proxy container can reach host/gateway $gw on port(s):$reachable"
+  else
+    echo "WARN host-isolation (report mode): proxy container reaches $gw on port(s):$reachable" \
+         "- host services are exposed to containers on this Docker host; NOT acceptable in" \
+         "production (needs rootless Docker + sshd bound to the tailnet interface)"
+  fi
 fi
 # (3) no listening port other than the published loopback API on the host side
 published="$("${COMPOSE[@]}" ps --format '{{.Publishers}}' | grep -v '^\[\]$' | grep -v '^$' || true)"

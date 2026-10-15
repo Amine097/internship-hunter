@@ -83,3 +83,13 @@ def test_deploy_scripts_are_executable_in_git():
     scripts = [ln for ln in out if ln.endswith((".sh", ".py"))]
     assert scripts
     assert all(ln.startswith("100755") for ln in scripts), scripts
+
+
+def test_ci_smoke_reports_but_deploy_gate_enforces_host_isolation():
+    ci = (WF / "ci.yaml").read_text()
+    assert "SMOKE_HOST_ISOLATION: report" in ci            # explicit, never implicit
+    smoke = (WF.parents[1] / "deploy" / "smoke-test.sh").read_text()
+    assert 'SMOKE_HOST_ISOLATION:-enforce' in smoke        # strict unless told otherwise
+    assert "SMOKE_HOST_ISOLATION" not in (WF / "deploy.yaml").read_text()
+    doc = (WF.parents[1] / "docs" / "deployment.md").read_text()
+    assert "enforce" in doc and "SMOKE_EXPECT_ROOTLESS=1" in doc

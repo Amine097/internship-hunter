@@ -85,8 +85,9 @@ revision; **S** = must be done on the real server. Nothing marked S has been don
 ## Rootless-host isolation (run `SMOKE_EXPECT_ROOTLESS=1 deploy/smoke-test.sh` on the server)
 Derived checks (also run in CI against the Docker runner, without the rootless assertion):
 - [x] **L** no container mounts the Docker socket or runs privileged; daemon is rootless (**S**)
-- [x] **L** the egress proxy (the only container with an outbound route) cannot reach its
-      gateway/host on ssh, the Docker API, postgres or the API port
+- [x] **L** (Docker Desktop VM) the egress proxy cannot reach its gateway/host on ssh, the
+      Docker API, postgres or the API port. **GitHub runner (rootful, sshd on 0.0.0.0): it CAN
+      reach `172.19.0.1:22`** — host-dependent, so CI reports it and the server must enforce it
 - [x] **L** only loopback-published ports; proxy refuses tailnet (100.64/10, 100.100.100.100),
       RFC1918, link-local, loopback literals and `localhost`
 - [ ] **S** the same three, on the rootless production host, plus Tailscale ACL review
