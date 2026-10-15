@@ -1,71 +1,91 @@
 #!/usr/bin/env bash
-# End-to-end smoke + isolation test against a RUNNING stack (demo mode, throwaway secrets).
-# Usage: ADMIN_TOKEN=... deploy/smoke-test.sh [docker compose args, e.g. -p hunterverify --env-file f]
+# End-to-end smoke, isolation and egress test against a RUNNING stack (demo mode, throwaway
+# secrets). Usage: ADMIN_TOKEN=... deploy/smoke-test.sh [docker compose args, e.g. -p x]
+# SMOKE_EXTERNAL=0 skips the checks that need real Internet access (allowed-host CONNECT).
 set -Eeuo pipefail
 : "${ADMIN_TOKEN:?set ADMIN_TOKEN}"
 API="${API_URL:-http://127.0.0.1:8000}"
+EXTERNAL="${SMOKE_EXTERNAL:-1}"
 COMPOSE=(docker compose "$@")
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ok() { echo "ok   $*"; }
 fail() { echo "FAIL $*" >&2; exit 1; }
 api() { curl -fsS -H "X-Admin-Token: $ADMIN_TOKEN" "$@"; }
 exec_in() { local svc="$1"; shift; "${COMPOSE[@]}" exec -T "$svc" "$@"; }
 
-wait_scan() { # wait_scan <scan_id>
+wait_scan() { # wait_scan <scan_id> -> final state
   for _ in $(seq 1 60); do
     state="$(api "$API/scans" | python3 -c "import sys,json; print(next((s['state'] for s in json.load(sys.stdin) if s['id']==$1), ''))")"
-    [[ "$state" == finished || "$state" == partial || "$state" == failed ]] && { echo "$state"; return; }
+    case "$state" in finished|partial|failed|cancelled) echo "$state"; return ;; esac
     sleep 2
   done
   echo timeout
 }
 
+# 1. service level -------------------------------------------------------------------------
 curl -fsS "$API/health" | grep -q '"submission_enabled":false' || fail "health / submission flag"
 ok "health reports submission disabled"
 curl -fsS "$API/ready" | grep -q ready || fail "ready"
-ok "ready (postgres + redis reachable)"
+ok "ready (PostgreSQL reachable, schema matches)"
 [[ "$(curl -s -o /dev/null -w '%{http_code}' "$API/profiles")" == 401 ]] || fail "unauthenticated /profiles"
-ok "admin routes reject missing token"
+ok "admin routes reject a missing token"
 
 id="$(api -X POST "$API/scan/1" | python3 -c 'import sys,json; print(json.load(sys.stdin)["scan_id"])')"
+again="$(api -X POST "$API/scan/1" | python3 -c 'import sys,json; print(json.load(sys.stdin)["scan_id"])')"
+[[ "$id" == "$again" ]] || [[ "$(wait_scan "$id")" != timeout ]] || fail "idempotent scheduling"
 [[ "$(wait_scan "$id")" == finished ]] || fail "scan $id did not finish"
 runs="$(api "$API/scans" | python3 -c "import sys,json; s=[x for x in json.load(sys.stdin) if x['id']==$id][0]; print(sum(a['state']=='finished' and a['output']['mode']=='demo' for a in s['agents']))")"
 [[ "$runs" == 3 ]] || fail "expected 3 finished demo agent runs, got $runs"
-ok "scan $id finished with three isolated demo agents"
+ok "scan $id finished through the PostgreSQL queue with three isolated demo agents"
 
-[[ "$(exec_in redis id -u | tr -d '\r')" != 0 ]] || fail "redis runs as root"
-ok "redis runs unprivileged"
+# 2. the queue is a table: nothing executable can be forged -----------------------------------
+out="$(exec_in discovery python - <<'PY'
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from hunter.db import session_scope
+for stmt in ("UPDATE tasks SET kind = 'subprocess.run'", "UPDATE tasks SET state = 'pwned'"):
+    try:
+        with session_scope() as db:
+            db.execute(text(stmt))
+        print("ACCEPTED", stmt)
+    except IntegrityError:
+        print("rejected")
+PY
+)"
+[[ "$(echo "$out" | tr -d '\r' | sort -u)" == rejected ]] || fail "forged task rows were accepted: $out"
+ok "database rejects forged task kinds/states (no function names, no payloads)"
 
-for target in redis:6379 postgres:5432 agent-claude-1:8100 api:8000; do
-  out="$(exec_in agent-codex python - <<PY
+# 3. agent isolation --------------------------------------------------------------------------
+reach() { # reach <service> <host:port> -> REACHABLE|blocked
+  exec_in "$1" python - <<PY | tr -d '\r'
 import socket
-h, p = "${target%%:*}", int("${target##*:}")
+h, p = "${2%%:*}", int("${2##*:}")
 try:
-    socket.create_connection((h, p), timeout=3)
+    socket.create_connection((h, p), timeout=4)
     print("REACHABLE")
 except OSError:
     print("blocked")
 PY
-)"
-  [[ "$(echo "$out" | tr -d '\r')" == blocked ]] || fail "agent-codex can reach $target"
+}
+for target in postgres:5432 agent-claude-1:8100 api:8000 discovery:8100 egress-claude-1:3128 \
+              1.1.1.1:443 8.8.8.8:53 169.254.169.254:80; do
+  [[ "$(reach agent-codex "$target")" == blocked ]] || fail "agent-codex can reach $target"
 done
-ok "agent container cannot reach redis / postgres / another agent / api"
+ok "agent cannot reach postgres / peers / api / orchestrator / other proxies / the Internet directly"
+[[ "$(reach agent-codex egress-codex:3128)" == REACHABLE ]] || fail "agent cannot reach its own proxy"
+ok "agent reaches only its own egress proxy"
 
 env_dump="$(exec_in agent-codex env)"
-for k in REDIS_URL DATABASE_URL ADMIN_TOKEN TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD REDIS_PASSWORD; do
+for k in DATABASE_URL ADMIN_TOKEN TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD REDIS_URL; do
   grep -q "^$k=" <<<"$env_dump" && fail "agent env contains $k"
 done
 ok "agent environment holds no infrastructure credentials"
 
 for a in agent-claude-1 agent-claude-2 agent-codex; do
-  exec_in discovery python - <<PY || fail "orchestrator cannot reach $a"
-import socket
-socket.create_connection(("$a", 8100), timeout=3)
-PY
+  [[ "$(reach discovery "$a:8100")" == REACHABLE ]] || fail "orchestrator cannot reach $a"
 done
 ok "orchestrator reaches every agent runner"
 
-code="$(exec_in discovery python - <<'PY'
+code="$(exec_in discovery python - <<'PY' | tr -d '\r'
 import urllib.request, urllib.error
 req = urllib.request.Request("http://agent-codex:8100/plan", data=b'{"profile":{"kind":"internship"}}',
                              headers={"Content-Type": "application/json"})
@@ -75,18 +95,39 @@ except urllib.error.HTTPError as e:
     print(e.code)
 PY
 )"
-[[ "$(echo "$code" | tr -d '\r')" == 401 ]] || fail "agent runner accepted an unauthenticated plan request ($code)"
+[[ "$code" == 401 ]] || fail "agent runner accepted an unauthenticated plan request ($code)"
 ok "agent runner rejects unauthenticated calls"
 
-before="$(exec_in discovery python -c "import os,redis; print(redis.Redis.from_url(os.environ['REDIS_URL']).zcard('rq:failed:discovery'))" | tr -d '\r')"
-exec_in discovery python - < "$HERE/smoke/attack.py" >/dev/null
-sleep 8
-exec_in discovery sh -c 'test ! -e /tmp/PWNED-PICKLE && test ! -e /tmp/PWNED-NAME' || fail "ATTACK SUCCEEDED: sentinel exists"
-after="$(exec_in discovery python -c "import os,redis; print(redis.Redis.from_url(os.environ['REDIS_URL']).zcard('rq:failed:discovery'))" | tr -d '\r')"
-[[ $((after - before)) -ge 1 ]] || fail "forged jobs were not recorded as failed"
-ok "pickled and forged-name jobs injected into live Redis were rejected"
+# 4. egress policy ----------------------------------------------------------------------------
+connect() { # connect <agent> <proxy> <host> <port> -> HTTP status of CONNECT, or "error"
+  exec_in "$1" python - <<PY | tr -d '\r'
+import socket
+try:
+    s = socket.create_connection(("$2", 3128), timeout=8)
+    s.sendall(b"CONNECT $3:$4 HTTP/1.1\r\nHost: $3:$4\r\n\r\n")
+    print(s.recv(256).split(b" ")[1].decode())
+except Exception:
+    print("error")
+PY
+}
+denied() { [[ "$1" != 200 ]] && return 0 || return 1; }
+for t in "example.com 443" "1.1.1.1 443" "169.254.169.254 443" "10.0.0.1 443" "host.docker.internal 443" \
+         "api.anthropic.com 22" "api.anthropic.com.evil.example 443" "api.openai.com 443"; do
+  read -r host port <<<"$t"
+  denied "$(connect agent-claude-1 egress-claude-1 "$host" "$port")" || fail "claude-1 proxy allowed $host:$port"
+done
+denied "$(connect agent-codex egress-codex api.anthropic.com 443)" || fail "codex proxy allowed anthropic"
+ok "proxy refuses other hosts, IP literals, metadata/LAN addresses, other ports and look-alikes"
+if [[ "$EXTERNAL" == 1 ]]; then
+  [[ "$(connect agent-claude-1 egress-claude-1 api.anthropic.com 443)" == 200 ]] \
+    || fail "claude-1 cannot reach its provider"
+  [[ "$(connect agent-codex egress-codex api.openai.com 443)" == 200 ]] \
+    || fail "codex cannot reach its provider"
+  ok "legitimate provider access still works (CONNECT api.anthropic.com / api.openai.com)"
+fi
 
+# 5. the worker survives and keeps serving -------------------------------------------------
 id="$(api -X POST "$API/scan/2" | python3 -c 'import sys,json; print(json.load(sys.stdin)["scan_id"])')"
-[[ "$(wait_scan "$id")" == finished ]] || fail "worker unusable after attack"
-ok "worker still processes legitimate scans after the attack"
+[[ "$(wait_scan "$id")" == finished ]] || fail "second profile scan did not finish"
+ok "second scan finished"
 echo "SMOKE TEST PASSED"

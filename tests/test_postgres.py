@@ -1,66 +1,53 @@
-"""Runs only when TEST_DATABASE_URL points at a disposable PostgreSQL (CI service / local)."""
+"""Real-PostgreSQL tests: true concurrency, SKIP LOCKED, and crash recovery with SIGKILL.
+
+Run when TEST_DATABASE_URL points at a disposable database (CI service / local container).
+"""
 import os
+import subprocess
+import sys
+import textwrap
 import threading
+import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
+from hunter import orchestrator
+from hunter.db import session_scope
+from hunter.models import Job, Scan, SearchProfile, Task
+from hunter.taskqueue import Heartbeater, LeaseLost, TaskQueue
+
 TEST_URL = os.environ.get("TEST_DATABASE_URL")
 pytestmark = pytest.mark.skipif(not TEST_URL, reason="TEST_DATABASE_URL not set")
 
 
-@pytest.fixture
-def pg(monkeypatch):
-    from hunter import db
-    from hunter.settings import get_settings
-
-    monkeypatch.setenv("DATABASE_URL", TEST_URL)
-    monkeypatch.setenv("PROFILES_PATH", "config/search_profiles.yaml")
-    get_settings.cache_clear()
-    db.engine.cache_clear()
-    with db.engine().begin() as c:
-        c.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
-    db.init_db()
-    yield db
-    db.engine.cache_clear()
-    get_settings.cache_clear()
-
-
-def test_init_idempotent_and_seeded(pg):
-    from hunter.models import SearchProfile
-    pg.init_db()
-    with pg.session_scope() as s:
-        assert s.scalar(select(func.count()).select_from(SearchProfile)) == 2
+def make_tasks(n: int, q: TaskQueue) -> list[int]:
+    """n independent queued scans (each on its own profile: one active scan per profile)."""
+    ids = []
+    with session_scope() as db:
+        for i in range(n):
+            p = SearchProfile(slug=f"load-{i}", name=f"Load {i}", kind="internship",
+                              enabled=True, filters={"kind": "internship"})
+            db.add(p)
+            db.flush()
+            s = Scan(profile_id=p.id, state="queued")
+            db.add(s)
+            db.flush()
+            q.enqueue(db, s.id)
+            ids.append(s.id)
+    return ids
 
 
-def test_varchar_limits_are_enforced_so_clipping_matters(pg):
-    from hunter.models import Job
+def test_varchar_limits_are_enforced_so_clipping_matters(pg_db):
     with pytest.raises(Exception):
-        with pg.session_scope() as s:
+        with session_scope() as s:
             s.add(Job(canonical_key="k", source="lever", source_url="https://x",
                       title="t" * 400, company="c", location="", description=""))
 
 
-def test_one_active_scan_per_profile_is_a_database_guarantee(pg):
-    from hunter.models import Scan
-    with pg.session_scope() as s:
-        s.add(Scan(profile_id=1, state="queued"))
-    with pytest.raises(IntegrityError):
-        with pg.session_scope() as s:
-            s.add(Scan(profile_id=1, state="running"))
-    with pg.session_scope() as s:  # finished scans are not constrained
-        s.add(Scan(profile_id=1, state="finished"))
-        s.add(Scan(profile_id=1, state="finished"))
-
-
-def test_concurrent_enqueue_race_on_real_postgres(pg, monkeypatch):
-    import fakeredis
-
-    from hunter import orchestrator, queueing
-    server = fakeredis.FakeServer()
-    monkeypatch.setattr(queueing, "redis_connection",
-                        lambda: fakeredis.FakeStrictRedis(server=server))
+def test_one_active_scan_per_profile_under_concurrent_enqueue(pg_db):
     ids, errors = [], []
 
     def go():
@@ -69,19 +56,19 @@ def test_concurrent_enqueue_race_on_real_postgres(pg, monkeypatch):
         except Exception as exc:
             errors.append(repr(exc))
 
-    threads = [threading.Thread(target=go) for _ in range(12)]
+    threads = [threading.Thread(target=go) for _ in range(16)]
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert not errors, errors
     assert len(set(ids)) == 1
+    with session_scope() as db:
+        assert db.scalar(select(func.count()).select_from(Task)) == 1
 
 
-def test_concurrent_job_insert_race(pg):
-    from hunter import orchestrator
-    from hunter.models import Job, Scan
-    with pg.session_scope() as s:
+def test_concurrent_job_insert_race(pg_db):
+    with session_scope() as s:
         s.add(Scan(profile_id=1, state="running"))
-        s.flush()
+    with session_scope() as s:
         scan_id = s.scalar(select(Scan.id))
     data = {"canonical_key": "same", "source": "lever", "source_url": "https://x/1",
             "title": "T", "company": "c", "location": "", "description": ""}
@@ -89,7 +76,8 @@ def test_concurrent_job_insert_race(pg):
 
     def go():
         try:
-            orchestrator._store_jobs(scan_id, [dict(data)])
+            with session_scope() as db:
+                orchestrator._store_jobs(db, scan_id, [dict(data)])
         except Exception as exc:
             errors.append(repr(exc))
 
@@ -97,5 +85,171 @@ def test_concurrent_job_insert_race(pg):
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert not errors, errors
-    with pg.session_scope() as s:
+    with session_scope() as s:
         assert s.scalar(select(func.count()).select_from(Job)) == 1
+
+
+def test_eight_threads_claim_every_task_exactly_once(pg_db):
+    q = TaskQueue()
+    ids = make_tasks(60, q)
+    claimed, lock = [], threading.Lock()
+
+    def worker():
+        while (c := q.claim()) is not None:
+            with lock:
+                claimed.append(c.scan_id)
+            with session_scope() as db:
+                q.fence(db, c)
+                q.complete(db, c)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sorted(claimed) == sorted(ids)            # all done, none twice
+    with session_scope() as db:
+        rows = db.execute(select(Task.state, Task.attempts)).all()
+    assert set(rows) == {("completed", 1)}
+
+
+CLAIMER = textwrap.dedent("""
+    import sys
+    from hunter.taskqueue import TaskQueue
+    q = TaskQueue()
+    while (c := q.claim()) is not None:
+        print(c.scan_id, flush=True)
+""")
+
+
+def test_separate_processes_never_double_claim(pg_db):
+    q = TaskQueue()
+    ids = make_tasks(40, q)
+    procs = [subprocess.Popen([sys.executable, "-c", CLAIMER], stdout=subprocess.PIPE,
+                              text=True, env=os.environ) for _ in range(4)]
+    out = []
+    for p in procs:
+        stdout, _ = p.communicate(timeout=60)
+        assert p.returncode == 0
+        out += [int(x) for x in stdout.split()]
+    assert sorted(out) == sorted(ids)
+
+
+def test_skip_locked_does_not_block_behind_a_locked_row(pg_db):
+    q = TaskQueue()
+    first, second = make_tasks(2, q)
+    from hunter.db import engine
+    with engine().connect() as holder:
+        holder.execute(text("BEGIN"))
+        holder.execute(text("SELECT id FROM tasks WHERE scan_id = :s FOR UPDATE"), {"s": first})
+        started = time.monotonic()
+        claim = q.claim()           # must skip the locked row, not wait for it
+        elapsed = time.monotonic() - started
+        holder.execute(text("ROLLBACK"))
+    assert claim is not None and claim.scan_id == second
+    assert elapsed < 3
+
+
+CRASHER = textwrap.dedent("""
+    import os, signal
+    from datetime import datetime, timedelta, timezone
+    from hunter.taskqueue import TaskQueue
+    off = timedelta(seconds=float(os.environ["CLOCK_OFFSET"]))
+    q = TaskQueue(clock=lambda: datetime.now(timezone.utc) + off, lease=timedelta(seconds=2))
+    c = q.claim()
+    assert c is not None
+    print(c.attempt, flush=True)
+    os.kill(os.getpid(), signal.SIGKILL)     # crash while holding the lease
+""")
+
+
+def _crash(offset: float) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-c", CRASHER], capture_output=True, text=True,
+                          env={**os.environ, "CLOCK_OFFSET": str(offset)}, timeout=60)
+
+
+def test_sigkilled_worker_is_recovered_then_retries_are_bounded(pg_db):
+    q0 = TaskQueue()
+    sid = orchestrator.enqueue_scan(1, q0)
+    offset = 0.0
+    for attempt in (1, 2, 3):
+        r = _crash(offset)
+        assert r.returncode == -9 and r.stdout.strip() == str(attempt)
+        with session_scope() as db:
+            t = db.scalar(select(Task).where(Task.scan_id == sid))
+            assert (t.state, t.attempts) == ("running", attempt)   # abandoned, lease dangling
+        reap_at = offset + 3                      # past the 2s lease
+        recovered = TaskQueue(
+            clock=lambda o=reap_at: datetime.now(timezone.utc) + timedelta(seconds=o)).reap()
+        assert recovered["retried" if attempt < 3 else "failed"] == 1
+        offset = reap_at + 30 * attempt + 1       # past the retry backoff (30s * attempts)
+    with session_scope() as db:
+        t = db.scalar(select(Task).where(Task.scan_id == sid))
+        assert (t.state, t.attempts) == ("failed", 3)
+        assert db.get(Scan, sid).state == "failed"
+        assert "lease expired" in db.get(Scan, sid).error
+
+
+def test_recovered_task_completes_on_a_healthy_worker(pg_db, run_tasks, agent_fleet):
+    sid = orchestrator.enqueue_scan(1)
+    assert _crash(0).returncode == -9
+    time.sleep(2.2)                                   # real lease expiry
+    def at(offset):
+        return TaskQueue(clock=lambda: datetime.now(timezone.utc) + timedelta(seconds=offset))
+
+    assert at(60).reap()["retried"] == 1       # backoff pushes availability to ~now+90s
+    assert run_tasks(at(200)) == 1
+    with session_scope() as db:
+        assert db.get(Scan, sid).state == "finished"
+        t = db.scalar(select(Task).where(Task.scan_id == sid))
+        assert (t.state, t.attempts) == ("completed", 2)
+
+
+def test_heartbeat_keeps_a_slow_task_alive_and_silence_does_not(pg_db):
+    q = TaskQueue(lease=timedelta(seconds=2))
+    make_tasks(2, q)
+    alive, silent = q.claim(), q.claim()
+    stop = threading.Event()
+    reaped = []
+
+    def reaper():
+        while not stop.is_set():
+            reaped.append(TaskQueue().reap())
+            stop.wait(0.3)
+
+    t = threading.Thread(target=reaper)
+    t.start()
+    with Heartbeater(q, alive, interval=0.5) as beat:
+        time.sleep(4.5)
+        beat.check()
+    stop.set()
+    t.join()
+    with session_scope() as db:
+        st = {x.id: (x.state, x.attempts) for x in db.scalars(select(Task))}
+    assert st[alive.task_id] == ("running", 1)
+    assert st[silent.task_id][0] == "queued"         # reaped: no heartbeat
+    with session_scope() as db:                      # the silent worker is fenced out
+        with pytest.raises(LeaseLost):
+            q.fence(db, silent)
+
+
+def test_fence_serialises_with_the_reaper(pg_db):
+    """The fence takes the task row lock: a concurrent reap skips it instead of racing."""
+    q = TaskQueue(lease=timedelta(seconds=1))
+    make_tasks(1, q)
+    claim = q.claim()
+    time.sleep(0.2)
+    with session_scope() as db:
+        q.fence(db, claim)                           # renews + locks until commit
+        assert TaskQueue().reap() == {"retried": 0, "failed": 0, "expired_in_queue": 0}
+        q.complete(db, claim)
+    with session_scope() as db:
+        assert db.scalar(select(Task.state)) == "completed"
+
+
+def test_database_constraints_reject_forged_tasks(pg_db):
+    q = TaskQueue()
+    make_tasks(1, q)
+    for stmt in ("UPDATE tasks SET kind = 'subprocess.run'",
+                 "UPDATE tasks SET state = 'exploded'"):
+        with pytest.raises(IntegrityError):
+            with session_scope() as db:
+                db.execute(text(stmt))

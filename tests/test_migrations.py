@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 
 import pytest
 import yaml
@@ -48,22 +49,39 @@ def test_upgrade_is_idempotent_and_downgrade_roundtrips(fresh_db):
         assert "scans" in inspect(c).get_table_names()
 
 
-def test_legacy_create_all_database_is_stamped_then_upgraded(fresh_db):
-    """A DB made by the pre-Alembic bootstrap (create_all, no index) must upgrade cleanly."""
-    Base.metadata.create_all(fresh_db)
+def test_legacy_pre_alembic_database_is_stamped_then_upgraded(fresh_db):
+    """A DB made by the pre-Alembic bootstrap (schema == revision 0001, no alembic_version,
+    real data inside) must upgrade to head without losing rows."""
+    from alembic import command
     with fresh_db.begin() as c:
-        c.execute(text("DROP INDEX uq_scans_one_active_per_profile"))
+        command.upgrade(db_module._alembic_config(c), "0001")
+        c.execute(text("DROP TABLE alembic_version"))
         c.execute(text("INSERT INTO search_profiles (slug,name,kind,enabled,filters) "
-                       "VALUES ('legacy','Legacy','internship',1,'{}')"
-                       if fresh_db.dialect.name == "sqlite" else
-                       "INSERT INTO search_profiles (slug,name,kind,enabled,filters) "
-                       "VALUES ('legacy','Legacy','internship',true,'{}')"))
+                       "VALUES ('legacy','Legacy','internship', :e, '{}')"),
+                  {"e": True})
     db_module.run_migrations()
     with fresh_db.connect() as c:
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0002"
+        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0003"
         assert c.execute(text("SELECT count(*) FROM search_profiles")).scalar() == 1  # data kept
-        names = {i["name"] for i in inspect(c).get_indexes("scans")}
-        assert "uq_scans_one_active_per_profile" in names
+        assert "tasks" in inspect(c).get_table_names()
+
+
+def test_active_scans_from_the_rq_era_get_a_task(fresh_db):
+    """Scans left queued/running by the Redis-era release must not stay orphaned."""
+    from alembic import command
+    with fresh_db.begin() as c:
+        cfg = db_module._alembic_config(c)
+        command.upgrade(cfg, "0002")
+        c.execute(text("INSERT INTO search_profiles (id,slug,name,kind,enabled,filters) "
+                       "VALUES (1,'p','P','internship', :e, '{}')"), {"e": True})
+        c.execute(text("INSERT INTO scans (id,profile_id,state,created_at,discovered,agent_reports)"
+                       " VALUES (1,1,'running', :t, 0, '[]')"),
+                  {"t": datetime(2026, 10, 1, tzinfo=timezone.utc)})
+    db_module.run_migrations()
+    with fresh_db.connect() as c:
+        row = c.execute(text("SELECT state, attempts FROM tasks WHERE scan_id = 1")).one()
+        assert tuple(row) == ("queued", 0)
+        assert c.execute(text("SELECT state FROM scans WHERE id = 1")).scalar() == "queued"
 
 
 def test_seed_updates_definition_but_keeps_operator_enabled_flag(fresh_db):

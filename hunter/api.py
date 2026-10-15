@@ -4,7 +4,7 @@ import secrets
 from fastapi import Depends, FastAPI, Header, HTTPException
 from sqlalchemy import func, select, text
 
-from hunter import orchestrator
+from hunter import db as database
 from hunter.db import session_scope
 from hunter.models import AgentRun, Application, Job, Scan, SearchProfile
 from hunter.orchestrator import enqueue_scan
@@ -36,13 +36,15 @@ def health():
 
 @app.get("/ready")
 def ready():
-    """Dependency check for deploy smoke tests: PostgreSQL and Redis must both answer."""
+    """PostgreSQL reachable and the schema matches (or is explicitly accepted by) this code."""
     try:
         with session_scope() as db:
             db.execute(text("SELECT 1"))
-        orchestrator.redis_connection().ping()
+        status = database.schema_state()[0]
     except Exception as exc:  # no detail: this endpoint is unauthenticated
         raise HTTPException(status_code=503, detail="not ready") from exc
+    if status not in ("ok", "accepted"):
+        raise HTTPException(status_code=503, detail="schema not ready")
     return {"status": "ready"}
 
 
@@ -103,6 +105,4 @@ def scan(profile_id: int):
         scan_id = enqueue_scan(profile_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"scan_id": scan_id, "state": "queued"}

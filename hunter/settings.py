@@ -8,7 +8,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str = "sqlite:///./hunter-local.db"
-    redis_url: str = "redis://redis:6379/0"
+    # Set only by deploy tooling after it verified rollback compatibility (docs/backup-restore.md)
+    hunter_accept_schema_revision: str = ""
     admin_token: str = ""
     telegram_bot_token: str = ""
     telegram_allowed_user_id: str = ""

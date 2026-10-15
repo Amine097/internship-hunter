@@ -7,7 +7,7 @@ H = {"X-Admin-Token": "t" * 40}
 
 
 @pytest.fixture
-def client(database, fake_redis):
+def client(database):
     return TestClient(api.app)
 
 
@@ -51,3 +51,16 @@ def test_scan_endpoint(client):
 
 def test_ready_checks_dependencies(client):
     assert client.get("/ready").json() == {"status": "ready"}
+
+
+def test_ready_fails_when_schema_is_unknown(client, monkeypatch):
+    from sqlalchemy import text
+
+    from hunter.db import session_scope
+    with session_scope() as db:
+        db.execute(text("UPDATE alembic_version SET version_num = 'zz_future'"))
+    assert client.get("/ready").status_code == 503
+    monkeypatch.setenv("HUNTER_ACCEPT_SCHEMA_REVISION", "zz_future")
+    from hunter.settings import get_settings
+    get_settings.cache_clear()
+    assert client.get("/ready").status_code == 200  # explicitly accepted (verified rollback)

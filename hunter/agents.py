@@ -10,7 +10,7 @@ from hunter.settings import get_settings
 
 AGENTS = ("claude-1", "claude-2", "codex")
 
-# The CLI subprocess gets only these variables. Redis/DB URLs, admin and Telegram tokens
+# The CLI subprocess gets only these variables. DB URLs, admin and Telegram tokens
 # are never forwarded to a model-facing process.
 _ENV_ALLOWLIST = (
     "PATH", "HOME", "LANG", "LC_ALL", "TZ", "CLAUDE_CONFIG_DIR", "CODEX_HOME",

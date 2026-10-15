@@ -1,0 +1,4 @@
+{
+  "_comment": "Revisions of PREVIOUS releases whose code still works on the schema at this release's head (expand-only migrations). Rollback to a release whose head is not listed is refused. See docs/backup-restore.md.",
+  "rollback_compatible_with": ["0002"]
+}

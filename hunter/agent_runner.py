@@ -2,7 +2,7 @@
 
 This process is the whole interface of an untrusted agent runtime: it accepts one
 authenticated POST /plan from the orchestrator and returns a schema-validated plan. It holds
-no Redis or database credentials, and it never initiates a connection to infrastructure.
+no database credentials, and it never initiates a connection to infrastructure.
 """
 import logging
 import secrets

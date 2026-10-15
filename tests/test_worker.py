@@ -1,36 +1,43 @@
+import threading
+
 import pytest
 
-from hunter import queueing, worker
+from hunter import worker
+from hunter.taskqueue import TaskQueue
 
 
-def test_validate_identity_rules():
-    worker.validate_identity("discovery", None)
-    for queue, name in [("claude-1", "claude-1"), ("codex", None), ("discovery", "codex"),
-                        ("bogus", None), ("", None)]:
-        with pytest.raises(ValueError):
-            worker.validate_identity(queue, name)
-
-
-def test_main_enforces_identity_before_touching_redis(monkeypatch):
-    called = []
-    monkeypatch.setattr(queueing, "make_worker", lambda *a, **k: called.append("worker"))
-    monkeypatch.setenv("HUNTER_QUEUE", "discovery")
+def test_worker_refuses_agent_identity(monkeypatch):
     monkeypatch.setenv("HUNTER_AGENT_NAME", "codex")
     with pytest.raises(ValueError):
         worker.main()
-    assert called == []
+    worker.validate_identity(None)
 
 
-def test_main_sweeps_stale_scans_then_works(monkeypatch):
-    order = []
+def test_run_forever_processes_then_stops(database, run_tasks):
+    from hunter import orchestrator
+    orchestrator.enqueue_scan(1)
+    seen, stop = [], threading.Event()
 
-    class W:
-        def work(self):
-            order.append("work")
+    def handler(queue, claim):
+        seen.append(claim.scan_id)
+        stop.set()
 
-    monkeypatch.delenv("HUNTER_AGENT_NAME", raising=False)
-    monkeypatch.setenv("HUNTER_QUEUE", "discovery")
-    monkeypatch.setattr(worker, "sweep_stale_scans", lambda: order.append("sweep"))
-    monkeypatch.setattr(queueing, "make_worker", lambda *a, **k: W())
-    worker.main()
-    assert order == ["sweep", "work"]
+    assert worker.run_forever(TaskQueue(), stop, handler, poll=0.01) == 1
+    assert seen == [1]
+
+
+def test_run_forever_reaps_before_claiming(database, monkeypatch):
+    calls = []
+
+    class Q:
+        def reap(self):
+            calls.append("reap")
+            return {}
+
+        def claim(self):
+            calls.append("claim")
+            stop.set()
+
+    stop = threading.Event()
+    worker.run_forever(Q(), stop, lambda *a: None, poll=0.01)
+    assert calls[:2] == ["reap", "claim"]

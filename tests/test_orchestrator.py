@@ -4,7 +4,7 @@ import httpx
 import pytest
 from sqlalchemy import func, select
 
-from hunter import orchestrator, queueing
+from hunter import orchestrator
 from hunter.db import session_scope
 from hunter.models import AgentRun, Job, Scan, ScanJob, SearchProfile
 
@@ -24,20 +24,19 @@ def sources(tmp_path, monkeypatch):
     )
 
 
-def run_one(drain, conn, profile_id=1):
+def run_one(run_tasks, profile_id=1):
     scan_id = orchestrator.enqueue_scan(profile_id)
-    drain(conn)
+    assert run_tasks() == 1
     return scan_id
 
 
-def test_enqueue_unknown_profile(database, fake_redis):
+def test_enqueue_unknown_profile(database):
     with pytest.raises(ValueError):
         orchestrator.enqueue_scan(9999)
 
 
-def test_full_scan_through_queue_and_http_agents(database, fake_redis, agent_fleet, sources,
-                                                 drain):
-    scan_id = run_one(drain, fake_redis())
+def test_full_scan_through_queue_and_http_agents(database, agent_fleet, sources, run_tasks):
+    scan_id = run_one(run_tasks)
     with session_scope() as db:
         scan = db.get(Scan, scan_id)
         assert scan.state == "finished" and scan.discovered == 1
@@ -47,20 +46,20 @@ def test_full_scan_through_queue_and_http_agents(database, fake_redis, agent_fle
         assert db.scalar(select(ScanJob.decision)) == "unassessed"  # nothing pre-judged
 
 
-def test_repeated_scans_do_not_duplicate_jobs(database, fake_redis, agent_fleet, sources, drain):
+def test_repeated_scans_do_not_duplicate_jobs(database, agent_fleet, sources, run_tasks):
     for _ in range(2):
-        run_one(drain, fake_redis())
+        run_one(run_tasks)
     with session_scope() as db:
         assert db.scalar(select(func.count()).select_from(Job)) == 1
         assert db.scalar(select(func.count()).select_from(ScanJob)) == 2
 
 
-def test_failed_agent_makes_scan_partial(database, fake_redis, agent_fleet, drain):
+def test_failed_agent_makes_scan_partial(database, agent_fleet, run_tasks):
     def broken(agent, profile):
         raise RuntimeError("cli exploded: secret-from-stderr")
 
     agent_fleet["claude-2"] = broken
-    scan_id = run_one(drain, fake_redis())
+    scan_id = run_one(run_tasks)
     with session_scope() as db:
         scan = db.get(Scan, scan_id)
         assert scan.state == "partial"
@@ -71,17 +70,16 @@ def test_failed_agent_makes_scan_partial(database, fake_redis, agent_fleet, drai
         assert len(good) == 2
 
 
-def test_agent_answering_as_another_identity_is_rejected(database, fake_redis, agent_fleet,
-                                                         drain):
+def test_agent_answering_as_another_identity_is_rejected(database, agent_fleet, run_tasks):
     agent_fleet["codex"] = lambda a, p: {"agent": "claude-1", "mode": "cli", "queries": ["x"]}
-    scan_id = run_one(drain, fake_redis())
+    scan_id = run_one(run_tasks)
     with session_scope() as db:
         run = db.scalar(select(AgentRun).where(
             AgentRun.scan_id == scan_id, AgentRun.agent == "codex"))
         assert run.state == "failed"
 
 
-def test_agent_timeout_is_recorded_without_orphan_jobs(database, fake_redis, agent_fleet, drain,
+def test_agent_timeout_is_recorded_without_orphan_jobs(database, agent_fleet, run_tasks,
                                                        monkeypatch):
     release = threading.Event()
 
@@ -92,35 +90,34 @@ def test_agent_timeout_is_recorded_without_orphan_jobs(database, fake_redis, age
     monkeypatch.setattr(orchestrator, "AGENT_TIMEOUT_S", 1)
     agent_fleet["codex"] = hang
     try:
-        scan_id = run_one(drain, fake_redis())
+        scan_id = run_one(run_tasks)
     finally:
         release.set()
     with session_scope() as db:
         assert db.get(Scan, scan_id).state == "partial"
         run = db.scalar(select(AgentRun).where(AgentRun.agent == "codex"))
         assert run.state == "failed"
-    assert fake_redis().llen("rq:queue:discovery") == 0  # nothing left queued behind us
 
 
-def test_unconfigured_token_fails_closed(database, fake_redis, monkeypatch, drain):
+def test_unconfigured_token_fails_closed(database, monkeypatch, run_tasks):
     for name in ("CLAUDE_1", "CLAUDE_2", "CODEX"):
         monkeypatch.setenv(f"AGENT_TOKEN_{name}", "")
     from hunter.settings import get_settings
     get_settings.cache_clear()
-    scan_id = run_one(drain, fake_redis())
+    scan_id = run_one(run_tasks)
     with session_scope() as db:
         assert db.get(Scan, scan_id).state == "partial"
         assert {r.state for r in db.scalars(select(AgentRun))} == {"failed"}
 
 
-def test_active_scan_is_reused_not_duplicated(database, fake_redis):
+def test_active_scan_is_reused_not_duplicated(database):
     first = orchestrator.enqueue_scan(1)
     assert orchestrator.enqueue_scan(1) == first
     with session_scope() as db:
         assert db.scalar(select(func.count()).select_from(Scan)) == 1
 
 
-def test_concurrent_enqueue_creates_single_active_scan(database, fake_redis):
+def test_concurrent_enqueue_creates_single_active_scan(database):
     ids, errors = [], []
 
     def go():
@@ -135,62 +132,18 @@ def test_concurrent_enqueue_creates_single_active_scan(database, fake_redis):
     assert not errors and len(set(ids)) == 1
 
 
-def test_enqueue_failure_marks_scan_failed_and_allows_retry(database, monkeypatch, fake_redis):
-    def broken():
-        raise ConnectionError("redis down")
-
-    monkeypatch.setattr(queueing, "redis_connection", broken)
-    with pytest.raises(RuntimeError):
-        orchestrator.enqueue_scan(1)
-    with session_scope() as db:
-        scan = db.scalar(select(Scan))
-        assert scan.state == "failed" and "ConnectionError" in scan.error
-    monkeypatch.setattr(queueing, "redis_connection", fake_redis)
-    # the failed scan no longer blocks a new one
-    assert orchestrator.enqueue_scan(1) > 0
 
 
-def test_stale_scans_are_swept(database, fake_redis):
-    from datetime import timedelta
-    scan_id = orchestrator.enqueue_scan(1)
-    with session_scope() as db:
-        db.get(Scan, scan_id).created_at = orchestrator.now() - timedelta(hours=1)
-        db.get(Scan, scan_id).state = "running"
-    assert orchestrator.sweep_stale_scans() == 1
-    with session_scope() as db:
-        assert db.get(Scan, scan_id).state == "failed"
-    assert orchestrator.sweep_stale_scans() == 0
 
 
-def test_run_scan_not_claimable_unless_queued(database, fake_redis):
-    scan_id = orchestrator.enqueue_scan(1)
-    with session_scope() as db:
-        db.get(Scan, scan_id).state = "failed"
-    assert orchestrator._run_scan(scan_id) == {"scan_id": scan_id, "skipped": True}
-
-
-def test_unexpected_exception_marks_scan_failed(database, fake_redis, monkeypatch):
-    scan_id = orchestrator.enqueue_scan(1)
-
-    def boom(*a, **k):
-        raise KeyError("x")
-
-    monkeypatch.setattr(orchestrator, "run_agents", boom)
-    with pytest.raises(KeyError):
-        orchestrator.run_scan(scan_id)
-    with session_scope() as db:
-        scan = db.get(Scan, scan_id)
-        assert scan.state == "failed" and scan.finished_at is not None
-
-
-def test_enqueue_all_reports_partial_failure(database, fake_redis):
+def test_enqueue_all_reports_partial_failure(database):
     with session_scope() as db:
         db.get(SearchProfile, 2).enabled = False
     queued, errors = orchestrator.enqueue_all_profiles()
     assert len(queued) == 1 and errors == []
 
 
-def test_oversized_agent_response_is_rejected(database, fake_redis, monkeypatch):
+def test_oversized_agent_response_is_rejected(database, monkeypatch):
     big = b'{"agent":"codex","mode":"demo","queries":[],"note":"' + b"a" * 40_000 + b'"}'
     transport = httpx.MockTransport(lambda r: httpx.Response(200, content=big))
     monkeypatch.setenv("AGENT_TOKEN_CODEX", "z" * 32)
@@ -199,3 +152,12 @@ def test_oversized_agent_response_is_rejected(database, fake_redis, monkeypatch)
     client = httpx.Client(transport=transport)
     with pytest.raises(ValueError, match="too large"):
         orchestrator.call_agent("codex", {"kind": "internship"}, client)
+
+
+def test_two_workers_cannot_run_the_same_scan(database, agent_fleet, run_tasks):
+    from hunter.taskqueue import TaskQueue
+    q = TaskQueue()
+    orchestrator.enqueue_scan(1, q)
+    first, second = q.claim(), q.claim()
+    assert first is not None and second is None
+    assert run_tasks() == 0  # nothing claimable while the first lease is live

@@ -1,18 +1,24 @@
-# Manual production deploy over Tailscale. NEVER triggered by push.
+# Manual production deploy over Tailscale. NEVER triggered by push or pull_request.
 #
-# Disabled by default: the jobs only run when the repository VARIABLE DEPLOY_ENABLED is
-# "true". Do not enable it until every item in docs/deployment.md "Go-live gates" is met.
+# Disabled by default: jobs run only when the repository VARIABLE DEPLOY_ENABLED is "true".
+# Do not enable it until every item in docs/deployment.md "Go-live gates" is met.
+#
+# Secret exposure by job (enforced by tests/test_workflows.py):
+#   verify  no secrets          decides WHAT may be released (main + green CI)
+#   build   no secrets          runs repository code (docker build); output is untrusted data
+#   sign    RELEASE_SIGNING_KEY runs only trusted-main shell; never executes artifact content
+#   deploy  TS_* / DEPLOY_*     transport only; cannot sign
 name: Deploy (manual)
 on:
   workflow_dispatch:
     inputs:
       action:
-        description: deploy (ship a commit) or rollback (previous release, no build)
+        description: deploy | deploy-irreversible (contracting migration; no rollback) | rollback
         type: choice
-        options: [deploy, rollback]
+        options: [deploy, deploy-irreversible, rollback]
         default: deploy
       ref:
-        description: Full 40-char commit SHA on main (deploy only)
+        description: Full 40-char commit SHA on main (deploy actions only)
         required: false
 permissions:
   contents: read
@@ -47,31 +53,57 @@ jobs:
 
   build:
     needs: verify
-    if: inputs.action == 'deploy'
+    if: inputs.action != 'rollback'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with: {fetch-depth: 0, ref: "${{ needs.verify.outputs.sha }}"}
-      - name: Build signed bundle (images tagged by SHA)
+      - name: Build unsigned artifacts (no secrets in this job)
+        run: deploy/build-artifacts.sh "${{ needs.verify.outputs.sha }}" artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: {name: release-artifacts, path: artifacts/, retention-days: 1}
+
+  sign:
+    needs: [verify, build]
+    if: github.ref == 'refs/heads/main' && inputs.action != 'rollback'
+    runs-on: ubuntu-latest
+    environment: release-signing     # own environment: secret + "main only" branch rule
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # the signing script comes from the trusted dispatching commit (main), never from the
+      # release being signed
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: {ref: "${{ github.sha }}"}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: {name: release-artifacts, path: artifacts}
+      - name: Verify and sign (executes nothing from the artifacts)
         env:
-          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}   # separate from the SSH key
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         run: |
-          umask 077; printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/sign_key"
-          deploy/make-bundle.sh "${{ needs.verify.outputs.sha }}" "$RUNNER_TEMP/sign_key" bundle.tar
-          rm -f "$RUNNER_TEMP/sign_key"
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/sign_key"
+          deploy/sign-bundle.sh artifacts "$RUNNER_TEMP/sign_key" \
+            "${{ needs.verify.outputs.sha }}" bundle.tar
+          shred -u "$RUNNER_TEMP/sign_key" || rm -f "$RUNNER_TEMP/sign_key"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: {name: release-bundle, path: bundle.tar, retention-days: 1}
 
   deploy:
-    needs: [verify, build]
-    if: always() && needs.verify.result == 'success' && (needs.build.result == 'success' || inputs.action == 'rollback')
+    needs: [verify, sign]
+    if: always() && needs.verify.result == 'success' && (needs.sign.result == 'success' || inputs.action == 'rollback')
     runs-on: ubuntu-latest
     environment: production        # required reviewers: the manual approval gate
     timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        if: inputs.action == 'deploy'
+        if: inputs.action != 'rollback'
         with: {name: release-bundle}
       - uses: tailscale/github-action@5d536117a7378beffcd6d8523ce73c50fa98684d # v3.2.1
         with:
@@ -93,8 +125,8 @@ jobs:
           ACTION: ${{ inputs.action }}
         run: |
           ssh_cmd=(ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "$TARGET")
-          if [[ "$ACTION" == rollback ]]; then
-            "${ssh_cmd[@]}" rollback
-          else
-            "${ssh_cmd[@]}" deploy < bundle.tar
-          fi
+          case "$ACTION" in
+            rollback) "${ssh_cmd[@]}" rollback ;;
+            deploy|deploy-irreversible) "${ssh_cmd[@]}" "$ACTION" < bundle.tar ;;
+            *) echo "unknown action"; exit 1 ;;
+          esac

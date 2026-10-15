@@ -1,51 +1,38 @@
 """Scan orchestration (trusted side).
 
-A scan row is recorded before a job is enqueued. Agents are *called* over a narrow HTTP
-interface and their replies are validated; they never touch Redis or the database.
+A scan and its task are created in one transaction. A worker claims the task under a lease
+and drives: agents -> persist -> ATS -> persist+finish. Agents are *called* over a narrow HTTP
+interface and their replies are validated; they never touch the queue or the database.
 
-State machine: queued -> running -> finished | partial | failed
-(``queued``/``running`` older than STALE_AFTER are swept to ``failed``.)
+Scan states:  queued -> running -> finished | partial | failed | cancelled
+(``partial`` = completed, but an agent or a source failed.) Every write made by a worker is
+fenced by its task lease (hunter.taskqueue), so an expired worker cannot overwrite results.
 """
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import httpx
 from pydantic import ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
-from hunter import queueing
 from hunter.agents import AGENTS
 from hunter.db import session_scope
 from hunter.models import ACTIVE_STATES, AgentRun, Job, Scan, ScanJob, SearchProfile
 from hunter.schemas import MAX_RESPONSE_BYTES, AgentPlan, AgentProfile
 from hunter.settings import get_settings
 from hunter.sources import fetch_all, read_sources
+from hunter.taskqueue import Claim, Heartbeater, LeaseLost, TaskCancelled, TaskQueue
 
-STALE_AFTER = timedelta(minutes=20)  # > RQ job_timeout (10 min) + slack
+log = logging.getLogger("hunter.orchestrator")
 AGENT_TIMEOUT_S = 110
 ATS_BUDGET_S = 240
 
 
-def redis_connection():
-    return queueing.redis_connection()
-
-
 def now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def sweep_stale_scans() -> int:
-    """Closes scans orphaned by a crashed/OOM-killed worker or a lost Redis job."""
-    with session_scope() as db:
-        result = db.execute(
-            update(Scan)
-            .where(Scan.state.in_(ACTIVE_STATES), Scan.created_at < now() - STALE_AFTER)
-            .values(state="failed", error="stale: no worker completed this scan",
-                    finished_at=now())
-        )
-        return result.rowcount or 0
 
 
 def _active_scan_id(db, profile_id: int) -> int | None:
@@ -54,9 +41,14 @@ def _active_scan_id(db, profile_id: int) -> int | None:
     ))
 
 
-def enqueue_scan(profile_id: int) -> int:
-    """Returns the scan id. A profile with an active scan returns that scan (idempotent)."""
-    sweep_stale_scans()
+def enqueue_scan(profile_id: int, queue: TaskQueue | None = None) -> int:
+    """Returns the scan id. A profile with an active scan returns that scan (idempotent).
+
+    The scan row and its task are created in ONE transaction: there is no window in which a
+    scan exists without work behind it, and the partial unique index makes concurrent calls
+    converge on a single active scan.
+    """
+    queue = queue or TaskQueue()
     with session_scope() as db:
         profile = db.get(SearchProfile, profile_id)
         if profile is None or not profile.enabled:
@@ -68,20 +60,11 @@ def enqueue_scan(profile_id: int) -> int:
         db.add(scan)
         try:
             db.flush()
+            queue.enqueue(db, scan.id)
+            return scan.id
         except IntegrityError:  # lost the race against a concurrent enqueue
             db.rollback()
             return _active_scan_id(db, profile_id)
-        scan_id = scan.id
-    try:
-        queueing.enqueue_scan_job(scan_id)
-    except Exception as exc:  # e.g. Redis down: never leave a phantom "queued" scan behind
-        with session_scope() as db:
-            db.execute(update(Scan).where(Scan.id == scan_id, Scan.state == "queued").values(
-                state="failed", error=f"enqueue failed: {type(exc).__name__}",
-                finished_at=now(),
-            ))
-        raise RuntimeError("Could not enqueue scan; is Redis reachable?") from exc
-    return scan_id
 
 
 def enqueue_all_profiles() -> tuple[list[int], list[str]]:
@@ -147,73 +130,83 @@ def run_agents(profile: dict, client_factory=None) -> list[dict]:
         return list(pool.map(one, AGENTS))
 
 
-# --- the scan job ----------------------------------------------------------------------
+# --- the scan task -------------------------------------------------------------------
 
-def _claim(scan_id: int) -> dict | None:
-    """queued -> running, atomically. Returns the profile filters or None if not claimable."""
+def _store_jobs(db, scan_id: int, jobs: list[dict]) -> None:
+    for data in jobs:
+        job = db.scalar(select(Job).where(Job.canonical_key == data["canonical_key"]))
+        if job is None:
+            try:
+                with db.begin_nested():
+                    job = Job(**data)
+                    db.add(job)
+                    db.flush()
+            except IntegrityError:  # another writer inserted it first
+                job = db.scalar(select(Job).where(Job.canonical_key == data["canonical_key"]))
+        link = db.scalar(select(ScanJob).where(
+            ScanJob.scan_id == scan_id, ScanJob.job_id == job.id))
+        if link is None:
+            db.add(ScanJob(scan_id=scan_id, job_id=job.id))
+
+
+def execute_scan(queue: TaskQueue, claim: Claim, client_factory=None, transport=None) -> dict:
+    """Runs one claimed scan. Raises LeaseLost / TaskCancelled if ownership ends."""
     with session_scope() as db:
-        claimed = db.execute(
-            update(Scan).where(Scan.id == scan_id, Scan.state == "queued").values(state="running")
-        ).rowcount
-        if not claimed:
-            return None
-        scan = db.get(Scan, scan_id)
-        return dict(db.get(SearchProfile, scan.profile_id).filters)
+        scan = db.get(Scan, claim.scan_id)
+        filters = dict(db.get(SearchProfile, scan.profile_id).filters)
+
+    with Heartbeater(queue, claim) as beat:
+        reports = run_agents(filters, client_factory)
+        beat.check()
+        with session_scope() as db:  # agent results are persisted before slow ATS I/O
+            queue.fence(db, claim)
+            db.execute(delete(AgentRun).where(AgentRun.scan_id == claim.scan_id))  # retry-safe
+            db.get(Scan, claim.scan_id).agent_reports = reports
+            for r in reports:
+                db.add(AgentRun(scan_id=claim.scan_id, agent=r["agent"], state=r["state"],
+                                output=r["output"]))
+
+        sources = read_sources(get_settings().sources_path)
+        jobs, errors = fetch_all(sources, deadline=time.monotonic() + ATS_BUDGET_S,
+                                 transport=transport)
+        beat.check()
+        with session_scope() as db:
+            queue.fence(db, claim)  # fencing: an expired worker fails here and rolls back
+            _store_jobs(db, claim.scan_id, jobs)
+            state = ("partial" if errors or any(r["state"] != "finished" for r in reports)
+                     else "finished")
+            done = db.execute(update(Scan).where(
+                Scan.id == claim.scan_id, Scan.state == "running",
+            ).values(state=state, discovered=len(jobs), finished_at=now(),
+                     error="; ".join(errors) if errors else None)).rowcount
+            if done != 1:
+                raise LeaseLost("scan is no longer running")
+            queue.complete(db, claim)
+    return {"scan_id": claim.scan_id, "state": state, "discovered": len(jobs),
+            "sources": len(sources), "errors": errors}
 
 
-def _store_jobs(scan_id: int, jobs: list[dict]) -> None:
-    with session_scope() as db:
-        for data in jobs:
-            job = db.scalar(select(Job).where(Job.canonical_key == data["canonical_key"]))
-            if job is None:
-                try:
-                    with db.begin_nested():
-                        job = Job(**data)
-                        db.add(job)
-                        db.flush()
-                except IntegrityError:  # another writer inserted it first
-                    job = db.scalar(select(Job).where(Job.canonical_key == data["canonical_key"]))
-            link = db.scalar(select(ScanJob).where(
-                ScanJob.scan_id == scan_id, ScanJob.job_id == job.id))
-            if link is None:
-                db.add(ScanJob(scan_id=scan_id, job_id=job.id))
-
-
-def _run_scan(scan_id: int, client_factory=None, transport=None) -> dict:
-    filters = _claim(scan_id)
-    if filters is None:
-        return {"scan_id": scan_id, "skipped": True}
-
-    reports = run_agents(filters, client_factory)
-    with session_scope() as db:  # agent results are persisted before slow ATS I/O starts
-        scan = db.get(Scan, scan_id)
-        scan.agent_reports = reports
-        for report in reports:
-            db.add(AgentRun(scan_id=scan_id, agent=report["agent"], state=report["state"],
-                            output=report["output"]))
-
-    sources = read_sources(get_settings().sources_path)
-    jobs, errors = fetch_all(sources, deadline=time.monotonic() + ATS_BUDGET_S,
-                             transport=transport)
-    _store_jobs(scan_id, jobs)
-    with session_scope() as db:
-        scan = db.get(Scan, scan_id)
-        scan.discovered = len(jobs)
-        scan.error = "; ".join(errors) if errors else None
-        scan.state = (
-            "partial" if errors or any(r["state"] != "finished" for r in reports) else "finished"
-        )
-        scan.finished_at = now()
-    return {"scan_id": scan_id, "discovered": len(jobs), "sources": len(sources),
-            "errors": errors}
-
-
-def run_scan(scan_id: int) -> dict:
-    """RQ entry point (allowlisted in hunter.queueing)."""
+def process_claim(queue: TaskQueue, claim: Claim, **kw) -> dict | None:
+    """Worker entry point for one claimed task; never raises for expected conditions."""
+    if claim.kind != "scan":  # unreachable (DB CHECK), kept as defence in depth
+        queue.fail_or_retry(claim, "unsupported task kind")
+        return None
     try:
-        return _run_scan(scan_id)
-    except Exception as exc:
-        with session_scope() as db:  # never leave a scan stuck in "running"
-            db.execute(update(Scan).where(Scan.id == scan_id, Scan.state == "running").values(
-                state="failed", error=type(exc).__name__, finished_at=now()))
-        raise
+        return execute_scan(queue, claim, **kw)
+    except LeaseLost as exc:
+        log.warning("lease lost, abandoning task %s: %s", claim.task_id, exc)
+    except TaskCancelled:
+        try:
+            with session_scope() as db:
+                queue.fence_loose(db, claim)
+                queue.cancel_running(db, claim)
+        except LeaseLost:
+            pass
+    except Exception as exc:  # unexpected: bounded retry, then the scan is failed
+        try:
+            outcome = queue.fail_or_retry(claim, type(exc).__name__)
+            log.error("task %s attempt %s crashed (%s): %s", claim.task_id, claim.attempt,
+                      type(exc).__name__, outcome)
+        except LeaseLost:
+            pass
+    return None

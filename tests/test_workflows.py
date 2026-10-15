@@ -1,0 +1,85 @@
+"""Static policy checks for the GitHub workflows (what secrets reach which job)."""
+import re
+from pathlib import Path
+
+import yaml
+
+WF = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+DEPLOY = yaml.safe_load((WF / "deploy.yaml").read_text())
+SHA_PIN = re.compile(r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}( |$)")
+
+
+def jobs_referencing(secret: str, doc=DEPLOY):
+    return {name for name, job in doc["jobs"].items() if secret in yaml.safe_dump(job)}
+
+
+def test_signing_key_is_only_reachable_from_the_sign_job():
+    assert jobs_referencing("RELEASE_SIGNING_KEY") == {"sign"}
+    for other in ("ci.yaml",):
+        assert "RELEASE_SIGNING_KEY" not in (WF / other).read_text()
+
+
+def test_sign_job_is_restricted_to_main_and_its_own_environment():
+    sign = DEPLOY["jobs"]["sign"]
+    assert sign["environment"] == "release-signing"
+    assert "refs/heads/main" in sign["if"]
+    assert "verify" in sign["needs"] and "build" in sign["needs"]
+    uses = [s.get("uses", "") for s in sign["steps"]]
+    assert not any("docker" in u for u in uses)
+    runs = "\n".join(s.get("run", "") for s in sign["steps"])
+    assert "docker " not in runs and "tar -x" not in runs  # never executes/extracts artifacts
+    checkout = next(s for s in sign["steps"] if "checkout" in s.get("uses", ""))
+    assert checkout["with"]["ref"] == "${{ github.sha }}"  # trusted code, not the release ref
+
+
+def test_build_and_verify_jobs_hold_no_secrets_and_no_environment():
+    for name in ("verify", "build"):
+        job = DEPLOY["jobs"][name]
+        dumped = yaml.safe_dump(job)
+        assert "secrets." not in dumped, name
+        assert "environment" not in job, name
+
+
+def test_deploy_secrets_are_confined_to_the_deploy_job():
+    for secret in ("TS_OAUTH_SECRET", "DEPLOY_SSH_KEY", "DEPLOY_KNOWN_HOSTS"):
+        assert jobs_referencing(secret) == {"deploy"}, secret
+    assert DEPLOY["jobs"]["deploy"]["environment"] == "production"
+
+
+def test_deploy_is_manual_only_and_disabled_by_default():
+    triggers = DEPLOY[True] if True in DEPLOY else DEPLOY["on"]
+    assert set(triggers) == {"workflow_dispatch"}
+    assert "vars.DEPLOY_ENABLED == 'true'" in DEPLOY["jobs"]["verify"]["if"]
+    for name in ("build", "sign", "deploy"):
+        assert "verify" in str(DEPLOY["jobs"][name]["needs"])
+
+
+def test_ci_does_not_run_on_untrusted_secrets_and_cancels_only_prs():
+    ci = yaml.safe_load((WF / "ci.yaml").read_text())
+    assert "secrets." not in (WF / "ci.yaml").read_text()
+    assert "pull_request'" in ci["concurrency"]["cancel-in-progress"]
+    assert ci["permissions"] == {"contents": "read"}
+
+
+def test_all_actions_are_pinned_to_commit_shas():
+    for wf in WF.glob("*.yaml"):
+        doc = yaml.safe_load(wf.read_text())
+        for job in doc["jobs"].values():
+            for step in job.get("steps", []):
+                if "uses" in step:
+                    assert SHA_PIN.match(step["uses"]), (wf.name, step["uses"])
+
+
+def test_actions_read_permission_only_where_needed():
+    perms = {n: j.get("permissions", {}) for n, j in DEPLOY["jobs"].items()}
+    assert perms["verify"].get("actions") == "read"
+    assert all("actions" not in p for n, p in perms.items() if n != "verify")
+
+
+def test_deploy_scripts_are_executable_in_git():
+    import subprocess
+    out = subprocess.run(["git", "ls-files", "-s", "deploy"], capture_output=True, text=True,
+                         cwd=WF.parents[1], check=True).stdout.split("\n")
+    scripts = [ln for ln in out if ln.endswith((".sh", ".py"))]
+    assert scripts
+    assert all(ln.startswith("100755") for ln in scripts), scripts

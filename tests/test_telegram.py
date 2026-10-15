@@ -13,7 +13,7 @@ def update(text, user=OWNER, chat=OWNER, chat_type="private"):
 
 
 @pytest.fixture(autouse=True)
-def _env(database, fake_redis):
+def _env(database):
     yield
 
 
@@ -63,14 +63,3 @@ def test_handler_failure_does_not_crash(monkeypatch):
 
     monkeypatch.setattr(telegram, "handle_command", boom)
     assert process_update(update("/profiles"), OWNER)[1] == "Command failed; check service logs."
-
-
-def test_scan_reports_redis_outage(monkeypatch):
-
-    def broken():
-        raise ConnectionError("down")
-
-    from hunter import queueing
-    monkeypatch.setattr(queueing, "redis_connection", broken)
-    assert "Redis unreachable" in handle_command("/scan", "/scan 1")
-    assert "Could not queue" in handle_command("/scan", "/scan")

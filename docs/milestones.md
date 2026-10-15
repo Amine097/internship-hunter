@@ -2,7 +2,7 @@
 
 ## M1 — Bootstrap (this delivery)
 - Private GitHub-ready repo, CI checks.
-- Backend, read-only endpoints, scheduler, RQ queues, isolated agents.
+- Backend, read-only endpoints, scheduler, PostgreSQL task queue, isolated agents.
 - Search profiles, ATS public discovery with explicit allowlist.
 - Telegram /profiles /status /scan, PostgreSQL persistence.
 - CLI agent adapters available but default to deterministic demo mode.

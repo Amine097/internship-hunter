@@ -4,16 +4,14 @@ import socket
 import threading
 import time
 
-import fakeredis
 import pytest
 import uvicorn
-from rq import SimpleWorker
-from rq.timeouts import TimerDeathPenalty
 
 from hunter import db as db_module
-from hunter import queueing
+from hunter import orchestrator
 from hunter.agent_runner import create_app
 from hunter.settings import get_settings
+from hunter.taskqueue import TaskQueue
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 AGENT_NAMES = ("claude-1", "claude-2", "codex")
@@ -37,22 +35,37 @@ def database(tmp_path, monkeypatch):
     get_settings.cache_clear()
 
 
+class FakeClock:
+    """Injectable clock so lease expiry can be tested deterministically."""
+
+    def __init__(self):
+        from datetime import datetime, timezone
+        self.t = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, seconds: float):
+        from datetime import timedelta
+        self.t += timedelta(seconds=seconds)
+
+
 @pytest.fixture
-def fake_redis(monkeypatch):
-    server = fakeredis.FakeServer()
-
-    def connect():
-        return fakeredis.FakeStrictRedis(server=server)
-
-    monkeypatch.setattr(queueing, "redis_connection", connect)
-    return connect
+def clock():
+    return FakeClock()
 
 
-def _drain(connection, worker_class=SimpleWorker):
-    """Runs the hardened worker until the queue is empty (in this thread)."""
-    worker = queueing.make_worker(connection, worker_class=worker_class)
-    worker.death_penalty_class = TimerDeathPenalty
-    worker.work(burst=True, with_scheduler=False)
+@pytest.fixture
+def run_tasks():
+    """Drains the queue in this thread: claim -> process, like one worker in burst mode."""
+    def go(queue: TaskQueue | None = None, **kw) -> int:
+        queue = queue or TaskQueue()
+        done = 0
+        while (claim := queue.claim()) is not None:
+            orchestrator.process_claim(queue, claim, **kw)
+            done += 1
+        return done
+    return go
 
 
 class _Server(uvicorn.Server):
@@ -105,23 +118,41 @@ def agent_fleet(monkeypatch):
     get_settings.cache_clear()
 
 
-@pytest.fixture
-def real_redis_url():
-    url = os.environ.get("TEST_REDIS_URL")
-    if not url:
-        pytest.skip("TEST_REDIS_URL not set")
-    return url
-
-
-@pytest.fixture
-def drain():
-    return _drain
-
-
 def pytest_sessionstart(session):
     """In CI the service-backed tests must run; a silent skip would hide a broken service."""
-    if os.environ.get("CI_REQUIRE_SERVICES") and not (
-        os.environ.get("TEST_DATABASE_URL") and os.environ.get("TEST_REDIS_URL")
-    ):
-        raise pytest.UsageError(
-            "CI_REQUIRE_SERVICES is set but TEST_DATABASE_URL/TEST_REDIS_URL are missing")
+    if os.environ.get("CI_REQUIRE_SERVICES") and not os.environ.get("TEST_DATABASE_URL"):
+        raise pytest.UsageError("CI_REQUIRE_SERVICES is set but TEST_DATABASE_URL is missing")
+
+
+def _prepare_db(kind, tmp_path, monkeypatch):
+    from sqlalchemy import text
+    url = f"sqlite:///{tmp_path / 'q.db'}" if kind == "sqlite" else os.environ["TEST_DATABASE_URL"]
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setenv("PROFILES_PATH", str(ROOT / "config/search_profiles.yaml"))
+    monkeypatch.setenv("SOURCES_PATH", str(tmp_path / "sources.yaml"))
+    monkeypatch.setenv("ADMIN_TOKEN", "t" * 40)
+    (tmp_path / "sources.yaml").write_text("sources: []\n")
+    get_settings.cache_clear()
+    db_module.engine.cache_clear()
+    if kind == "postgres":
+        with db_module.engine().begin() as c:
+            c.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+    db_module.init_db()
+
+
+@pytest.fixture(params=["sqlite"] + (["postgres"] if os.environ.get("TEST_DATABASE_URL") else []))
+def any_db(request, tmp_path, monkeypatch):
+    """Migrated + seeded database on SQLite and (when configured) real PostgreSQL."""
+    _prepare_db(request.param, tmp_path, monkeypatch)
+    yield request.param
+    db_module.engine.cache_clear()
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def pg_db(tmp_path, monkeypatch):
+    """Real PostgreSQL only; the module-level skipif covers a missing TEST_DATABASE_URL."""
+    _prepare_db("postgres", tmp_path, monkeypatch)
+    yield "postgres"
+    db_module.engine.cache_clear()
+    get_settings.cache_clear()

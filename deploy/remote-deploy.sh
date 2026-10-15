@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # Server-side deploy entrypoint, installed as the SSH *forced command* of the CI key:
 #   restrict,command="/opt/internship-hunter/deploy/remote-deploy.sh" ssh-ed25519 AAAA... ci-deploy
-# SSH_ORIGINAL_COMMAND is exactly "deploy" (signed release bundle on stdin) or "rollback".
+# SSH_ORIGINAL_COMMAND is exactly one of:
+#   deploy               signed release bundle on stdin; refused if rollback would be unsafe
+#   deploy-irreversible  same, but the operator accepts that rollback to the running release
+#                        will NOT be possible (contracting migration); backup is mandatory
+#   rollback             re-activate the previous release from already-loaded images
 #
 # Properties:
-#  * the bundle must carry a manifest signed with the release-signing key (separate from the
-#    SSH key) whose public half lives in $BASE/shared/allowed_signers; hashes of the source
-#    archive and the pre-built images are checked against the signed manifest
-#  * images are immutable, tagged by commit SHA, and loaded - never built - on this host
-#  * one deploy at a time (flock); failed deploys restore the previous release automatically
-#  * rollback re-uses already-loaded images: no build, no registry, no network
+#  * manifest signed with the release-signing key (separate from the SSH key); hashes of the
+#    source archive and pre-built images are checked against the signed manifest
+#  * only regular files/directories are accepted in the bundle and the source archive
+#  * images are immutable, tagged by commit SHA, loaded - never built - on this host
+#  * schema compatibility with the rollback target is checked BEFORE anything changes
+#  * one deploy at a time (flock); failed deploys restore the previous release
+#  * rollback is only reported successful after images, health and schema were verified
 #  * refuses to run against a rootful Docker daemon unless HUNTER_ALLOW_ROOTFUL=1
 set -Eeuo pipefail
 
@@ -21,13 +26,18 @@ SIGN_NAMESPACE=hunter-release
 
 die() { echo "deploy: $1" >&2; exit "${2:-1}"; }
 state() { echo "$BASE/state/$1"; }
+read_state() { cat "$(state "$1")" 2>/dev/null || true; }
 
-compose() { # compose <sha> <args...>
-  # RELEASE_SHA is passed as an env-file *and* env var so no env-forwarding quirk can make
+compose() { # compose <sha> <args...>   (optional env: ACCEPT_SCHEMA_REVISION)
+  # RELEASE_SHA goes through an env-file *and* env var so no env-forwarding quirk can make
   # compose fall back to a mutable tag (activate() additionally verifies what is running).
   local sha="$1" relenv; shift
   relenv="$BASE/state/release-$sha.env"
-  printf 'RELEASE_SHA=%s\n' "$sha" > "$relenv"
+  {
+    printf 'RELEASE_SHA=%s\n' "$sha"
+    [[ -n "${ACCEPT_SCHEMA_REVISION:-}" ]] \
+      && printf 'HUNTER_ACCEPT_SCHEMA_REVISION=%s\n' "$ACCEPT_SCHEMA_REVISION"
+  } > "$relenv"
   (cd "$BASE/releases/$sha" && RELEASE_SHA="$sha" \
      docker compose -p "$PROJECT" --env-file "$BASE/shared/.env" --env-file "$relenv" "$@")
 }
@@ -37,28 +47,30 @@ health_check() {
   curl -fsS http://127.0.0.1:8000/health | grep -q '"submission_enabled":false'
 }
 
-activate() { # activate <sha>: start (never build) the release, then verify health
+verify_running_images() { # every first-party container must run exactly this release's images
+  local sha="$1" images bad n
+  images="$(compose "$sha" ps --format '{{.Image}}')" || return 1
+  bad="$(grep '^internship-hunter-' <<<"$images" | grep -v ":$sha\$" || true)"
+  n="$(grep -c "^internship-hunter-.*:$sha\$" <<<"$images" || true)"
+  if [[ -n "$bad" || "$n" -lt 10 ]]; then
+    echo "deploy: containers are not running release $sha (found: ${bad:-only $n matching})" >&2
+    return 1
+  fi
+}
+
+activate() { # activate <sha>: start (never build) the release, then verify it
   # Explicit `|| return`: errexit is suppressed when this runs inside `if !`/`||`.
   local sha="$1"
   docker image inspect "internship-hunter-app:$sha" >/dev/null 2>&1 \
     || { echo "deploy: image internship-hunter-app:$sha is not loaded" >&2; return 3; }
   docker image inspect "internship-hunter-agent:$sha" >/dev/null 2>&1 \
     || { echo "deploy: image internship-hunter-agent:$sha is not loaded" >&2; return 3; }
+  docker image inspect "internship-hunter-egress:$sha" >/dev/null 2>&1 \
+    || { echo "deploy: image internship-hunter-egress:$sha is not loaded" >&2; return 3; }
   compose "$sha" config -q || return 1
   compose "$sha" up -d --no-build --remove-orphans --wait --wait-timeout 300 || return 1
   verify_running_images "$sha" || return 1
   health_check || return 1
-}
-
-verify_running_images() { # every first-party container must run exactly this release's images
-  local sha="$1" images bad n
-  images="$(compose "$sha" ps --format '{{.Image}}')" || return 1
-  bad="$(grep '^internship-hunter-' <<<"$images" | grep -v ":$sha\$" || true)"
-  n="$(grep -c "^internship-hunter-.*:$sha\$" <<<"$images" || true)"
-  if [[ -n "$bad" || "$n" -lt 7 ]]; then
-    echo "deploy: containers are not running release $sha (found: ${bad:-only $n matching})" >&2
-    return 1
-  fi
 }
 
 set_current() { ln -sfn "$BASE/releases/$1" "$BASE/current.new" && mv -Tf "$BASE/current.new" "$BASE/current"; }
@@ -69,20 +81,66 @@ require_rootless() {
     || die "refusing to deploy: Docker daemon is not rootless (see docs/deployment.md)" 5
 }
 
-do_rollback() {
-  local current previous
-  current="$(cat "$(state current_sha)" 2>/dev/null || true)"
-  previous="$(cat "$(state previous_sha)" 2>/dev/null || true)"
-  [[ "$previous" =~ ^[0-9a-f]{40}$ ]] || die "no previous release recorded" 3
-  [[ -d "$BASE/releases/$previous" ]] || die "previous release directory missing" 3
-  activate "$previous" || die "rollback target failed health check" 6
-  set_current "$previous"
-  echo "$previous" > "$(state current_sha)"
-  [[ -n "$current" ]] && echo "$current" > "$(state previous_sha)"
-  echo "rolled back to $previous (DB schema is NOT downgraded; see docs/backup-restore.md)"
+only_regular_entries() { # only_regular_entries <tar> <z|-> <allow_dirs 0|1>: no links/devices/fifos
+  local flag="-tvf"; [[ "$2" == z ]] && flag="-tzvf"
+  local bad
+  if [[ "$3" == 1 ]]; then
+    bad="$(tar "$flag" "$1" | cut -c1 | grep -v '^[-d]' || true)"
+  else
+    bad="$(tar "$flag" "$1" | cut -c1 | grep -v '^-' || true)"
+  fi
+  [[ -z "$bad" ]]
 }
 
-do_deploy() {
+manual_recovery() {
+  local backups
+  # shellcheck disable=SC2012  # names are generated by this script (sha + timestamp)
+  backups="$(ls -1t "$BASE"/backups/*.sql.gz 2>/dev/null | head -3 | tr '\n' ' ' || true)"
+  cat >&2 <<MSG
+deploy: MANUAL RECOVERY REQUIRED
+  running release : $(read_state current_sha)
+  database revision: $(read_state db_head)
+  latest backups   : $backups
+  procedure        : docs/backup-restore.md ("Restore")
+MSG
+}
+
+do_rollback() {
+  local current previous cur_head prev_head db_head accept=""
+  current="$(read_state current_sha)"; previous="$(read_state previous_sha)"
+  cur_head="$(read_state current_head)"; prev_head="$(read_state previous_head)"
+  db_head="$(read_state db_head)"
+  [[ "$previous" =~ ^[0-9a-f]{40}$ ]] || die "no previous release recorded" 3
+  [[ -d "$BASE/releases/$previous" ]] || die "previous release directory missing" 3
+  if [[ "$(read_state rollback_ok)" != 1 ]]; then
+    echo "deploy: rollback refused: the database schema ($db_head) is not known to be" \
+         "compatible with $previous (head ${prev_head:-unknown})." >&2
+    manual_recovery
+    exit 9
+  fi
+  # A newer-but-compatible schema is accepted explicitly, never silently.
+  [[ -n "$db_head" && "$db_head" != "$prev_head" ]] && accept="$db_head"
+  export ACCEPT_SCHEMA_REVISION="$accept"
+  if ! activate "$previous"; then
+    echo "deploy: rollback target $previous failed verification; re-activating $current" >&2
+    export ACCEPT_SCHEMA_REVISION=""
+    activate "$current" || echo "deploy: could not re-activate $current either" >&2
+    manual_recovery
+    exit 6
+  fi
+  set_current "$previous"
+  echo "$previous" > "$(state current_sha)"
+  echo "$current" > "$(state previous_sha)"
+  echo "$prev_head" > "$(state current_head)"
+  echo "$cur_head" > "$(state previous_head)"
+  # going forward again is always safe (the DB is at that release's head); going back again
+  # is only safe if the DB schema matches the other release's head
+  if [[ "$db_head" == "$cur_head" ]]; then echo 1 > "$(state rollback_ok)"; else echo 0 > "$(state rollback_ok)"; fi
+  echo "rolled back to $previous (verified: images, health, schema; DB revision ${db_head:-unknown} accepted)"
+}
+
+do_deploy() { # do_deploy <normal|irreversible>
+  local mode="$1"
   [[ -f "$BASE/shared/.env" ]] || die "missing $BASE/shared/.env" 3
   [[ -f "$BASE/shared/allowed_signers" ]] || die "missing $BASE/shared/allowed_signers" 3
 
@@ -94,6 +152,7 @@ do_deploy() {
   local members; members="$(tar -tf "$stage/bundle.tar" | LC_ALL=C sort | tr '\n' ' ')"
   [[ "$members" == "images.tar.gz manifest manifest.sig source.tar.gz " ]] \
     || die "unexpected bundle members: $members" 2
+  only_regular_entries "$stage/bundle.tar" - 0 || die "bundle contains non-regular entries" 2
   tar -xf "$stage/bundle.tar" -C "$stage" --no-same-owner --no-same-permissions
 
   # 1) signature over the manifest
@@ -101,14 +160,18 @@ do_deploy() {
     -s "$stage/manifest.sig" < "$stage/manifest" >/dev/null 2>&1 \
     || die "manifest signature verification FAILED" 7
 
-  # 2) strict manifest parsing
-  local sha src_hash img_hash created
+  # 2) strict manifest parsing (exactly six known lines)
+  local sha src_hash img_hash created new_head compat
   sha="$(sed -n 's/^sha=\([0-9a-f]\{40\}\)$/\1/p' "$stage/manifest")"
   src_hash="$(sed -n 's/^source_sha256=\([0-9a-f]\{64\}\)$/\1/p' "$stage/manifest")"
   img_hash="$(sed -n 's/^images_sha256=\([0-9a-f]\{64\}\)$/\1/p' "$stage/manifest")"
   created="$(sed -n 's/^created=\([0-9]\{10\}\)$/\1/p' "$stage/manifest")"
-  [[ -n "$sha" && -n "$src_hash" && -n "$img_hash" && -n "$created" ]] || die "bad manifest" 2
-  [[ "$(wc -l < "$stage/manifest")" -eq 4 ]] || die "bad manifest (extra lines)" 2
+  new_head="$(sed -n 's/^schema_head=\([0-9A-Za-z_]\{1,32\}\)$/\1/p' "$stage/manifest")"
+  compat="$(sed -n 's/^rollback_compatible=\(\([0-9A-Za-z_]\{1,32\}\(,[0-9A-Za-z_]\{1,32\}\)*\)\{0,1\}\)$/\1/p' "$stage/manifest")"
+  [[ -n "$sha" && -n "$src_hash" && -n "$img_hash" && -n "$created" && -n "$new_head" ]] \
+    || die "bad manifest" 2
+  grep -q '^rollback_compatible=' "$stage/manifest" || die "bad manifest (no compat line)" 2
+  [[ "$(wc -l < "$stage/manifest")" -eq 6 ]] || die "bad manifest (unexpected lines)" 2
 
   # 3) artifact integrity
   [[ "$(sha256sum "$stage/source.tar.gz" | cut -d' ' -f1)" == "$src_hash" ]] \
@@ -117,10 +180,25 @@ do_deploy() {
     || die "image archive hash mismatch" 7
 
   # 4) replay/downgrade protection: a validly signed but OLDER bundle is refused
-  local last_created; last_created="$(cat "$(state current_created)" 2>/dev/null || echo 0)"
+  local last_created; last_created="$(read_state current_created)"; last_created="${last_created:-0}"
   [[ "$created" -ge "$last_created" ]] || die "bundle is older than the running release" 7
 
-  # 5) unpack source safely
+  # 5) schema compatibility with the rollback target (the release running right now)
+  local running run_head rollback_ok=1
+  running="$(read_state current_sha)"; run_head="$(read_state current_head)"
+  if [[ -n "$running" && "$running" != "$sha" ]]; then
+    if [[ -n "$run_head" && ( "$run_head" == "$new_head" || ",$compat," == *",$run_head,"* ) ]]; then
+      rollback_ok=1
+    elif [[ "$mode" == irreversible ]]; then
+      rollback_ok=0
+      echo "deploy: accepted IRREVERSIBLE deploy: rollback to $running will be refused" >&2
+    else
+      die "schema $new_head is not declared rollback-compatible with the running release (head ${run_head:-unknown}); use deploy-irreversible after reviewing the migration" 9
+    fi
+  fi
+
+  # 6) unpack source safely (regular files/dirs only, no absolute or .. paths)
+  only_regular_entries "$stage/source.tar.gz" z 1 || die "source archive has non-regular entries" 2
   if tar -tzf "$stage/source.tar.gz" | grep -Eq '^/|(^|/)\.\.(/|$)'; then
     die "source archive contains unsafe paths" 2
   fi
@@ -129,12 +207,12 @@ do_deploy() {
   tar -xzf "$stage/source.tar.gz" -C "$rel.partial" --no-same-owner --no-same-permissions
   rm -rf "$rel"; mv "$rel.partial" "$rel"
 
-  # 6) immutable images: load, never build
+  # 7) immutable images: load, never build
   docker load -i "$stage/images.tar.gz" >/dev/null
 
-  local previous; previous="$(cat "$(state current_sha)" 2>/dev/null || true)"
+  local previous="$running"
 
-  # 7) database backup before anything is changed (skipped on the very first deploy)
+  # 8) database backup before anything is changed (skipped on the very first deploy)
   if [[ -n "$previous" ]] && compose "$previous" ps -q postgres 2>/dev/null | grep -q .; then
     mkdir -p "$BASE/backups"
     local dump stamp
@@ -147,29 +225,41 @@ do_deploy() {
     ls -1t "$BASE"/backups/pre-*.sql.gz | tail -n +11 | xargs -r rm -f
   fi
 
-  # 8) switch; any failure restores the previous release
+  # 9) switch; a failed migration, start or health check restores the previous release
+  export ACCEPT_SCHEMA_REVISION=""
   if ! ( set_current "$sha" && activate "$sha" ); then
-    echo "deploy: $sha failed; restoring ${previous:-<none>}" >&2
+    echo "deploy: $sha failed (migration, start or health check); restoring ${previous:-<none>}" >&2
     if [[ -n "$previous" ]]; then
       set_current "$previous"
-      activate "$previous" || echo "deploy: RESTORE ALSO FAILED - manual intervention" >&2
+      if ! activate "$previous"; then
+        echo "deploy: RESTORE ALSO FAILED" >&2
+        manual_recovery
+        exit 10
+      fi
     fi
     exit 1
   fi
-  [[ -n "$previous" && "$previous" != "$sha" ]] && echo "$previous" > "$(state previous_sha)"
+  [[ -n "$previous" && "$previous" != "$sha" ]] && {
+    echo "$previous" > "$(state previous_sha)"
+    echo "$run_head" > "$(state previous_head)"
+  }
   echo "$sha" > "$(state current_sha)"
+  echo "$new_head" > "$(state current_head)"
+  echo "$new_head" > "$(state db_head)"
   echo "$created" > "$(state current_created)"
+  echo "$rollback_ok" > "$(state rollback_ok)"
 
-  # 9) prune old releases, never current or previous
-  local keep_prev; keep_prev="$(cat "$(state previous_sha)" 2>/dev/null || true)"
+  # 10) prune old releases, never current or previous
+  local keep_prev; keep_prev="$(read_state previous_sha)"
   # shellcheck disable=SC2012  # directory names are 40-hex commit SHAs
   ls -1dt "$BASE"/releases/*/ 2>/dev/null | tail -n +$((KEEP_RELEASES + 1)) | while read -r d; do
     name="$(basename "$d")"
     [[ "$name" == "$sha" || "$name" == "$keep_prev" ]] && continue
     rm -rf "$d"
-    docker image rm "internship-hunter-app:$name" "internship-hunter-agent:$name" >/dev/null 2>&1 || true
+    docker image rm "internship-hunter-app:$name" "internship-hunter-agent:$name" \
+      "internship-hunter-egress:$name" >/dev/null 2>&1 || true
   done
-  echo "deployed $sha"
+  echo "deployed $sha (schema $new_head; rollback_ok=$rollback_ok)"
 }
 
 STAGE=""
@@ -180,9 +270,10 @@ main() {
   exec 9>"$BASE/state/deploy.lock"
   flock -n 9 || die "another deploy is running" 4
   case "${SSH_ORIGINAL_COMMAND:-}" in
-    deploy)   require_rootless; do_deploy ;;
-    rollback) require_rootless; do_rollback ;;
-    *)        die "unsupported command" 2 ;;
+    deploy)              require_rootless; do_deploy normal ;;
+    deploy-irreversible) require_rootless; do_deploy irreversible ;;
+    rollback)            require_rootless; do_rollback ;;
+    *)                   die "unsupported command" 2 ;;
   esac
 }
 main

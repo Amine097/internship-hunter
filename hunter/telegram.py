@@ -106,13 +106,11 @@ def handle_command(command: str, raw: str) -> str:
                 return f"Scan #{enqueue_scan(int(arguments[1]))} queued or already running"
             queued, errors = enqueue_all_profiles()
             if errors and not queued:
-                return "Could not queue scans (Redis unreachable or no enabled profile)."
+                return "Could not queue scans (no enabled profile or database error)."
             note = f" ({len(errors)} failed)" if errors else ""
             return f"Queued scans: {queued}{note}"
         except ValueError:
             return "Profile unavailable. Use /profiles"
-        except RuntimeError:
-            return "Could not queue scan (Redis unreachable)."
     return "Unknown command. Use /help"
 
 

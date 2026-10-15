@@ -16,6 +16,10 @@ Docker daemon (see "Evidence" in the PR description). No secrets are configured.
 - **Two independent keys**: the SSH key (reaches the server) and the release-signing key
   (authorises content). The server only trusts the signing key's public half
   (`shared/allowed_signers`), so a stolen SSH key alone cannot deploy arbitrary code.
+- **The signing key never meets repository code.** Jobs are split: `build` (runs repository
+  code, no secrets) → `sign` (own GitHub environment `release-signing`, main only, runs
+  trusted-main shell that only hashes/verifies the artifacts) → `deploy` (transport only).
+  `tests/test_workflows.py` enforces which job may reference which secret.
 - **Rootless Docker is mandatory** for the deploy user: the script refuses a rootful daemon
   (exit 5). A docker-group member is root-equivalent on a shared host.
 - Developer agents (Claude Code/Codex on your workstation) get no server access, no deploy or
@@ -24,10 +28,13 @@ Docker daemon (see "Evidence" in the PR description). No secrets are configured.
 
 ## Bundle and verification
 
-`deploy/make-bundle.sh <sha> <key> out.tar` produces `manifest`, `manifest.sig`,
-`source.tar.gz` (`git archive`) and `images.tar.gz` (`docker save` of
-`internship-hunter-{app,agent}:<sha>`). `remote-deploy.sh` then:
+`deploy/build-artifacts.sh` (no secrets) produces `source.tar.gz` (`git archive`),
+`images.tar.gz` (`docker save` of `internship-hunter-{app,agent,egress}:<sha>`) and a
+6-line `manifest` (sha, hashes, created, `schema_head`, `rollback_compatible`);
+`deploy/sign-bundle.sh` verifies and signs it. `deploy/make-bundle.sh` does both locally. `remote-deploy.sh` then:
 
+0. accepts only regular files/directories in the bundle and the source archive (no
+   symlinks, hard links or devices);
 1. takes the deploy lock (`flock`; a concurrent deploy exits 4) and checks rootless Docker;
 2. caps the bundle size and accepts exactly the four expected members;
 3. verifies the SSH signature (`ssh-keygen -Y verify`, namespace `hunter-release`);
@@ -36,7 +43,9 @@ Docker daemon (see "Evidence" in the PR description). No secrets are configured.
 6. rejects archives with absolute or `..` paths; unpacks to `releases/<sha>`;
 7. `docker load`s the images (never `build`);
 8. takes a `pg_dump` backup and aborts on failure, before any change;
-9. switches `current`, runs `compose up -d --no-build --wait`, then checks `/ready` and
+9. (schema compatibility with the running release is checked here, before any change;
+   see `docs/backup-restore.md`)
+10. switches `current`, runs `compose up -d --no-build --wait`, then checks `/ready` and
    `submission_enabled == false`;
 10. on **any** failure restores the previous release; on success records `current_sha` /
     `previous_sha` and prunes old releases (never current or previous).
@@ -60,8 +69,8 @@ you -> Actions "Deploy (manual)" (action=deploy, ref=<full SHA>)
 2. `mkdir -p /opt/internship-hunter/{releases,state,staging,shared,backups,deploy}`; install
    `deploy/remote-deploy.sh` into `/opt/internship-hunter/deploy/` **root-owned and not
    writable by the deploy user** (it is the forced command).
-3. `shared/.env` (mode 600) from `.env.example`: **six** independent random values
-   (Postgres, Redis, admin, three agent tokens). Never commit it.
+3. `shared/.env` (mode 600) from `.env.example`: **five** independent random values
+   (Postgres, admin, three agent tokens). Never commit it.
 4. `shared/allowed_signers`: `release ssh-ed25519 AAAA…` (public half of the signing key).
    Generate with `ssh-keygen -t ed25519 -N '' -f release_signing_key`; keep the private half
    only as the GitHub secret.
@@ -83,7 +92,8 @@ you -> Actions "Deploy (manual)" (action=deploy, ref=<full SHA>)
 | Environment | `production` | required reviewers; **deployment branches: `main` only** |
 | Secret (env) | `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET` | Tailscale OAuth client for `tag:ci` |
 | Secret (env) | `DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS` | forced-command key; pinned host key |
-| Secret (env) | `RELEASE_SIGNING_KEY` | private signing key (not the SSH key) |
+| Environment | `release-signing` | **only** home of `RELEASE_SIGNING_KEY`; deployment branches: `main` only |
+| Secret (env `release-signing`) | `RELEASE_SIGNING_KEY` | private signing key (not the SSH key); never a repository-level secret |
 | Variable (env) | `DEPLOY_USER`, `DEPLOY_TAILNET_HOST` | `hunter-deploy`, MagicDNS name |
 
 `workflow_dispatch` runs the workflow file of the *selected* branch; the environment's
@@ -105,7 +115,7 @@ Also: branch protection on `main` requiring all CI jobs, and secret scanning.
 Log in once per container, interactively, from your own terminal:
 
 ```bash
-docker compose run --rm --no-deps -it agent-claude-1 claude
+docker compose run --rm --no-deps -it agent-claude-1 claude   # proxies must be running: docker compose up -d egress-claude-1
 docker compose run --rm --no-deps -it agent-claude-2 claude
 docker compose run --rm --no-deps -it agent-codex codex login
 ```
