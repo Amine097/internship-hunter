@@ -5,7 +5,7 @@ the production host); **CI** = defined in GitHub Actions, *not yet executed* on 
 revision; **S** = must be done on the real server. Nothing marked S has been done.
 
 ## Code / CI
-- [x] **L** `ruff check .` clean; `pytest` **187 passed, 0 skipped** on Python 3.12.15 against
+- [x] **L** `ruff check .` clean; `pytest` **217 passed, 0 skipped** on Python 3.12.15 against
       real PostgreSQL 17 (`TEST_DATABASE_URL`, `CI_REQUIRE_SERVICES=1`)
 - [ ] **CI** same on GitHub (`lint-test`; fails if the PostgreSQL service is missing)
 - [x] **L** `pip-audit` no known vulnerabilities; [ ] **CI**
@@ -44,6 +44,27 @@ revision; **S** = must be done on the real server. Nothing marked S has been don
       replay, lock, rootful refusal, backup failure, failed restore (exit 10), failed health
       check on rollback (exit 6)
 - [ ] **S** rootless Docker on the production host; real deploy and rollback there
+
+## Final pre-deployment fixes (real daemon, signed bundles, real images + database)
+- [x] **L** REVIEWER SCENARIO: A on 0003, B migrates to 0004 then fails its health check ->
+      automatic restore of A succeeded (A told to accept exactly 0004, declared compatible);
+      database at 0004, A running, `/ready` 200, state `db_head` repaired from the real DB
+      (the pre-fix script exits 10 on the same scenario: `HUNTER_DEPLOY_SCRIPT` regression run)
+- [x] **L** deploy of a healthy B on the already-migrated database; rollback with a corrupted
+      `state/db_head` still works because the real `alembic_version` is read
+- [x] **L** database tampered to an unexpected revision (0009): rollback refused (exit 9), no
+      acceptance granted; irreversible deploys still end in manual recovery (stub suite)
+- [x] **L** `compat.json` no longer lists releases without the accept protocol; build and
+      signing both reject such a declaration
+- [x] **L** signing job recomputes `schema_head`/`rollback_compatible` from the source archive
+      and refuses a build manifest that disagrees; checks commit id, member types, script modes
+- [x] **L** egress proxy CONNECT-only (plain HTTP to an allowed host was forwarded before:
+      observed 400 from the provider; now 403)
+- [x] **L** graceful shutdown releases a task without consuming an attempt
+- [x] **L** PostgreSQL: expired-lease row locked by a fencing worker is skipped by the reaper;
+      an expired worker loses to an in-flight reaper without writing
+- [x] **L** actionlint clean on both workflows
+- [ ] **CI** all of the above on GitHub for commit `2d5ac4d` and later (not yet run)
 
 ## Release signing (static checks of the workflow files)
 - [x] **L** `RELEASE_SIGNING_KEY` referenced only by the `sign` job (own environment, main only);
