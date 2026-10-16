@@ -112,8 +112,11 @@ def install() -> None:
         pytest.fail(problem)
     if os.geteuid() != 0:
         pytest.fail("must run as root (sudo) against the system manager")
+    # GitHub-hosted runners report 'starting' during the job (boot-time jobs still queued);
+    # PID 1 accepts units then. Refused: no systemd as PID 1, or a manager not up/going down.
     state = run("systemctl", "is-system-running", check=False).stdout.strip()
-    if state not in ("running", "degraded"):
+    if not Path("/run/systemd/system").is_dir() \
+            or state not in ("running", "degraded", "starting"):
         pytest.fail(f"system manager not usable: {state!r}")
     present = [str(p) for p in INSTALLED if p.exists()]
     present += [u for u in USERS if _exists(pwd.getpwnam, u)]
