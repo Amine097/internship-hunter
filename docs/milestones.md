@@ -2,7 +2,7 @@
 
 ## M1 — Bootstrap (this delivery)
 - Private GitHub-ready repo, CI checks.
-- Backend, read-only endpoints, scheduler, RQ queues, isolated agents.
+- Backend, read-only endpoints, scheduler, PostgreSQL task queue, isolated agents.
 - Search profiles, ATS public discovery with explicit allowlist.
 - Telegram /profiles /status /scan, PostgreSQL persistence.
 - CLI agent adapters available but default to deterministic demo mode.
@@ -29,6 +29,6 @@
 - Consent and legally relevant questions require verified information.
 
 ## M5 — Deployment
-- GitHub Actions CI. Later: dedicated SSH runner / pull-based deployment.
+- GitHub Actions CI + manual Tailscale deploy (designed in M1 hardening; see docs/deployment.md).
 - Migrations with Alembic, backups/restores, alerts, dependency pinning.
 - Read-only Gmail integration for reply classification only with authorization.

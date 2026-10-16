@@ -2,14 +2,19 @@
 import secrets
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
+from hunter import db as database
+from hunter import sessions
 from hunter.db import session_scope
 from hunter.models import AgentRun, Application, Job, Scan, SearchProfile
-from hunter.orchestrator import enqueue_scan
+from hunter.policy import SUBMISSION_ENABLED
 from hunter.settings import get_settings
 
-app = FastAPI(title="Internship Hunter", version="0.1.0")
+app = FastAPI(
+    title="Internship Hunter", version="0.1.0",
+    docs_url=None, redoc_url=None, openapi_url=None,  # no unauthenticated schema
+)
 
 
 def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
@@ -23,7 +28,24 @@ def require_admin(x_admin_token: str | None = Header(default=None)) -> None:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "submission_enabled": False, "mode": get_settings().agent_mode}
+    return {
+        "status": "ok", "submission_enabled": SUBMISSION_ENABLED,
+        "mode": get_settings().agent_mode,
+    }
+
+
+@app.get("/ready")
+def ready():
+    """PostgreSQL reachable and the schema matches (or is explicitly accepted by) this code."""
+    try:
+        with session_scope() as db:
+            db.execute(text("SELECT 1"))
+        status = database.schema_state()[0]
+    except Exception as exc:  # no detail: this endpoint is unauthenticated
+        raise HTTPException(status_code=503, detail="not ready") from exc
+    if status not in ("ok", "accepted"):
+        raise HTTPException(status_code=503, detail="schema not ready")
+    return {"status": "ready"}
 
 
 @app.get("/status", dependencies=[Depends(require_admin)])
@@ -34,7 +56,7 @@ def status():
             "jobs": db.scalar(select(func.count()).select_from(Job)),
             "scans": db.scalar(select(func.count()).select_from(Scan)),
             "applications": db.scalar(select(func.count()).select_from(Application)),
-            "submission_enabled": False,
+            "submission_enabled": SUBMISSION_ENABLED,
         }
 
 
@@ -79,8 +101,11 @@ def agents():
 
 @app.post("/scan/{profile_id}", dependencies=[Depends(require_admin)])
 def scan(profile_id: int):
-    try:
-        scan_id = enqueue_scan(profile_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"scan_id": scan_id, "state": "queued"}
+    """Requests a research session for one profile. It is NOT started here: like every other
+    entry point it needs the owner's approval in Telegram."""
+    with session_scope() as db:
+        profile = db.get(SearchProfile, profile_id)
+        if profile is None or not profile.enabled:
+            raise HTTPException(status_code=404, detail="Search profile not found or disabled")
+    sid, _ = sessions.request_session("api", [profile_id])
+    return {"session_id": sid, "state": "pending_approval"}

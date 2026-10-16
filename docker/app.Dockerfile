@@ -5,5 +5,5 @@ COPY pyproject.toml README.md ./
 COPY hunter ./hunter
 RUN pip install --no-cache-dir .
 COPY config ./config
-RUN useradd --create-home --uid 10001 hunter
+RUN useradd --no-create-home --uid 10001 hunter
 USER hunter

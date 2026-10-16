@@ -1,6 +1,8 @@
 """Public ATS discovery only; no authentication, scraping bypass or submissions."""
 import hashlib
+import json
 import re
+import time
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -38,11 +40,64 @@ def read_sources(path: str) -> list[dict]:
     if not isinstance(sources, list):
         raise ValueError("sources must be a list")
     for source in sources:
+        if not isinstance(source, dict):
+            raise ValueError("Each source must be a mapping")
         if source.get("kind") not in ("greenhouse", "lever"):
             raise ValueError("Only public Greenhouse or Lever source types are allowed in V1")
         if not allowed_board_name(str(source.get("token", ""))):
             raise ValueError("Invalid ATS board handle")
     return sources
+
+
+def _clip(value, limit: int) -> str:
+    return str(value or "").replace("\x00", "")[:limit]
+
+
+def _safe_url(value) -> str | None:
+    url = str(value or "")
+    return url if url.startswith(("https://", "http://")) else None
+
+
+def _normalize(kind: str, token: str, job: dict) -> dict | None:
+    """Returns None for a malformed posting so one bad record cannot drop a whole board."""
+    try:
+        if kind == "greenhouse":
+            external_id, url, title = job["id"], job["absolute_url"], job["title"]
+            location = (job.get("location") or {}).get("name")
+            description = job.get("content")
+        else:
+            external_id, url, title = job["id"], job["hostedUrl"], job["text"]
+            location = (job.get("categories") or {}).get("location")
+            description = job.get("descriptionPlain") or job.get("description")
+    except (KeyError, AttributeError, TypeError):
+        return None
+    url = _safe_url(url)
+    if url is None or not title:
+        return None
+    return {
+        "canonical_key": canonical_key(kind, token, str(external_id)),
+        "source": kind,
+        "source_url": url,
+        "title": _clip(title, 350),
+        "company": token,
+        "location": _clip(location, 250),
+        "description": _clip(strip_html(description), 100_000),
+    }
+
+
+MAX_BODY_BYTES = 8 * 1024 * 1024
+
+
+def _get_json(client: httpx.Client, url: str):
+    """GET with a hard body cap, so a hostile or broken board cannot exhaust memory."""
+    with client.stream("GET", url) as response:
+        response.raise_for_status()
+        body = bytearray()
+        for chunk in response.iter_bytes():
+            body += chunk
+            if len(body) > MAX_BODY_BYTES:
+                raise ValueError("ATS response too large")
+    return json.loads(body)
 
 
 def fetch_source(source: dict, client: httpx.Client) -> list[dict]:
@@ -51,45 +106,38 @@ def fetch_source(source: dict, client: httpx.Client) -> list[dict]:
     if kind not in ("greenhouse", "lever") or not allowed_board_name(token):
         raise ValueError("Invalid source")
     if kind == "greenhouse":
-        url = f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
-        response = client.get(url)
-        response.raise_for_status()
-        return [
-            {
-                "canonical_key": canonical_key(kind, token, str(job["id"])),
-                "source": kind,
-                "source_url": job["absolute_url"],
-                "title": job["title"],
-                "company": token,
-                "location": job.get("location", {}).get("name", ""),
-                "description": strip_html(job.get("content", "")),
-            }
-            for job in response.json().get("jobs", [])
-        ]
-    response = client.get(f"https://api.lever.co/v0/postings/{token}?mode=json")
-    response.raise_for_status()
-    return [
-        {
-            "canonical_key": canonical_key(kind, token, str(job["id"])),
-            "source": kind,
-            "source_url": job["hostedUrl"],
-            "title": job["text"],
-            "company": token,
-            "location": job.get("categories", {}).get("location", ""),
-            "description": strip_html(job.get("descriptionPlain") or job.get("description")),
-        }
-        for job in response.json()
-    ]
+        data = _get_json(
+            client, f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
+        )
+        postings = data.get("jobs", []) if isinstance(data, dict) else None
+    else:
+        postings = _get_json(client, f"https://api.lever.co/v0/postings/{token}?mode=json")
+    if not isinstance(postings, list):
+        raise ValueError("Unexpected ATS response shape")
+    jobs = (_normalize(kind, token, p) for p in postings if isinstance(p, dict))
+    return [j for j in jobs if j is not None]
 
 
-def fetch_all(sources: list[dict]) -> tuple[list[dict], list[str]]:
+def make_client(transport: httpx.BaseTransport | None = None) -> httpx.Client:
+    return httpx.Client(timeout=12.0, follow_redirects=False, transport=transport)
+
+
+def fetch_all(
+    sources: list[dict], deadline: float | None = None,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[list[dict], list[str]]:
+    """``deadline`` is a ``time.monotonic()`` value; later sources are skipped and reported."""
     found: dict[str, dict] = {}
     errors: list[str] = []
-    with httpx.Client(timeout=12.0, follow_redirects=False) as client:
+    with make_client(transport) as client:
         for source in sources:
+            label = f"{source.get('kind')}:{source.get('token')}"
+            if deadline is not None and time.monotonic() > deadline:
+                errors.append(f"{label}: skipped (scan deadline)")
+                continue
             try:
                 for job in fetch_source(source, client):
                     found[job["canonical_key"]] = job
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-                errors.append(f"{source['kind']}:{source['token']}: {type(exc).__name__}")
+                errors.append(f"{label}: {type(exc).__name__}")
     return list(found.values()), errors

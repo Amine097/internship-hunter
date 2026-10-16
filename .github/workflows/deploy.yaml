@@ -1,0 +1,132 @@
+# Manual production deploy over Tailscale. NEVER triggered by push or pull_request.
+#
+# Disabled by default: jobs run only when the repository VARIABLE DEPLOY_ENABLED is "true".
+# Do not enable it until every item in docs/deployment.md "Go-live gates" is met.
+#
+# Secret exposure by job (enforced by tests/test_workflows.py):
+#   verify  no secrets          decides WHAT may be released (main + green CI)
+#   build   no secrets          runs repository code (docker build); output is untrusted data
+#   sign    RELEASE_SIGNING_KEY runs only trusted-main shell; never executes artifact content
+#   deploy  TS_* / DEPLOY_*     transport only; cannot sign
+name: Deploy (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: deploy | deploy-irreversible (contracting migration; no rollback) | rollback
+        type: choice
+        options: [deploy, deploy-irreversible, rollback]
+        default: deploy
+      ref:
+        description: Full 40-char commit SHA on main (deploy actions only)
+        required: false
+permissions:
+  contents: read
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read            # needed to list workflow runs for the CI check below
+    outputs:
+      sha: ${{ steps.v.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: {fetch-depth: 0, ref: main}
+      - id: v
+        env:
+          REF: ${{ inputs.ref }}
+          ACTION: ${{ inputs.action }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/main ]] || { echo "run this workflow from main"; exit 1; }
+          if [[ "$ACTION" == rollback ]]; then echo "sha=rollback" >> "$GITHUB_OUTPUT"; exit 0; fi
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "ref must be a full SHA"; exit 1; }
+          git merge-base --is-ancestor "$REF" origin/main || { echo "SHA is not on main"; exit 1; }
+          n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yaml/runs?head_sha=$REF&status=success" --jq '.total_count')
+          [[ "$n" -gt 0 ]] || { echo "no green CI run for $REF"; exit 1; }
+          echo "sha=$REF" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: verify
+    if: inputs.action != 'rollback'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: {fetch-depth: 0, ref: "${{ needs.verify.outputs.sha }}"}
+      - name: Build unsigned artifacts (no secrets in this job)
+        run: deploy/build-artifacts.sh "${{ needs.verify.outputs.sha }}" artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: {name: release-artifacts, path: artifacts/, retention-days: 1}
+
+  sign:
+    needs: [verify, build]
+    if: github.ref == 'refs/heads/main' && inputs.action != 'rollback'
+    runs-on: ubuntu-latest
+    environment: release-signing     # own environment: secret + "main only" branch rule
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # the signing script comes from the trusted dispatching commit (main), never from the
+      # release being signed
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: {ref: "${{ github.sha }}"}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: {name: release-artifacts, path: artifacts}
+      - name: Verify and sign (executes nothing from the artifacts)
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/sign_key"
+          deploy/sign-bundle.sh artifacts "$RUNNER_TEMP/sign_key" \
+            "${{ needs.verify.outputs.sha }}" bundle.tar
+          shred -u "$RUNNER_TEMP/sign_key" || rm -f "$RUNNER_TEMP/sign_key"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: {name: release-bundle, path: bundle.tar, retention-days: 1}
+
+  deploy:
+    needs: [verify, sign]
+    if: always() && needs.verify.result == 'success' && (needs.sign.result == 'success' || inputs.action == 'rollback')
+    runs-on: ubuntu-latest
+    environment: production        # required reviewers: the manual approval gate
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: inputs.action != 'rollback'
+        with: {name: release-bundle}
+      - uses: tailscale/github-action@5d536117a7378beffcd6d8523ce73c50fa98684d # v3.2.1
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+      - name: Prepare SSH (host key pinned, forced-command key)
+        env:
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          umask 077
+          printf '%s\n' "$KEY" > ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Deploy / roll back
+        env:
+          TARGET: ${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_TAILNET_HOST }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          ssh_cmd=(ssh -i ~/.ssh/id_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "$TARGET")
+          case "$ACTION" in
+            rollback) "${ssh_cmd[@]}" rollback ;;
+            deploy|deploy-irreversible) "${ssh_cmd[@]}" "$ACTION" < bundle.tar ;;
+            *) echo "unknown action"; exit 1 ;;
+          esac

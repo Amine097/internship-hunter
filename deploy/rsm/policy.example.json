@@ -1,0 +1,36 @@
+{
+  "_comment": "EXAMPLE ONLY. Names are the 20 services you listed; every dependency and every choice below MUST be verified on the server with `python -m hunter.rsm plan` and `docker inspect` before use. This file must be root-owned and not group/world-writable.",
+  "version": 1,
+  "max_session_seconds": 2700,
+  "stale_contact_seconds": 300,
+  "prepared_timeout_seconds": 600,
+  "min_available_mib": 6144,
+  "dns_independence_verified": false,
+  "protected": [
+    "adguard", "uptime-kuma", "beszel", "beszel-agent", "speedtest-tracker", "homarr",
+    "immich_postgres", "immich_redis"
+  ],
+  "probes": {
+    "jellyfin": {"kind": "jellyfin_playback", "base_url": "http://127.0.0.1:8096",
+                 "key_file": "/etc/hunter-rsm/jellyfin.key"},
+    "immich": {"kind": "immich_activity", "base_url": "http://127.0.0.1:2283",
+               "key_file": "/etc/hunter-rsm/immich.key"}
+  },
+  "containers": {
+    "whisper-dispatcher":      {"stop_timeout": 20},
+    "bazarr":                  {"stop_timeout": 20},
+    "prowlarr":                {"stop_timeout": 20},
+    "radarr":                  {"stop_timeout": 30},
+    "sonarr":                  {"stop_timeout": 30},
+    "seerr":                   {"stop_timeout": 20},
+    "flaresolverr":            {"stop_timeout": 20},
+    "qbittorrent":             {"stop_timeout": 60, "depends_on": ["gluetun"]},
+    "gluetun":                 {"stop_timeout": 30},
+    "jellyfin":                {"stop_timeout": 60, "busy_probe": "jellyfin", "on_busy": "block"},
+    "immich_machine_learning": {"stop_timeout": 30, "busy_probe": "immich", "on_busy": "block"},
+    "immich_server":           {"stop_timeout": 60, "busy_probe": "immich", "on_busy": "block",
+                                "depends_on": ["immich_postgres", "immich_redis",
+                                               "immich_machine_learning"]}
+  },
+  "telegram_notify": {"bot_token_file": "/etc/hunter-rsm/telegram.token", "chat_id": 0}
+}

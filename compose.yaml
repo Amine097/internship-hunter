@@ -1,144 +1,220 @@
 name: internship-hunter
+
+# Trust boundaries (see docs/security-architecture.md)
+#   data           (internal)  postgres, migrate, api, discovery, scheduler, telegram
+#   edge                       api (published on 127.0.0.1 only)
+#   egress                     discovery (ATS boards), telegram (Telegram API), egress proxies
+#   agent_<name>   (internal)  exactly one untrusted agent, its egress proxy, the orchestrator
+# The work queue lives in PostgreSQL (no Redis). Agent containers have NO database access,
+# NO admin/Telegram secrets, cannot reach each other, and have NO route to anything except
+# their own allow-listing egress proxy: the agent networks are internal, so ignoring
+# HTTPS_PROXY gets a connection error, not a bypass.
 x-db-env: &db-env
   DATABASE_URL: postgresql+psycopg://hunter:${POSTGRES_PASSWORD:?set_POSTGRES_PASSWORD}@postgres:5432/hunter
-  REDIS_URL: redis://redis:6379/0
   PROFILES_PATH: /app/config/search_profiles.yaml
   SOURCES_PATH: /app/config/sources.yaml
+  AGENT_MODE: ${AGENT_MODE:-demo}
+  # set only by the deploy script, after it verified rollback compatibility
+  HUNTER_ACCEPT_SCHEMA_REVISION: ${HUNTER_ACCEPT_SCHEMA_REVISION:-}
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 256
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
 x-app: &app
+  <<: *hardening
+  image: internship-hunter-app:${RELEASE_SHA:-dev}
   build:
     context: .
     dockerfile: docker/app.Dockerfile
-  environment: *db-env
-  depends_on:
-    postgres:
-      condition: service_healthy
-    redis:
-      condition: service_healthy
-  restart: unless-stopped
+  mem_limit: 256m
+  cpus: 0.5
+x-agent: &agent
+  <<: *hardening
+  image: internship-hunter-agent:${RELEASE_SHA:-dev}
+  build:
+    context: .
+    dockerfile: docker/agent.Dockerfile
+  command: ["uvicorn", "--factory", "hunter.agent_runner:app_from_env",
+            "--host", "0.0.0.0", "--port", "8100"]
+  mem_limit: 768m
+  cpus: 1.0
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
 
 services:
   postgres:
+    <<: *hardening
     image: postgres:17-alpine
+    read_only: false              # data dir + /var/run/postgresql
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]   # official entrypoint needs these
     environment:
       POSTGRES_USER: hunter
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set_POSTGRES_PASSWORD}
       POSTGRES_DB: hunter
     volumes: [postgres_data:/var/lib/postgresql/data]
+    networks: [data]
+    mem_limit: 512m
     healthcheck:
       test: [CMD-SHELL, "pg_isready -U hunter -d hunter"]
       interval: 5s
       timeout: 5s
       retries: 12
-    restart: unless-stopped
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes: [redis_data:/data]
-    healthcheck:
-      test: [CMD, redis-cli, ping]
-      interval: 5s
-      retries: 10
-    restart: unless-stopped
   migrate:
     <<: *app
-    command: ["python", "-m", "hunter.db"]
     restart: "no"
+    command: ["python", "-m", "hunter.db"]
+    environment: *db-env
+    networks: [data]
+    depends_on:
+      postgres: {condition: service_healthy}
   api:
     <<: *app
+    command: ["uvicorn", "hunter.api:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       <<: *db-env
       ADMIN_TOKEN: ${ADMIN_TOKEN:?set_ADMIN_TOKEN}
-    command: ["uvicorn", "hunter.api:app", "--host", "0.0.0.0", "--port", "8000"]
-    ports: ["127.0.0.1:8000:8000"]
+    networks: [data, edge]
+    ports: ["127.0.0.1:8000:8000"]   # loopback only; reach it over Tailscale / SSH forward
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      migrate: {condition: service_completed_successfully}
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
       interval: 10s
       retries: 5
   discovery:
     <<: *app
     command: ["python", "-m", "hunter.worker"]
+    stop_grace_period: 150s   # finish/release the current scan before SIGKILL (agents <= 110s)
     environment:
-      DATABASE_URL: postgresql+psycopg://hunter:${POSTGRES_PASSWORD:?set_POSTGRES_PASSWORD}@postgres:5432/hunter
-      REDIS_URL: redis://redis:6379/0
-      PROFILES_PATH: /app/config/search_profiles.yaml
-      SOURCES_PATH: /app/config/sources.yaml
-      HUNTER_QUEUE: discovery
+      <<: *db-env
+      AGENT_TOKEN_CLAUDE_1: ${AGENT_TOKEN_CLAUDE_1:?set_AGENT_TOKEN_CLAUDE_1}
+      AGENT_TOKEN_CLAUDE_2: ${AGENT_TOKEN_CLAUDE_2:?set_AGENT_TOKEN_CLAUDE_2}
+      AGENT_TOKEN_CODEX: ${AGENT_TOKEN_CODEX:?set_AGENT_TOKEN_CODEX}
+    networks: [data, egress, agent_claude_1, agent_claude_2, agent_codex]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      migrate: {condition: service_completed_successfully}
   scheduler:
     <<: *app
+    command: ["python", "-m", "hunter.scheduler"]
     environment:
       <<: *db-env
       SCAN_CRON: ${SCAN_CRON:-0 7,13,20 * * *}
       TZ: ${TZ:-Europe/Zurich}
-    command: ["python", "-m", "hunter.scheduler"]
+    networks: [data]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      migrate: {condition: service_completed_successfully}
+  # Drives approved research sessions: talks to PostgreSQL only (and, when the optional
+  # compose.rsm.yaml override is used, to the host broker socket). It is the ONLY service that
+  # may ever hold that socket. No Docker socket, no agent networks.
+  session-controller:
+    <<: *app
+    command: ["python", "-m", "hunter.session_controller"]
+    environment:
+      <<: *db-env
+      RSM_ENABLED: "false"
+    networks: [data]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
   telegram:
     <<: *app
+    command: ["python", "-m", "hunter.telegram"]
     environment:
       <<: *db-env
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
-    command: ["python", "-m", "hunter.telegram"]
+    networks: [data, egress]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      migrate: {condition: service_completed_successfully}
   agent-claude-1:
-    <<: *app
-    build:
-      context: .
-      dockerfile: docker/agent.Dockerfile
-    command: ["python", "-m", "hunter.worker"]
+    <<: *agent
     environment:
-      REDIS_URL: redis://redis:6379/0
-      HUNTER_QUEUE: claude-1
       HUNTER_AGENT_NAME: claude-1
+      HTTPS_PROXY: http://egress-claude-1:3128
+      HTTP_PROXY: http://egress-claude-1:3128
+      NO_PROXY: localhost,127.0.0.1
+      AGENT_TOKEN: ${AGENT_TOKEN_CLAUDE_1:?set_AGENT_TOKEN_CLAUDE_1}
       CLAUDE_CONFIG_DIR: /home/hunter/.claude
       AGENT_MODE: ${AGENT_MODE:-demo}
     volumes: [claude1_home:/home/hunter]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      egress-claude-1: {condition: service_healthy}
+    networks: [agent_claude_1]
   agent-claude-2:
-    <<: *app
-    build:
-      context: .
-      dockerfile: docker/agent.Dockerfile
-    command: ["python", "-m", "hunter.worker"]
+    <<: *agent
     environment:
-      REDIS_URL: redis://redis:6379/0
-      HUNTER_QUEUE: claude-2
       HUNTER_AGENT_NAME: claude-2
+      HTTPS_PROXY: http://egress-claude-2:3128
+      HTTP_PROXY: http://egress-claude-2:3128
+      NO_PROXY: localhost,127.0.0.1
+      AGENT_TOKEN: ${AGENT_TOKEN_CLAUDE_2:?set_AGENT_TOKEN_CLAUDE_2}
       CLAUDE_CONFIG_DIR: /home/hunter/.claude
       AGENT_MODE: ${AGENT_MODE:-demo}
     volumes: [claude2_home:/home/hunter]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      egress-claude-2: {condition: service_healthy}
+    networks: [agent_claude_2]
   agent-codex:
-    <<: *app
-    build:
-      context: .
-      dockerfile: docker/agent.Dockerfile
-    command: ["python", "-m", "hunter.worker"]
+    <<: *agent
     environment:
-      REDIS_URL: redis://redis:6379/0
-      HUNTER_QUEUE: codex
       HUNTER_AGENT_NAME: codex
+      HTTPS_PROXY: http://egress-codex:3128
+      HTTP_PROXY: http://egress-codex:3128
+      NO_PROXY: localhost,127.0.0.1
+      AGENT_TOKEN: ${AGENT_TOKEN_CODEX:?set_AGENT_TOKEN_CODEX}
+      CODEX_HOME: /home/hunter/.codex
       AGENT_MODE: ${AGENT_MODE:-demo}
     volumes: [codex_home:/home/hunter]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      egress-codex: {condition: service_healthy}
+    networks: [agent_codex]
+
+  # Allow-listing egress proxies, one per agent (the hostname lists are the policy).
+  # The lists below are the documented defaults; verify them against the pinned CLI versions
+  # before AGENT_MODE=cli (docs/security-architecture.md).
+  egress-claude-1: &egress
+    <<: *hardening
+    image: internship-hunter-egress:${RELEASE_SHA:-dev}
+    build:
+      context: .
+      dockerfile: docker/egress-proxy.Dockerfile
+    environment:
+      EGRESS_ALLOW: ${EGRESS_ALLOW_ANTHROPIC:-api.anthropic.com,console.anthropic.com,claude.ai,statsig.anthropic.com}
+    networks: [egress, agent_claude_1]
+    mem_limit: 64m
+    cpus: 0.25
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 3128"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  egress-claude-2:
+    <<: *egress
+    networks: [egress, agent_claude_2]
+  egress-codex:
+    <<: *egress
+    environment:
+      EGRESS_ALLOW: ${EGRESS_ALLOW_OPENAI:-api.openai.com,auth.openai.com,chatgpt.com}
+    networks: [egress, agent_codex]
+
+networks:
+  data: {internal: true}
+  edge: {}
+  egress: {}
+  agent_claude_1: {internal: true}   # no route out: only the egress proxy is reachable
+  agent_claude_2: {internal: true}
+  agent_codex: {internal: true}
 volumes:
   postgres_data:
-  redis_data:
   claude1_home:
   claude2_home:
   codex_home:

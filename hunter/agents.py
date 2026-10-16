@@ -1,6 +1,7 @@
 """Three independent *planning* agents. No tool grants and no auto-apply."""
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,6 +9,18 @@ from pathlib import Path
 from hunter.settings import get_settings
 
 AGENTS = ("claude-1", "claude-2", "codex")
+
+# The CLI subprocess gets only these variables. DB URLs, admin and Telegram tokens
+# are never forwarded to a model-facing process.
+_ENV_ALLOWLIST = (
+    "PATH", "HOME", "LANG", "LC_ALL", "TZ", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "SSL_CERT_FILE",
+)
+_FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+
+
+def cli_env() -> dict[str, str]:
+    return {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
 
 
 def demo_plan(agent: str, profile: dict) -> dict:
@@ -30,10 +43,12 @@ def demo_plan(agent: str, profile: dict) -> dict:
 
 
 def parse_plan(raw: str, agent: str) -> dict:
-    data = json.loads(raw)
+    text = raw.strip()
+    fenced = _FENCE.match(text)
+    data = json.loads(fenced.group(1) if fenced else text)
     if not isinstance(data, dict) or not isinstance(data.get("queries"), list):
         raise ValueError("Agent must return a JSON object containing queries")
-    queries = [q[:160] for q in data["queries"] if isinstance(q, str) and q.strip()][:15]
+    queries = [q.strip()[:160] for q in data["queries"] if isinstance(q, str) and q.strip()][:15]
     return {"agent": agent, "mode": "cli", "queries": queries}
 
 
@@ -49,7 +64,7 @@ def run_plan(agent: str, profile: dict) -> dict:
         return demo_plan(agent, profile)
     if settings.agent_mode != "cli":
         raise ValueError("AGENT_MODE must be demo or cli")
-    if os.environ.get("HUNTER_AGENT_NAME") != agent:
+    if settings.hunter_agent_name != agent:
         raise ValueError("Agent cannot run using another worker's credentials")
 
     prompt = (
@@ -63,9 +78,11 @@ def run_plan(agent: str, profile: dict) -> dict:
         command = ["claude", "-p", prompt, "--output-format", "json", "--tools", ""]
         result = subprocess.run(
             command, capture_output=True, text=True, timeout=90, check=True,
-            cwd="/tmp", env=os.environ.copy(),
+            cwd="/tmp", env=cli_env(),
         )
         envelope = json.loads(result.stdout)
+        if envelope.get("is_error") or not isinstance(envelope.get("result"), str):
+            raise ValueError("Claude CLI reported an error")
         return parse_plan(envelope["result"], agent)
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -76,9 +93,6 @@ def run_plan(agent: str, profile: dict) -> dict:
         ]
         subprocess.run(
             command, capture_output=True, text=True, timeout=90, check=True, cwd=temp_dir,
+            env=cli_env(),
         )
         return parse_plan(result_file.read_text(encoding="utf-8"), agent)
-
-
-def agent_task(agent: str, profile: dict) -> dict:
-    return run_plan(agent, profile)

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Internship Hunter RSM watchdog every 30 seconds
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
