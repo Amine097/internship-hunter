@@ -60,6 +60,34 @@ def test_rsm_pilot_workflow_is_manual_secretless_and_does_not_relax_apparmor():
     assert doc["permissions"] == {"contents": "read"}
 
 
+def test_rsm_systemd_job_is_the_only_privileged_ci_job_and_holds_nothing():
+    text = (WF / "ci.yaml").read_text()
+    ci = yaml.safe_load(text)
+    job = ci["jobs"]["rsm-systemd"]
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert job["permissions"] == {"contents": "read"}
+    assert "environment" not in job and "secrets." not in yaml.safe_dump(job)
+    # never for fork PRs: privileged execution only for this repository's own branches
+    assert "github.event.pull_request.head.repo.full_name == github.repository" in job["if"]
+    checkout = next(s for s in job["steps"] if "checkout" in s.get("uses", ""))
+    assert checkout["with"]["persist-credentials"] is False
+    runs = "\n".join(s.get("run", "") for s in job["steps"])
+    assert "RSM_SYSTEMD=1" in runs and "tests/test_rsm_systemd.py" in runs
+    assert "skipped|deselected" in runs                         # a skip fails the job
+    cleanup = [s for s in job["steps"] if "--cleanup" in s.get("run", "")]
+    assert len(cleanup) == 1 and cleanup[0]["if"] == "always()"
+    # sudo nowhere else; lint-test stays unprivileged and does not opt in
+    for name, other in ci["jobs"].items():
+        if name != "rsm-systemd":
+            assert "sudo" not in yaml.safe_dump(other), name
+    assert "RSM_SYSTEMD" not in yaml.safe_dump(ci["jobs"]["lint-test"])
+    # the runner's AppArmor / user-namespace restrictions are not relaxed
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "apparmor_restrict_unprivileged_userns" not in code
+    assert "sysctl" not in code and "aa-teardown" not in code and "aa-disable" not in code
+    assert "/etc/apparmor.d" not in code and "apparmor_parser" not in code
+
+
 def test_deploy_is_manual_only_and_disabled_by_default():
     triggers = DEPLOY[True] if True in DEPLOY else DEPLOY["on"]
     assert set(triggers) == {"workflow_dispatch"}

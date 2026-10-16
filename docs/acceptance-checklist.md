@@ -128,6 +128,17 @@ Derived checks (also run in CI against the Docker runner, without the rootless a
 - [x] **L** shellcheck (all deploy + pilot scripts) and actionlint (all workflows) clean
 - [ ] **NOT RUN** `SocketUser/SocketGroup`, EACCES for an unauthorised user, docker
       supplementary group, system-manager sandbox: `deploy/rsm/pilot/pilot-test.sh` (root)
+- [x] **L** (CI fix) the user-manager run above could not work on GitHub's Ubuntu 24.04
+      runners (218/CAPABILITIES: AppArmor restricts the user namespace the user manager needs to
+      drop the bounding set). `tests/test_rsm_systemd.py` now installs the production units
+      under the SYSTEM manager as root, only in the CI job `rsm-systemd` (ephemeral runner,
+      disposable users, fake docker bind-mounted inside the units, no credentials, not for fork
+      PRs, AppArmor untouched). Covers the `SocketUser/SocketGroup`, EACCES and docker
+      supplementary-group items above. Run locally in a disposable Ubuntu 24.04 systemd
+      container: 15 passed; weakening the unit (bounding set, `~@privileged` filter,
+      `NoNewPrivileges`) makes it fail. The earlier chown probe (on `/proc/self`) passed even
+      without the filter (procfs refuses every chown); it now chowns a file the process owns.
+      **Not yet run on GitHub.**
 - [ ] **NOT RUN** real rootless Docker: namespace mapping, bind-mounted directory after broker
       restart/crash, rootless daemon started before the broker: pilot script / `rsm-pilot.yaml`
 - [ ] **NOT RUN** real-Docker integration tests (`RSM_INTEGRATION=1`): network-namespace
