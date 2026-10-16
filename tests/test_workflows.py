@@ -46,6 +46,20 @@ def test_deploy_secrets_are_confined_to_the_deploy_job():
     assert DEPLOY["jobs"]["deploy"]["environment"] == "production"
 
 
+def test_rsm_pilot_workflow_is_manual_secretless_and_does_not_relax_apparmor():
+    text = (WF / "rsm-pilot.yaml").read_text()
+    doc = yaml.safe_load(text)
+    triggers = doc[True] if True in doc else doc["on"]
+    assert set(triggers) == {"workflow_dispatch"}
+    assert "secrets." not in text
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "apparmor_restrict_unprivileged_userns=0" not in code.replace(" ", "")
+    assert "sysctl -w" not in code and "aa-teardown" not in code and "aa-disable" not in code
+    assert "/usr/bin/rootlesskit" in code                      # a per-binary profile only
+    assert "usermod -aG docker" not in code and "docker hunter-deploy" not in code
+    assert doc["permissions"] == {"contents": "read"}
+
+
 def test_deploy_is_manual_only_and_disabled_by_default():
     triggers = DEPLOY[True] if True in DEPLOY else DEPLOY["on"]
     assert set(triggers) == {"workflow_dispatch"}

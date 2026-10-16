@@ -116,3 +116,20 @@ Derived checks (also run in CI against the Docker runner, without the rootless a
 - [ ] **CI** all of the above on GitHub (RSM integration needs the runner's Docker)
 - [ ] **S** installation and acceptance tests A1-A16 of docs/resource-sessions.md on the
       real host (nothing in this section has run on your server)
+
+## Resource sessions: review fixes (9d35464 -> this commit) - what was and was NOT executed
+- [x] **L** `ruff`; `pytest` **389 passed, 10 skipped** (local, Python 3.12, real PostgreSQL via
+      `pgserver`); the 10 skips are the real-Docker integration tests (no Docker daemon was
+      reachable in this session)
+- [x] **L** REAL systemd (user manager): socket activation, sandboxed broker process state,
+      `kill -9` recovery with an unchanged socket inode, restarts during live calls, connect
+      before the broker runs, watchdog and boot-recovery units, corrupt-state exit code 3
+- [x] **L** the production seccomp filter blocks `chown`; the Go docker CLI runs under it
+- [x] **L** shellcheck (all deploy + pilot scripts) and actionlint (all workflows) clean
+- [ ] **NOT RUN** `SocketUser/SocketGroup`, EACCES for an unauthorised user, docker
+      supplementary group, system-manager sandbox: `deploy/rsm/pilot/pilot-test.sh` (root)
+- [ ] **NOT RUN** real rootless Docker: namespace mapping, bind-mounted directory after broker
+      restart/crash, rootless daemon started before the broker: pilot script / `rsm-pilot.yaml`
+- [ ] **NOT RUN** real-Docker integration tests (`RSM_INTEGRATION=1`): network-namespace
+      providers (stale/undeclared/recreated), SIGTERM-ignoring container, admin abandon
+- [ ] **CI** everything above on GitHub for the new commit

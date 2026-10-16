@@ -17,20 +17,38 @@ class FakeDocker:
         self.fail_start: dict[str, int] = {}
         self.crash_after_stops: int | None = None
         self.crash_after_starts: int | None = None
+        self.on_stop = None                      # hook(name): e.g. advance a fake clock
         self._starts = 0
         self._ids = itertools.count(1)
         self._stops = 0
 
     # -- world construction ---------------------------------------------------------------
-    def add(self, name, running=True, restart="unless-stopped", network_mode="", labels=None):
-        self.c[name] = {"id": f"id{next(self._ids):04d}", "running": running,
+    def add(self, name, running=True, restart="unless-stopped", network_mode="", labels=None,
+            uses_netns_of=None, ref="id"):
+        """``uses_netns_of=provider`` records ``container:<provider id>`` exactly as Docker
+        does (``ref="name"`` records the name form instead)."""
+        if uses_netns_of is not None:
+            target = self.c[uses_netns_of]["id"] if ref == "id" else uses_netns_of
+            network_mode = f"container:{target}"
+        self.c[name] = {"id": f"{next(self._ids):064x}", "running": running,
                         "restart": restart, "network_mode": network_mode,
                         "labels": labels or {}, "manually_stopped": False}
         return self
 
     def recreate(self, name, running=False):
+        """New container id under the same name; clients keep the OLD id (stale)."""
         old = self.c[name]
-        self.c[name] = {**old, "id": f"id{next(self._ids):04d}", "running": running}
+        self.c[name] = {**old, "id": f"{next(self._ids):064x}", "running": running}
+
+    def _lookup(self, ref):
+        """Docker accepts a name, a full id or an unambiguous id prefix."""
+        if ref in self.c:
+            return ref
+        hits = [n for n, v in self.c.items() if v["id"] == ref or (len(ref) >= 4 and
+                                                                   v["id"].startswith(ref))]
+        if len(hits) > 1:
+            raise DockerError(f"multiple IDs found with provided prefix: {ref}")
+        return hits[0] if hits else None
 
     def remove(self, name):
         del self.c[name]
@@ -56,7 +74,8 @@ class FakeDocker:
 
     def inspect(self, name):
         self.calls.append(("inspect", name))
-        return self._info(name) if name in self.c else None
+        real = self._lookup(name)
+        return self._info(real) if real is not None else None
 
     def running(self):
         return [self._info(n) for n, v in self.c.items() if v["running"]]
@@ -67,6 +86,8 @@ class FakeDocker:
             raise DockerError("No such container")
         if name in self.fail_stop:
             raise DockerError("stop timed out")
+        if self.on_stop is not None:
+            self.on_stop(name)                   # the stop "takes time"
         self.c[name]["running"] = False
         self.c[name]["manually_stopped"] = True
         self._stops += 1

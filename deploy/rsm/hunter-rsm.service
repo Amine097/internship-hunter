@@ -1,10 +1,10 @@
-# Host-side Resource Session Manager broker. Installed and updated BY THE ADMINISTRATOR
-# (root-owned files under /opt/hunter-rsm); never by the application's deploy pipeline.
+# Host-side Resource Session Manager broker, started ON DEMAND by hunter-rsm.socket.
+# Installed and updated BY THE ADMINISTRATOR (root-owned files under /opt/hunter-rsm).
 [Unit]
 Description=Internship Hunter Resource Session Manager (broker)
 Documentation=file:///opt/hunter-rsm/docs/resource-sessions.md
 After=docker.service
-Requires=docker.service
+Requires=docker.service hunter-rsm.socket
 
 [Service]
 Type=simple
@@ -13,14 +13,11 @@ Group=hunter-rsm
 # Access to the ROOTFUL Docker socket is the privilege this unit exists to confine.
 SupplementaryGroups=docker
 Environment=PYTHONPATH=/opt/hunter-rsm/src PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/bin/python3 -m hunter.rsm serve \
+ExecStart=/usr/bin/python3 -m hunter.rsm serve --systemd \
   --policy /etc/hunter-rsm/policy.json --state-dir /var/lib/hunter-rsm \
-  --socket /run/hunter-rsm/rsm.sock --socket-group __HUNTER_ROOTLESS_PRIMARY_GROUP__ \
   --allowed-uid __HUNTER_ROOTLESS_UID__
 Restart=always
 RestartSec=2
-RuntimeDirectory=hunter-rsm
-RuntimeDirectoryMode=0750
 StateDirectory=hunter-rsm
 StateDirectoryMode=0750
 NoNewPrivileges=yes
@@ -46,6 +43,7 @@ AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io
+SystemCallErrorNumber=EPERM
 UMask=0027
 
 [Install]

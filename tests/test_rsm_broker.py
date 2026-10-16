@@ -54,7 +54,7 @@ def policy_doc(**over):
 def world():
     d = FakeDocker()
     d.add("gluetun", restart="always")
-    d.add("qbittorrent", restart="unless-stopped", network_mode="container:gluetun")
+    d.add("qbittorrent", restart="unless-stopped", uses_netns_of="gluetun")  # container:<id>
     d.add("radarr").add("sonarr").add("jellyfin").add("immich_machine_learning")
     d.add("whisper-dispatcher", running=False)           # already stopped before the session
     d.add("adguard", restart="always").add("immich_postgres").add("immich_redis")
@@ -403,14 +403,41 @@ def test_emergency_restore_works_without_knowing_the_session_id(env):
     assert docker.c["qbittorrent"]["running"]
 
 
-def test_corrupt_state_is_preserved_not_silently_discarded(env, tmp_path):
+def test_corrupt_state_is_reported_on_every_call_never_as_idle(env):
     broker, docker, store, clock, mem = env
     broker.prepare(SID)
+    broker.stop_approved(SID)
     store.state_path.write_text("{not json")
-    with pytest.raises(RuntimeError, match="corrupt"):
-        broker.status()
-    assert list(store.dir.glob("session.corrupt-*"))
+    original = store.state_path.read_text()
+    for _ in range(3):                                   # persistent, not a one-off
+        for res in (broker.status(), broker.watchdog_tick(), broker.restore(SID),
+                    broker.emergency_restore(), broker.prepare(SID2),
+                    broker.watchdog_tick(at_boot=True)):
+            assert res["ok"] is False and res["code"] == "state_corrupt"
+    assert store.state_path.read_text() == original      # NOT renamed, NOT touched
+    assert not list(store.dir.glob("session.corrupt-*"))
     assert any(e["event"] == "state_corrupt" for e in store.audit_events())
+    assert not docker.c["qbittorrent"]["running"]        # and nothing acted on a guess
+    assert docker.touched("start") == set()
+
+
+def test_structurally_invalid_state_is_corrupt_too(env):
+    broker, docker, store, clock, mem = env
+    for bad in ('{"version": 2, "session": null}', '[]', '{"version":1,"session":{"id":"x"}}',
+                ""):
+        store.state_path.write_text(bad)
+        assert broker.status()["code"] == "state_corrupt", bad
+
+
+def test_every_good_save_keeps_a_valid_backup(env):
+    broker, docker, store, clock, mem = env
+    broker.prepare(SID)
+    broker.stop_approved(SID)
+    backup = store.load_backup()
+    assert backup is not None and backup["session"]["id"] == SID
+    store.state_path.write_text("garbage")                # corruption must not clobber it
+    broker.status()
+    assert store.load_backup()["session"]["id"] == SID
 
 
 # ---- protect running playback / Immich; unlisted dependents ------------------------------------

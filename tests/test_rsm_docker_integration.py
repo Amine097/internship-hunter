@@ -62,7 +62,7 @@ def world(tmp_path):
     sh("create", "--name", names["stopped"], "--label", "hunter-rsm-test=1", IMAGE,
        "sleep", "3600")
     doc = {
-        "version": 1, "max_session_seconds": 600, "stale_contact_seconds": 2,
+        "version": 1, "max_session_seconds": 600, "stale_contact_seconds": 100,
         "prepared_timeout_seconds": 60, "min_available_mib": 1,
         "protected": [names["protected"]],
         "containers": {
@@ -165,7 +165,10 @@ def test_killing_the_real_helper_process_mid_session_is_recovered_by_the_watchdo
         server.wait(timeout=10)
     assert not running(names["client"])                     # still down: nobody restored yet
 
-    time.sleep(3)                                           # controller silent > 2 s
+    # the controller has been silent for a long time (policy: 100 s); age the contact stamp
+    doc = json.loads((state / "session.json").read_text())
+    doc["session"]["last_contact"] -= 1000
+    (state / "session.json").write_text(json.dumps(doc))
     r = rsm_cli("watchdog", pol=pol, state=state)           # independent systemd-timer unit
     out = json.loads(r.stdout)
     assert r.returncode == 0 and out["code"] == "restored" and out["reason"] == \
@@ -203,3 +206,89 @@ def test_policy_names_that_do_not_exist_are_ignored_not_created(world):
     assert r["ok"] and f"{P}-ghost" not in r["to_stop"]
     assert sh("inspect", f"{P}-ghost", check=False).returncode != 0
     assert b.restore(f"it-{RUN}-0005")["ok"]
+
+
+# ---- review fixes: real NetworkMode=container:<id> handling, slow stops, admin recovery --------
+
+def make_broker(world_, probe=lambda p: (False, "")):
+    names, pol, tmp = world_
+    return Broker(policy_of(pol), CliDocker(shutil.which("docker")), Store(tmp / "state"),
+                  probe_runner=probe)
+
+
+def test_real_docker_records_the_provider_id_and_it_is_resolved(world):
+    names, pol, tmp = world
+    ref = sh("inspect", "-f", "{{.HostConfig.NetworkMode}}", names["client"]).stdout.strip()
+    assert ref.startswith("container:")
+    b = make_broker(world)
+    r = b.prepare(f"it-{RUN}-0101")
+    assert r["ok"], r
+    entry = next(e for e in b.store.load()["session"]["snapshot"]
+                 if e["name"] == names["client"])
+    vpn_id = sh("inspect", "-f", "{{.Id}}", names["vpn"]).stdout.strip()
+    assert entry["provider"] == {"name": names["vpn"], "id": vpn_id}
+    assert b.restore(f"it-{RUN}-0101")["ok"]
+
+
+def test_real_undeclared_network_dependency_is_refused(world):
+    names, pol, tmp = world
+    doc = json.loads(pol.read_text())
+    doc["containers"][names["client"]].pop("depends_on")
+    pol.write_text(json.dumps(doc))
+    r = make_broker(world).prepare(f"it-{RUN}-0102")
+    assert not r["ok"] and r["code"] == "blocked_dependency"
+    assert r["problems"][0]["code"] == "undeclared_dependency"
+    assert running(names["vpn"]) and running(names["client"])
+
+
+def test_real_recreated_provider_is_stale_at_prepare(world):
+    names, pol, tmp = world
+    sh("rm", "-f", names["vpn"])
+    sh("run", "-d", "--name", names["vpn"], "--label", "hunter-rsm-test=1",
+       "--restart", "always", IMAGE, "sleep", "3600")                 # same name, NEW id
+    r = make_broker(world).prepare(f"it-{RUN}-0103")
+    assert not r["ok"] and r["code"] == "blocked_dependency"
+    assert r["problems"][0]["code"] in ("stale_provider", "ambiguous_provider")
+    assert running(names["client"])                                    # nothing was stopped
+
+
+def test_real_provider_recreated_during_the_session_is_reported_at_restore(world):
+    names, pol, tmp = world
+    b = make_broker(world)
+    sid = f"it-{RUN}-0104"
+    assert b.prepare(sid)["ok"] and b.stop_approved(sid)["ok"]
+    sh("rm", "-f", names["vpn"])
+    sh("run", "-d", "--name", names["vpn"], "--label", "hunter-rsm-test=1",
+       "--restart", "always", IMAGE, "sleep", "3600")
+    r = b.restore(sid)
+    assert r["code"] == "restore_failed"
+    assert "recreated" in r["failures"][names["client"]]
+    assert running(names["vpn"]) and running(names["worker"])
+    assert not running(names["client"])                                # never half-started
+    from hunter.rsm import admin
+    out = admin.abandon(b, "the client must be recreated by its compose project")
+    assert [u["container"] for u in out["unresolved"]] == [names["client"]]
+    assert b.status()["active"] is False
+
+
+def test_real_container_that_ignores_sigterm_is_stopped_within_the_bounded_timeout(world):
+    names, pol, tmp = world
+    slow = f"{P}-stubborn"
+    sh("run", "-d", "--name", slow, "--label", "hunter-rsm-test=1", IMAGE, "sh", "-c",
+       'trap "" TERM; while true; do sleep 1; done')
+    try:
+        doc = json.loads(pol.read_text())
+        doc["containers"][slow] = {"stop_timeout": 3}
+        pol.write_text(json.dumps(doc))
+        b = make_broker(world)
+        sid = f"it-{RUN}-0105"
+        assert b.prepare(sid)["ok"]
+        started = time.monotonic()
+        r = b.stop_approved(sid)
+        elapsed = time.monotonic() - started
+        assert r["ok"], r
+        assert elapsed < 60                                            # bounded, never hangs
+        assert not running(slow)
+        assert b.restore(sid)["ok"] and running(slow)
+    finally:
+        sh("rm", "-f", slow, check=False)

@@ -7,9 +7,21 @@ from collections.abc import Callable
 from hunter.rsm import probes as probes_mod
 from hunter.rsm.dockerctl import DockerController, DockerError
 from hunter.rsm.policy import SESSION_ID, Policy, stop_order
-from hunter.rsm.store import Store
+from hunter.rsm.store import StateCorrupt, Store
 
 ACTIVE_PHASES = ("prepared", "stopping", "stopped", "restoring", "restore_failed")
+
+
+def _guarded(fn):
+    """Corrupt recovery state is reported as such on EVERY call; it never reads as 'idle'."""
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except StateCorrupt as exc:
+            return self._corrupt(exc)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
 
 
 def read_mem_available_mib(path: str = "/proc/meminfo") -> int:
@@ -32,6 +44,10 @@ class Broker:
     def _result(self, ok: bool, code: str, **extra) -> dict:
         return {"ok": ok, "code": code, **extra}
 
+    def _corrupt(self, exc: Exception) -> dict:
+        # Visible, never "idle": the containers may still be stopped.
+        return self._result(False, "state_corrupt", error=str(exc)[:300])
+
     def _public(self, s: dict | None) -> dict | None:
         if not s:
             return None
@@ -42,6 +58,7 @@ class Broker:
             "to_stop": s["stop_order"], "stopped": s["stopped"], "skipped_busy": s["skipped"],
             "failures": s["failures"], "mem_available_before_mib": s.get("mem_before"),
             "mem_available_after_mib": s.get("mem_after"),
+            "limits": self.policy.limits(),
         }
 
     def _finish(self, state: dict, outcome: str) -> None:
@@ -52,7 +69,60 @@ class Broker:
         }]
         state["session"] = None
 
+    # ------------------------------------------------------------------ dependencies ----------
+    def _provider(self, client) -> tuple[str, object | None, str | None]:
+        """Resolve ``NetworkMode=container:<ref>`` to the REAL provider container.
+
+        Returns (status, provider_info, ref): status is ``none`` (no shared namespace),
+        ``ok``, ``stale`` (the referenced container no longer exists: the provider was
+        recreated under a new id) or ``ambiguous`` (docker cannot resolve the reference to
+        exactly one container)."""
+        mode = client.network_mode or ""
+        if not mode.startswith("container:"):
+            return "none", None, None
+        ref = mode.split(":", 1)[1]
+        try:
+            info = self.docker.inspect(ref)
+        except DockerError:
+            return "ambiguous", None, ref
+        if info is None:
+            return "stale", None, ref
+        return "ok", info, ref
+
+    def _check_dependencies(self, running: dict, to_stop: set[str], skipped_names: set[str]):
+        """Refuse any shared-namespace relationship the policy does not declare."""
+        problems = []
+        for other in self.docker.running():
+            status, provider, ref = self._provider(other)
+            if status == "none":
+                continue
+            in_policy = other.name in self.policy.containers
+            if status in ("stale", "ambiguous"):
+                if in_policy or other.name in to_stop:
+                    problems.append({"code": f"{status}_provider", "client": other.name,
+                                     "reference": ref})
+                continue
+            pname = provider.name
+            if pname in to_stop and other.name not in to_stop:
+                # a client we would NOT stop (unlisted, protected or busy-skipped) loses its
+                # network when the provider stops
+                problems.append({"code": "unlisted_dependent", "dependent": other.name,
+                                 "depends_on": pname})
+            elif other.name in to_stop and pname in self.policy.containers:
+                if pname not in self.policy.containers[other.name].depends_on:
+                    problems.append({"code": "undeclared_dependency", "client": other.name,
+                                     "provider": pname})
+        return problems
+
+    def _snapshot_entry(self, name: str, info) -> dict:
+        status, provider, _ = self._provider(info)
+        entry = {"name": name, "id": info.id, "restart_policy": info.restart_policy}
+        if status == "ok" and provider is not None:
+            entry["provider"] = {"name": provider.name, "id": provider.id}
+        return entry
+
     # ------------------------------------------------------------------ prepare -------------
+    @_guarded
     def prepare(self, session_id: str) -> dict:
         if not SESSION_ID.match(session_id or ""):
             return self._result(False, "bad_session_id")
@@ -94,33 +164,28 @@ class Broker:
             skipped_names = {s["container"] for s in skipped}
             to_stop = {n for n in running if n not in skipped_names}
 
-            # Anything attached to a container we would stop must be part of the stop set,
-            # otherwise stopping it would silently break an unlisted service (e.g. a
-            # container using `network_mode: container:gluetun`).
-            unexpected = []
+            # The ACTUAL namespace graph is authoritative; compose labels only add to it.
+            problems = self._check_dependencies(running, to_stop, skipped_names)
             for other in self.docker.running():
                 if other.name in to_stop:
                     continue
                 for tname in to_stop:
-                    tinfo = running[tname]
-                    uses_ns = other.network_mode in (f"container:{tname}",
-                                                     f"container:{tinfo.id}")
-                    dep_label = tname in (other.labels.get("com.docker.compose.depends_on")
-                                         or "")
-                    if uses_ns or dep_label:
-                        unexpected.append({"dependent": other.name, "depends_on": tname})
-            if unexpected:
-                self.store.audit("blocked_dependency", session_id=session_id,
-                                 dependents=unexpected)
-                return self._result(False, "blocked_dependency", dependents=unexpected)
+                    if tname in (other.labels.get("com.docker.compose.depends_on") or ""):
+                        problems.append({"code": "unlisted_dependent",
+                                         "dependent": other.name, "depends_on": tname})
+            if problems:
+                self.store.audit("blocked_dependency", session_id=session_id, problems=problems)
+                legacy = [{"dependent": x["dependent"], "depends_on": x["depends_on"]}
+                          for x in problems if x["code"] == "unlisted_dependent"]
+                return self._result(False, "blocked_dependency", dependents=legacy,
+                                    problems=problems)
 
             order = stop_order(self.policy.containers, to_stop)
             now = self.clock()
             state["session"] = {
                 "id": session_id, "phase": "prepared", "created_at": now,
                 "deadline": now + self.policy.max_session_seconds, "last_contact": now,
-                "snapshot": [{"name": n, "id": running[n].id,
-                              "restart_policy": running[n].restart_policy} for n in order],
+                "snapshot": [self._snapshot_entry(n, running[n]) for n in order],
                 "stop_order": order, "stopped": [], "skipped": skipped, "failures": {},
                 "mem_before": self.mem(), "mem_after": None, "stopping": None,
             }
@@ -131,6 +196,7 @@ class Broker:
             return self._result(True, "prepared", **self._public(state["session"]))
 
     # ------------------------------------------------------------------ stop ----------------
+    @_guarded
     def stop_approved(self, session_id: str) -> dict:
         with self.store.lock() as got:
             if not got:
@@ -150,6 +216,7 @@ class Broker:
                     continue
                 rule = self.policy.containers[name]
                 s["stopping"] = name
+                s["last_contact"] = self.clock()             # a slow stop must not look silent
                 self.store.save(state)                       # intent is durable BEFORE acting
                 self.store.audit("stop", session_id=session_id, container=name)
                 try:
@@ -167,9 +234,11 @@ class Broker:
                                         **self._public(s))
                 s["stopped"].append(name)
                 s["stopping"] = None
+                s["last_contact"] = self.clock()             # refreshed after EACH stop
                 self.store.save(state)
             s["phase"] = "stopped"
             s["mem_after"] = self.mem()
+            s["last_contact"] = self.clock()   # the caller can only poll after this returns
             self.store.save(state)
             self.store.audit("stopped", session_id=session_id, mem_after=s["mem_after"])
             if s["mem_after"] < self.policy.min_available_mib:
@@ -177,6 +246,28 @@ class Broker:
             return self._result(True, "stopped", **self._public(s))
 
     # ------------------------------------------------------------------ restore -------------
+    def _provider_problem(self, entry: dict, info) -> str | None:
+        """A client may only be started if the namespace it references still exists.
+
+        If the provider was recreated (new container id) the client still points at the old,
+        dead namespace and Docker cannot start it: say so explicitly instead of retrying."""
+        status, provider, ref = self._provider(info)
+        if status == "none":
+            return None
+        if status == "stale":
+            return (f"network provider {entry.get('provider', {}).get('name', ref)!r} was "
+                    f"recreated (reference {ref[:12]} no longer exists): the container must "
+                    "be recreated by its owner, it cannot be started as is")
+        if status == "ambiguous":
+            return f"network provider reference {ref!r} is ambiguous"
+        old = entry.get("provider")
+        if old and provider.id != old["id"]:
+            self.store.audit("provider_id_changed", container=entry["name"],
+                             provider=provider.name, old_id=old["id"], new_id=provider.id)
+        if not provider.running:
+            return f"network provider {provider.name!r} is not running"
+        return None
+
     def _restore_locked(self, state: dict, reason: str) -> dict:
         s = state["session"]
         s["phase"] = "restoring"
@@ -198,6 +289,11 @@ class Broker:
                     self.store.audit("restore_recreated", container=name,
                                      old_id=entry["id"], new_id=info.id)
                 if info.running:
+                    continue
+                broken = self._provider_problem(entry, info)
+                if broken:
+                    failures[name] = broken
+                    self.store.audit("restore_provider_problem", container=name, detail=broken)
                     continue
                 self.store.audit("start", container=name, reason=reason)
                 last: Exception | None = None
@@ -228,6 +324,7 @@ class Broker:
         self.store.audit("restored", session_id=sid, reason=reason)
         return self._result(True, "restored", session_id=sid)
 
+    @_guarded
     def restore(self, session_id: str) -> dict:
         with self.store.lock() as got:
             if not got:
@@ -244,6 +341,7 @@ class Broker:
             s["last_contact"] = self.clock()
             return self._restore_locked(state, "restore")
 
+    @_guarded
     def emergency_restore(self) -> dict:
         with self.store.lock() as got:
             if not got:
@@ -255,6 +353,7 @@ class Broker:
             return self._restore_locked(state, "emergency")
 
     # ------------------------------------------------------------------ status --------------
+    @_guarded
     def status(self, session_id: str | None = None) -> dict:
         """Never blocks: reads the atomically-replaced state file. When the caller names
         the active session this doubles as the controller's liveness signal."""
@@ -270,6 +369,7 @@ class Broker:
                                 mem_available_mib=self.mem())
 
     # ------------------------------------------------------------------ watchdog ------------
+    @_guarded
     def watchdog_tick(self, at_boot: bool = False) -> dict:
         """Independent safety net, run by a separate systemd unit. Restores when the session
         outlived its deadline, the controller went silent, or after a reboot."""

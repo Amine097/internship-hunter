@@ -1,0 +1,28 @@
+# The listening socket is created, owned and permissioned by SYSTEMD, never by the broker:
+# the service keeps an empty capability set and a seccomp filter that (correctly) forbids
+# chown/chmod, and it inherits this descriptor as fd 3 (sd_listen_fds).
+#
+# The directory is administrator-owned, outside /run (tmpfs, recreated) and /etc, and stable:
+# it exists before the rootless daemon starts and survives broker restarts, so a bind mount
+# of the DIRECTORY into the rootless session-controller never goes stale.
+#   /var/lib/hunter-rsm-ipc   root:__HUNTER_CLIENT_GROUP__  0750   (see tmpfiles.d/hunter-rsm.conf)
+#
+# __HUNTER_CLIENT_GROUP__ = the PRIMARY group of the rootless Docker user (container root maps
+# to that user/group). It is NOT the docker group; membership of docker is never granted.
+[Unit]
+Description=Internship Hunter Resource Session Manager socket
+Documentation=file:///opt/hunter-rsm/docs/resource-sessions.md
+RequiresMountsFor=/var/lib/hunter-rsm-ipc
+
+[Socket]
+ListenStream=/var/lib/hunter-rsm-ipc/rsm.sock
+SocketUser=hunter-rsm
+SocketGroup=__HUNTER_CLIENT_GROUP__
+SocketMode=0660
+Accept=no
+Backlog=16
+# a client that connects while the broker restarts is queued by systemd, not refused
+RemoveOnStop=no
+
+[Install]
+WantedBy=sockets.target

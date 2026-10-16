@@ -108,7 +108,7 @@ def served(tmp_path, broker):
     servers = []
 
     def start(allowed_uids=()):
-        srv = RsmServer(path, b, group=None, allowed_uids=allowed_uids)
+        srv = RsmServer(path, b, allowed_uids=allowed_uids)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         servers.append(srv)
         return path
@@ -245,8 +245,44 @@ def test_systemd_units_are_sandboxed():
         text = (unit_dir / unit).read_text()
         for must in ("NoNewPrivileges=yes", "ProtectSystem=strict", "ProtectHome=yes",
                      "PrivateTmp=yes", "ReadWritePaths=/var/lib/hunter-rsm",
-                     "CapabilityBoundingSet=", "RestrictAddressFamilies=",
-                     "SystemCallFilter="):
+                     "CapabilityBoundingSet=", "AmbientCapabilities=",
+                     "RestrictAddressFamilies=", "SystemCallFilter=",
+                     "SystemCallErrorNumber=EPERM", "RestrictNamespaces=yes"):
             assert must in text, f"{unit} missing {must}"
-        assert "User=hunter-rsm" in text
+        assert "User=hunter-rsm" in text and "SupplementaryGroups=docker" in text
+        assert "chown" not in text.lower().replace("~@privileged", "")
+
+
+def test_broker_service_uses_socket_activation_not_its_own_socket():
+    unit_dir = Path(__file__).resolve().parents[1] / "deploy" / "rsm"
+    svc = (unit_dir / "hunter-rsm.service").read_text()
+    sock = (unit_dir / "hunter-rsm.socket").read_text()
+    assert "serve --systemd" in svc and "--socket" not in svc.replace("--socket-", "")
+    assert "RuntimeDirectory" not in svc                        # nothing under /run to go stale
+    assert "Requires=docker.service hunter-rsm.socket" in svc
+    assert "SocketUser=hunter-rsm" in sock and "SocketMode=0660" in sock
+    assert "SocketGroup=__HUNTER_CLIENT_GROUP__" in sock and "SocketGroup=docker" not in sock
+    assert "Accept=no" in sock
+    listen = next(ln for ln in sock.splitlines() if ln.startswith("ListenStream="))
+    path = listen.split("=", 1)[1]
+    assert path == "/var/lib/hunter-rsm-ipc/rsm.sock"
+    assert not path.startswith(("/run", "/etc", "/tmp"))        # stable, admin-owned location
+    for text in (svc, sock):
+        assert "0666" not in text and "0777" not in text and "chmod 7" not in text
+    tmpfiles = (unit_dir / "tmpfiles-hunter-rsm.conf").read_text()
+    line = next(ln for ln in tmpfiles.splitlines() if ln.startswith("d "))
+    assert line.split()[:4] == ["d", "/var/lib/hunter-rsm-ipc", "0750", "root"]
+    assert "__HUNTER_CLIENT_GROUP__" in line and "docker" not in line
+    override = (unit_dir.parents[1] / "compose.rsm.yaml").read_text()
+    assert "/var/lib/hunter-rsm-ipc:/run/hunter-rsm:ro" in override
+    assert "docker.sock" not in override
+
+
+def test_the_package_never_changes_ownership_or_modes_itself():
+    banned = {"chown", "lchown", "fchown", "chmod", "fchmod"}
+    for f in PKG.glob("*.py"):
+        for node in ast.walk(ast.parse(f.read_text())):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr in banned:
+                pytest.fail(f"{f.name}:{node.lineno} calls {node.func.attr}")
     assert FakeDocker  # keep import referenced

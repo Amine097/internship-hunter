@@ -532,3 +532,231 @@ def test_notifications_are_delivered_once_and_alerts_are_marked(rig):
 
 def test_unused_fake_docker_import_guard():
     assert FakeDocker
+
+
+# ---- MEDIUM-1: scans must stop when the reservation ends ---------------------------------------
+
+def start_running(rig):
+    sid = request(rig)
+    accept(rig, sid)
+    for _ in range(4):
+        rig.ctrl.tick()
+    assert state_of(sid) == "running"
+    return sid
+
+
+def task_states():
+    with session_scope() as db:
+        return {t.scan_id: (t.state, t.cancel_requested) for t in db.scalars(select(Task))}
+
+
+def age(rig, claim, seconds, alive=True):
+    """Time passes. A LIVE worker keeps heartbeating its lease; a crashed one does not."""
+    for _ in range(seconds // 60):
+        rig.clock.advance(60)
+        if alive:
+            rig.queue.heartbeat(claim)
+    rig.clock.advance(seconds % 60)
+
+
+def end_with_one_scan_running(rig, ender):
+    """Two scans: one claimed by a 'worker', one still queued, then the host ends the session."""
+    sid = start_running(rig)
+    claim = rig.queue.claim()                       # a worker is running scan 1
+    assert claim is not None
+    ender(claim)
+    return sid, claim
+
+
+def lock_of(sid):
+    with session_scope() as db:
+        return db.get(ResourceSession, sid).lock_key
+
+
+def result_of(sid):
+    with session_scope() as db:
+        return dict(db.get(ResourceSession, sid).result)
+
+
+def test_watchdog_end_cancels_queued_and_running_scans_and_holds_the_lock_until_clean(rig):
+    sid, claim = end_with_one_scan_running(
+        rig, lambda c: (age(rig, c, 2701), rig.broker.watchdog_tick()))
+    assert managed_running(rig)                         # the host already restored
+    rig.ctrl.tick()                                     # controller notices, cancels
+    ts = task_states()
+    assert ts[claim.scan_id] == ("running", True)       # running: flagged, fenced stop
+    other = next(i for i in ts if i != claim.scan_id)
+    assert ts[other] == ("cancelled", False)            # queued: cancelled at once
+    assert state_of(sid) == "restoring"
+    assert lock_of(sid) == "active"                     # NOT released while a scan still runs
+    other_session = request(rig)
+    assert accept(rig, other_session).outcome == "busy"
+
+    orchestrator.process_claim(rig.queue, claim)        # the worker hits its next fence
+    assert task_states()[claim.scan_id] == ("cancelled", True)
+    rig.ctrl.tick()
+    assert state_of(sid) == "failed" and lock_of(sid) is None
+    res = result_of(sid)
+    assert res["cause"] == "watchdog" and res["cleanup"]["incomplete"] == []
+    assert set(res["cleanup"]["scans"].values()) == {"cancelled"}
+    kind, text = notes()[-1]
+    assert kind == "alert" and "UNEXPECTED" in text and "watchdog" in text
+    assert "deadline" in text
+
+
+def test_owner_restore_is_distinguished_from_a_watchdog_restore(rig):
+    sid = start_running(rig)
+    claim = rig.queue.claim()
+    sessions.request_emergency_restore()                # the owner sends /restore
+    for _ in range(3):
+        rig.ctrl.tick()
+    assert managed_running(rig)
+    orchestrator.process_claim(rig.queue, claim)
+    for _ in range(3):
+        rig.ctrl.tick()
+    assert state_of(sid) == "failed"
+    kind, text = notes()[-1]
+    assert result_of(sid)["cause"] in ("owner", "owner_emergency")
+    assert "your request" in text or "emergency restore" in text
+    assert kind == "info" and "UNEXPECTED" not in text
+    assert set(result_of(sid)["cleanup"]["scans"].values()) == {"cancelled"}
+
+
+def test_boot_recovery_ends_the_session_and_cancels_scans(rig):
+    sid = start_running(rig)
+    rig.docker.reboot()
+    assert rig.broker.watchdog_tick(at_boot=True)["reason"] == "boot_recovery"
+    for _ in range(3):
+        rig.ctrl.tick()
+    assert set(t[0] for t in task_states().values()) == {"cancelled"}
+    assert result_of(sid)["cause"] == "watchdog"
+    assert "boot_recovery" in notes()[-1][1] and state_of(sid) == "failed"
+
+
+def test_abandon_by_an_administrator_ends_the_session_and_cancels_scans(rig):
+    from hunter.rsm import admin
+    sid = start_running(rig)
+    rig.docker.remove("radarr")
+    rig.broker.restore(sid)                             # fails: radarr is gone
+    assert rig.broker.status(sid)["session"]["phase"] == "restore_failed"
+    admin.abandon(rig.broker, "radarr was deleted by the owner for good")
+    for _ in range(4):
+        rig.ctrl.tick()
+    assert result_of(sid)["cause"] == "abandoned"
+    assert set(t[0] for t in task_states().values()) == {"cancelled"}
+    assert state_of(sid) == "failed" and lock_of(sid) is None
+    assert "abandoned by an administrator" in notes()[-1][1]
+
+
+def test_a_scan_that_will_not_stop_is_reported_after_the_grace_period(rig):
+    sid, claim = end_with_one_scan_running(
+        rig, lambda c: (age(rig, c, 2701), rig.broker.watchdog_tick()))
+    rig.ctrl.tick()
+    age(rig, claim, 601, alive=False)                   # the worker hangs: no fence, no beat
+    rig.ctrl.tick()
+    assert state_of(sid) == "failed" and lock_of(sid) is None
+    assert result_of(sid)["cleanup"]["incomplete"] == [str(claim.scan_id)]
+    assert any(k == "alert" and "did not stop" in t for k, t in notes())
+
+
+def test_cancelled_task_is_never_retried_after_its_worker_dies(rig):
+    sid, claim = end_with_one_scan_running(
+        rig, lambda c: (age(rig, c, 2701), rig.broker.watchdog_tick()))
+    rig.ctrl.tick()
+    assert task_states()[claim.scan_id] == ("running", True)
+    age(rig, claim, 300, alive=False)                   # the worker crashed: lease expires
+    assert rig.queue.reap()["cancelled"] == 1           # NOT 'retried'
+    assert task_states()[claim.scan_id] == ("cancelled", True)
+    assert rig.queue.claim() is None                    # nothing left to run
+    rig.ctrl.tick()
+    assert state_of(sid) == "failed" and lock_of(sid) is None
+
+
+def test_graceful_shutdown_of_a_cancelled_task_stays_cancelled(rig):
+    import threading
+    sid = start_running(rig)
+    claim = rig.queue.claim()
+    rig.queue.cancel(claim.scan_id)                     # flagged while running
+    stop = threading.Event()
+    stop.set()
+    orchestrator.process_claim(rig.queue, claim, stop=stop)
+    assert task_states()[claim.scan_id][0] == "cancelled"   # not re-queued by release()
+    assert sid
+
+
+def test_restore_failure_alerts_are_rate_limited_and_recovery_is_announced(rig):
+    sid = start_running(rig)
+    rig.docker.fail_start["sonarr"] = 10_000
+    sessions.request_emergency_restore()
+    for _ in range(30):                                 # ~10 minutes of failing retries
+        rig.ctrl.tick()
+        rig.clock.advance(21)
+    alerts = [t for k, t in notes() if "RESTORATION FAILED" in t]
+    assert len(alerts) == 1                             # not one per retry
+    rig.clock.advance(31 * 60)
+    rig.ctrl.tick()
+    rig.clock.advance(21)
+    rig.ctrl.tick()
+    assert len([t for k, t in notes() if "RESTORATION FAILED" in t]) == 2   # once per 30 min
+    rig.docker.fail_start.clear()
+    for _ in range(5):
+        rig.ctrl.tick()
+        rig.clock.advance(21)
+    assert any("Restoration recovered" in t for _, t in notes())
+    assert managed_running(rig) and sid
+
+
+def test_the_client_deadline_is_raised_above_the_brokers_stop_budget(rig):
+    seen = {}
+
+    class Recording(InProcessRsm):
+        timeout = 400.0
+
+        def ensure_timeout(self, limits):
+            seen["limits"] = limits
+            self.timeout = max(self.timeout, limits["stop_phase_budget_seconds"] + 120)
+
+    rig.ctrl.rsm = Recording(rig.broker)
+    sid = request(rig)
+    accept(rig, sid)
+    rig.ctrl.tick()
+    rig.ctrl.tick()
+    assert seen["limits"]["stop_phase_budget_seconds"] > 0
+    assert rig.ctrl.rsm.timeout >= seen["limits"]["stop_phase_budget_seconds"] + 120
+
+
+def test_rsm_client_timeout_adapts_and_connect_retries_survive_a_broker_restart(tmp_path):
+    import json
+    import socket
+    import threading
+    import time
+
+    from hunter import rsm_client
+    c = rsm_client.RsmClient(str(tmp_path / "s.sock"), timeout=400)
+    c.ensure_timeout({"stop_phase_budget_seconds": 900})
+    assert c.timeout == 900 + rsm_client.TIMEOUT_MARGIN
+    c.ensure_timeout({"stop_phase_budget_seconds": 10})
+    assert c.timeout == 900 + rsm_client.TIMEOUT_MARGIN       # never lowered
+    c.ensure_timeout(None)
+    c.ensure_timeout({"stop_phase_budget_seconds": "bogus"})
+    assert c.timeout == 900 + rsm_client.TIMEOUT_MARGIN
+
+    rsm_client.CONNECT_RETRY_DELAY = 0.2
+    path = str(tmp_path / "late.sock")
+
+    def broker_comes_back():                             # started AFTER the first attempt
+        time.sleep(0.3)
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(path)
+        srv.listen(1)
+        conn, _ = srv.accept()
+        conn.makefile().readline()
+        conn.sendall(json.dumps({"ok": True, "code": "status"}).encode() + b"\n")
+        conn.close()
+        srv.close()
+
+    threading.Thread(target=broker_comes_back, daemon=True).start()
+    client = rsm_client.RsmClient(path, timeout=5)
+    assert client.status()["ok"] is True                  # retried the connect, then served
+    with pytest.raises(RsmUnavailable):
+        rsm_client.RsmClient(str(tmp_path / "never.sock"), timeout=1).status()

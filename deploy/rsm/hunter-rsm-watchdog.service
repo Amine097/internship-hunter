@@ -36,4 +36,5 @@ AmbientCapabilities=
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @swap @reboot @raw-io
+SystemCallErrorNumber=EPERM
 UMask=0027

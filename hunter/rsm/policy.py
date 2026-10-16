@@ -61,8 +61,19 @@ class Policy:
     dns_independence_verified: bool = False
     notify: Notify | None = None
 
+    def max_single_stop_seconds(self) -> int:
+        """Longest a SINGLE stop may take: docker's own wait plus the CLI's 30 s slack."""
+        return max(c.stop_timeout for c in self.containers.values()) + 30
+
     def stop_phase_budget(self) -> int:
-        return sum(c.stop_timeout + 10 for c in self.containers.values())
+        """Upper bound for a whole stop_approved call (every container, slack included)."""
+        return sum(c.stop_timeout + 30 for c in self.containers.values())
+
+    def limits(self) -> dict:
+        return {"stop_phase_budget_seconds": self.stop_phase_budget(),
+                "max_single_stop_seconds": self.max_single_stop_seconds(),
+                "stale_contact_seconds": self.stale_contact_seconds,
+                "max_session_seconds": self.max_session_seconds}
 
 
 def is_always_protected(name: str, dns_verified: bool = False) -> bool:
@@ -157,6 +168,14 @@ def parse_policy(doc: dict) -> Policy:
         raise PolicyError("max_session_seconds must be 60..14400")
     if pol.stop_phase_budget() * 2 >= pol.max_session_seconds:
         raise PolicyError("sum of stop timeouts is too large for max_session_seconds")
+    # The broker refreshes last_contact after every single stop, so staleness is measured
+    # against ONE stop, never the whole phase: it must comfortably exceed the slowest stop.
+    if pol.stale_contact_seconds < pol.max_single_stop_seconds() + 60:
+        raise PolicyError(
+            f"stale_contact_seconds ({pol.stale_contact_seconds}) must be at least "
+            f"{pol.max_single_stop_seconds() + 60} (slowest single stop + 60 s margin)")
+    if pol.prepared_timeout_seconds < 60:
+        raise PolicyError("prepared_timeout_seconds must be at least 60")
     return pol
 
 

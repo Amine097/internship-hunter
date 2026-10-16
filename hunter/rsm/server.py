@@ -67,15 +67,43 @@ class _Handler(socketserver.StreamRequestHandler):
         self.wfile.write(json.dumps(resp).encode() + b"\n")
 
 
+SD_LISTEN_FDS_START = 3
+
+
 class RsmServer(socketserver.UnixStreamServer):
+    """Production: the listening socket is created, owned (SocketUser/SocketGroup) and
+    permissioned (SocketMode) by systemd and inherited here, so this process needs no
+    capability to chown/chmod anything and keeps a locked-down sandbox. The standalone
+    ``path`` mode exists for development and tests only."""
+
     allow_reuse_address = True
 
-    def __init__(self, path: str, broker: Broker, group: str | None, allowed_uids=()):
+    def __init__(self, path: str | None, broker: Broker, allowed_uids=(),
+                 sock: socket.socket | None = None):
         self.broker, self.allowed_uids = broker, tuple(allowed_uids)
+        if sock is not None:
+            super().__init__(sock.getsockname(), _Handler, bind_and_activate=False)
+            self.socket.close()
+            self.socket = sock                  # already bound + listening (by systemd)
+            return
         if os.path.exists(path):
             os.unlink(path)
-        super().__init__(path, _Handler)
-        os.chmod(path, 0o660)
-        if group:
-            import grp
-            os.chown(path, -1, grp.getgrnam(group).gr_gid)
+        old = os.umask(0o117)                   # socket is created 0660: no chmod needed
+        try:
+            super().__init__(path, _Handler)
+        finally:
+            os.umask(old)
+
+    @classmethod
+    def from_systemd(cls, broker: Broker, allowed_uids=()) -> "RsmServer":
+        """Adopt the socket passed via the sd_listen_fds protocol (fd 3)."""
+        if os.environ.get("LISTEN_PID") != str(os.getpid()):
+            raise RuntimeError("not socket-activated (LISTEN_PID does not match)")
+        if int(os.environ.get("LISTEN_FDS", "0")) < 1:
+            raise RuntimeError("not socket-activated (LISTEN_FDS < 1)")
+        for var in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"):
+            os.environ.pop(var, None)
+        sock = socket.socket(fileno=SD_LISTEN_FDS_START)
+        if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_STREAM:
+            raise RuntimeError("inherited descriptor is not an AF_UNIX stream socket")
+        return cls(None, broker, allowed_uids, sock=sock)

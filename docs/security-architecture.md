@@ -91,7 +91,10 @@ The V1 work queue is now one PostgreSQL table (`tasks`). Nothing in it is execut
 A privileged host-side helper may stop an admin-approved set of containers of the *existing*
 rootful daemon. It is a separate trust zone with five fixed operations, a root-owned policy
 and an independent watchdog; the application reaches it only through one Unix socket that
-only the session controller holds. See `docs/resource-sessions.md`.
+only the session controller holds. The socket is created by systemd socket activation in a
+stable root-owned directory; the broker neither chowns nor chmods. Administrative recovery
+(`hunter.rsm admin`) is uid-0 only and not reachable over the socket. See
+`docs/resource-sessions.md`.
 
 ## Evidence
 

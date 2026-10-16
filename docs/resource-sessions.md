@@ -48,26 +48,39 @@ session may be active (database-enforced); a second Accept is refused.
                                                        └────────────────────────────────────┘
 ```
 
-**One narrow channel:** a Unix socket `/run/hunter-rsm/rsm.sock`, bind-mounted into exactly
-one container (`session-controller`, via the opt-in `compose.rsm.yaml`). Everything else:
+**One narrow channel:** a Unix socket `/var/lib/hunter-rsm-ipc/rsm.sock`, bind-mounted
+(as the *directory*, read-only) into exactly one container (`session-controller`, via the
+opt-in `compose.rsm.yaml`). Everything else:
 
 - **Agents, proxies, API, Telegram bot, scheduler, discovery**: no socket, no Docker socket.
   Asserted by `tests/test_compose_invariants.py`; checked live by `deploy/smoke-test.sh`.
 - **The rootful Docker socket is never mounted anywhere** and `hunter-deploy` (the rootless
   user) must *not* be in the `docker` group: that would be root on the host.
+  `deploy/rsm/pilot/install-pilot.sh` refuses to install if it is.
 - **Telegram never talks to the helper.** The bot only moves `pending -> accepted/declined`
   in PostgreSQL after authenticating the owner. A Telegram/bot outage cannot strand a session
   because the controller, the helper's watchdog and the boot unit do not depend on it.
+
+**Socket lifecycle (systemd socket activation).** `hunter-rsm.socket` creates, owns
+(`SocketUser=hunter-rsm`, `SocketGroup=<client primary group>`) and permissions
+(`SocketMode=0660`) the socket; `hunter-rsm.service` *inherits it as fd 3*. The broker never
+chowns or chmods anything, so it keeps an empty capability set and a seccomp filter that
+forbids both (the previous in-process `chown` was killed by that filter at startup). The
+socket is activated at boot, before the rootless daemon, and survives broker restarts and
+crashes: a client that connects while the broker is down is queued by the kernel until
+systemd restarts it. The directory `/var/lib/hunter-rsm-ipc` is `root:<client group> 0750`
+(tmpfiles.d), outside `/run` (recreated) and `/etc`, so a bind mount of it never goes stale.
 
 Alternatives considered and rejected: (1) mounting `docker.sock` — root-equivalent for any
 compromised container; (2) the helper polling PostgreSQL — would need the database reachable
 from the host and gives the helper a DB credential; (3) `sudo`/ssh from a container —
 bigger surface, shell semantics; (4) HTTP on host loopback — rootless networking
-deliberately cannot reach host loopback (and we test that it cannot).
+deliberately cannot reach host loopback (and we test that it cannot); (5) a `RuntimeDirectory`
+under `/run` — recreated on every service restart, which stranded the bind mount.
 
 **Why the socket works under rootless Docker:** container root *is* the unprivileged host
-user, so the socket is `0660 hunter-rsm:<rootless user's primary group>` and the broker also
-checks `SO_PEERCRED` uid. A non-root container user would map to a sub-uid that cannot
+user, so the socket is `0660 hunter-rsm:<rootless user's primary group>` (the group is never
+`docker`) and the broker also checks `SO_PEERCRED` uid. A non-root container user would map to a sub-uid that cannot
 connect; hence `user: "0:0"` **in the override only** (still `cap_drop: ALL`, read-only
 root). In rootless mode this is not host root.
 
@@ -142,9 +155,12 @@ docker ps -q | xargs docker inspect --format '{{.Name}} {{.HostConfig.RestartPol
 8. **Port clash:** the application publishes `127.0.0.1:8000`; check the rootful services do
    not already use it (`ss -tlnp`).
 9. **Clock:** deadlines use the host clock; keep NTP on.
-10. **Direct Telegram message from the helper** (optional `telegram_notify`) needs the bot
+10. **Alerts are rate limited** (one restoration-failure alert per 30 min per problem, in the
+    app and from the host), then a "recovered" message; a persistent problem is therefore
+    quiet after the first alert. Check `/status` and `journalctl -u hunter-rsm-watchdog`.
+11. **Direct Telegram message from the helper** (optional `telegram_notify`) needs the bot
     token readable by `hunter-rsm`; omit it if you prefer alerts only via the app.
-11. **Unverified here:** rootless slirp4netns/pasta behaviour, your real container graph,
+12. **Unverified here:** rootless slirp4netns/pasta behaviour, your real container graph,
     and the CLI provider hosts. The acceptance tests in section 9 settle these.
 
 ## 7. Files added by this milestone
@@ -196,17 +212,23 @@ sudo -u hunter-rsm env PYTHONPATH=/opt/hunter-rsm/src python3 -m hunter.rsm plan
 ```
 Compare the listing with your understanding; fix the policy until it is exactly right.
 
-**6. Units.** Replace `__HUNTER_ROOTLESS_UID__` and `__HUNTER_ROOTLESS_PRIMARY_GROUP__` in
-`hunter-rsm.service` (`id -u hunter-deploy`, `id -gn hunter-deploy`), then
+**6. Socket directory, then units.** `CLIENT_GROUP=$(id -gn hunter-deploy)` (its *primary*
+group, **not** `docker`) and `CLIENT_UID=$(id -u hunter-deploy)`:
 ```bash
-sudo install -m 0644 deploy/rsm/*.service deploy/rsm/*.timer /etc/systemd/system/
+sed "s/__HUNTER_CLIENT_GROUP__/$CLIENT_GROUP/" deploy/rsm/tmpfiles-hunter-rsm.conf | sudo tee /etc/tmpfiles.d/hunter-rsm.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/hunter-rsm.conf
+sed "s/__HUNTER_CLIENT_GROUP__/$CLIENT_GROUP/" deploy/rsm/hunter-rsm.socket  | sudo tee /etc/systemd/system/hunter-rsm.socket
+sed "s/__HUNTER_ROOTLESS_UID__/$CLIENT_UID/"   deploy/rsm/hunter-rsm.service | sudo tee /etc/systemd/system/hunter-rsm.service
+sudo install -m 0644 deploy/rsm/hunter-rsm-watchdog.service deploy/rsm/hunter-rsm-watchdog.timer deploy/rsm/hunter-rsm-recover.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now hunter-rsm.service hunter-rsm-recover.service hunter-rsm-watchdog.timer
-systemctl status hunter-rsm.service; ls -l /run/hunter-rsm/
+sudo systemctl enable --now hunter-rsm.socket hunter-rsm-recover.service hunter-rsm-watchdog.timer
+systemctl status hunter-rsm.socket; ls -l /var/lib/hunter-rsm-ipc/
 ```
-**7. Channel check** (as the rootless user; must work) and (as any other user; must fail):
+**7. Channel check** (as the rootless user: must work; as any other user: must fail with
+`Permission denied`):
 ```bash
-sudo -u hunter-deploy python3 -c "import socket,json;s=socket.socket(socket.AF_UNIX);s.connect('/run/hunter-rsm/rsm.sock');s.sendall(b'{\"op\":\"status\"}\n');print(s.makefile().readline())"
+sudo -u hunter-deploy python3 -c "import socket;s=socket.socket(socket.AF_UNIX);s.connect('/var/lib/hunter-rsm-ipc/rsm.sock');s.sendall(b'{\"op\":\"status\"}\n');print(s.makefile().readline())"
+sudo -u nobody python3 -c "import socket;s=socket.socket(socket.AF_UNIX);s.connect('/var/lib/hunter-rsm-ipc/rsm.sock')"   # PermissionError
 ```
 **8. Enable in the application (opt-in):**
 ```bash
@@ -236,7 +258,38 @@ First production deployment stays `AGENT_MODE=demo`.
 | A15 | `sudo cat /var/lib/hunter-rsm/audit.log` | every prepare/stop/start/restore recorded, in order |
 | A16 | `SMOKE_EXPECT_ROOTLESS=1 deploy/smoke-test.sh` in enforce mode | passes (host exposure checks) |
 
-## 10. What is deliberately not done
+## 10. Review fixes for 9d35464 (HIGH-1/2, MEDIUM-1..4, LOW-1)
+
+| Finding | Fix | Verified |
+|---|---|---|
+| HIGH-1 broker could not start: in-process `chown` killed by its own seccomp filter | systemd socket activation (`hunter-rsm.socket`), broker inherits fd 3; no chown/chmod in code (AST-tested) | **real systemd (user manager)**: activation on first connect, `NoNewPrivs=1`, `CapEff=0`, `Seccomp=2`, fd 3 is a socket; the filter really blocks `chown`; the Go docker CLI runs under the filter. **Not yet**: `SocketUser/SocketGroup` ownership and EACCES for another user (system manager + root; `pilot-test.sh`) |
+| HIGH-2 socket under `/run` went stale on service restart | stable root-owned dir `/var/lib/hunter-rsm-ipc` (tmpfiles.d), bind-mount of the directory `:ro` | **real systemd**: `kill -9` -> restart, socket inode unchanged; restarts during live calls lose nothing; connect before the broker runs is queued, not refused. **Not yet**: real rootless Docker namespace mapping (`pilot-test.sh`, `rsm-pilot.yaml`) |
+| MEDIUM-1 scans kept running after the reservation ended | controller cancels all scans on every end cause, holds the lock until cleanup is recorded, a cancelled task is never retried, owner vs watchdog distinguished | session tests (SQLite) incl. queued/running scans, dead worker, hung worker |
+| MEDIUM-2 only compose `depends_on` considered | real `NetworkMode=container:<id|name|prefix>` resolved; undeclared, stale (recreated) and ambiguous providers refused; provider recreated mid-session reported at restore | fake Docker; **real-Docker tests written (`test_rsm_docker_integration.py`) but not executed in this environment** |
+| MEDIUM-3 permanent `restore_failed` | `python -m hunter.rsm admin abandon|reconcile|recover-state|show`, uid 0 only, not on the socket, audited, never deletes; alerts rate limited | unit + CLI tests; non-root refusal; real-systemd watchdog unit |
+| MEDIUM-4 slow stops looked like silence | contact refreshed after every stop and at the end; policy validation `stale_contact_seconds >= slowest single stop + 60`; client deadline raised to the broker's advertised stop budget | slow-stop tests with a fake clock; client adaptation tests |
+| LOW-1 corrupt state was renamed and then read as "idle" | never renamed; every call reports `state_corrupt`; last good backup kept; explicit `admin recover-state --mode backup|discard`; invalid policy exits 4 and touches nothing | unit tests, **real-systemd watchdog unit** exits 3 and acts on nothing |
+
+## 11. Disposable-container-only pilot (Ubuntu 24.04) - minimal instructions
+
+Purpose: prove the host mechanics without any production container in scope. The generated
+policy can only name `hv-pilot-*` containers; the script creates and removes only those.
+
+0. Prerequisites you set up yourself: a user `hunter-deploy` with **rootless Docker**
+   running (`systemctl --user status docker` as that user) and *not* in the `docker` group.
+   Ubuntu 24.04 restricts unprivileged user namespaces; give **only** `/usr/bin/rootlesskit` an
+   AppArmor profile (see `.github/workflows/rsm-pilot.yaml` for the exact profile). Do not
+   disable the restriction globally.
+1. `sudo deploy/rsm/pilot/install-pilot.sh --client-user hunter-deploy`
+2. `sudo deploy/rsm/pilot/pilot-test.sh --client-user hunter-deploy --require-rootless`
+   (about 6 minutes; it waits for the real watchdog once).
+3. Read the `PASS/FAIL/SKIP` lines. A `SKIP` means that part did **not** run.
+4. `sudo deploy/rsm/pilot/uninstall-pilot.sh` removes everything it installed.
+
+The same job runs from GitHub (manual `workflow_dispatch`: "RSM pilot (manual)") on a real
+Ubuntu 24.04 runner. It is experimental and has not been run yet.
+
+## 12. What is deliberately not done
 
 No scheduling of memory cgroups, no per-container resource limits on existing services, no
 Docker API proxy, no automatic policy discovery, no stopping of protected names, no

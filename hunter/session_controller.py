@@ -30,6 +30,8 @@ SCAN_TERMINAL = ("finished", "partial", "failed", "cancelled")
 PREPARE_RETRIES = 6            # broker unreachable at prepare: nothing was stopped yet
 RESTORE_RETRY_AFTER = timedelta(seconds=20)
 RESTORE_MAX_FAST_ATTEMPTS = 5  # then the state becomes restore_failed (still retried slowly)
+ALERT_MIN_INTERVAL = timedelta(minutes=30)   # restore-failure alerts are rate limited
+CLEANUP_GRACE = timedelta(minutes=10)        # how long to wait for cancelled scans to stop
 
 REASONS = {
     "blocked_busy": "a protected service is busy (e.g. active playback or an Immich job)",
@@ -121,6 +123,9 @@ class SessionController:
             return self._reserve_unavailable(sid, str(exc))
         if not prep.get("ok"):
             return self._blocked(sid, prep)             # nothing was stopped
+        ensure = getattr(self.rsm, "ensure_timeout", None)
+        if ensure is not None:                          # deadline must exceed the stop budget
+            ensure(prep.get("limits"))
         try:
             stop = self.rsm.stop_approved(sid)
         except RsmUnavailable:
@@ -187,6 +192,22 @@ class SessionController:
                           f"(max {get_settings().session_max_seconds // 60} min).")
 
     # -- running: wait, heartbeat, enforce limits -------------------------------------------------
+    @staticmethod
+    def _end_cause(status: dict, sid: str) -> tuple[str, str]:
+        """Why did the host end the session? Distinguishes owner-requested from unexpected."""
+        for item in reversed(status.get("history") or []):
+            if item.get("id") != sid:
+                continue
+            outcome = item.get("outcome", "")
+            if outcome.startswith("restored:watchdog:"):
+                return "watchdog", outcome.split("restored:watchdog:", 1)[1]
+            if outcome.startswith("restored:emergency"):
+                return "owner_emergency", "emergency restore on the host"
+            if outcome.startswith("abandoned"):
+                return "abandoned", item.get("reason") or "abandoned by the administrator"
+            return "host", outcome
+        return "unknown", "the host helper no longer reports this session"
+
     def _running(self, sid: str) -> None:
         with session_scope() as db:
             row = db.get(ResourceSession, sid)
@@ -202,106 +223,170 @@ class SessionController:
                 with session_scope() as db:
                     db.get(ResourceSession, sid).broker = st.get("session") or {}
                 if not st.get("active"):
-                    # the watchdog (or an operator) already restored and ended the session
-                    self._finish(sid, "running", "failed",
-                                 reason="the host watchdog ended the session early")
-                    self._notify(sid, "Research session was ended early by the host "
-                                      "watchdog; containers were restored.", kind="alert")
-                    return
+                    # The host ended the reservation (watchdog, boot recovery, /restore on the
+                    # host, admin). The scans MUST stop: they no longer have their resources.
+                    cause, why = self._end_cause(st, sid)
+                    return self._to_restoring(sid, "running", final="failed", cause=cause,
+                                              reason=why, restored=True)
             except RsmUnavailable:
                 log.warning("broker status unavailable for %s", sid)
 
         if asked:
-            return self._to_restoring(sid, "running", final="failed",
+            return self._to_restoring(sid, "running", final="failed", cause="owner",
                                       reason="restore requested by the owner")
         if deadline is not None and self.now().replace(tzinfo=None) >= \
                 deadline.replace(tzinfo=None):
-            return self._to_restoring(sid, "running", final="failed",
+            return self._to_restoring(sid, "running", final="failed", cause="timeout",
                                       reason="session timed out")
         if scan_ids and all(states.get(s) in SCAN_TERMINAL for s in scan_ids):
             bad = [s for s, st in states.items() if st in ("failed", "cancelled")]
             if bad:
-                return self._to_restoring(sid, "running", final="failed",
+                return self._to_restoring(sid, "running", final="failed", cause="scan_failed",
                                           reason=f"scan(s) failed: {bad}")
-            return self._to_restoring(sid, "running", final="completed")
+            return self._to_restoring(sid, "running", final="completed", cause="completed")
         if not scan_ids:
-            return self._to_restoring(sid, "running", final="failed", reason="no scans to run")
+            return self._to_restoring(sid, "running", final="failed", cause="no_scans",
+                                      reason="no scans to run")
 
     def _to_restoring(self, sid: str, expect: str, final: str, reason: str | None = None,
-                      broker: dict | None = None) -> None:
+                      broker: dict | None = None, cause: str = "error",
+                      restored: bool = False) -> None:
         with session_scope() as db:
             row = db.get(ResourceSession, sid)
-            res = {**(row.result or {}), "final": final}
+            res = {**(row.result or {}), "final": final, "cause": cause, "restored": restored}
             if reason:
                 res["reason"] = reason
-            db.execute(update(ResourceSession).where(
+            if restored:
+                res["restored_at"] = self.now().isoformat()
+            moved = db.execute(update(ResourceSession).where(
                 ResourceSession.id == sid, ResourceSession.state == expect,
             ).values(state="restoring", result=res, restore_attempts=0,
-                     broker=broker or row.broker or {}))
+                     broker=broker or row.broker or {})).rowcount
+        if moved:
+            self._restoring(sid)   # cancel the scans NOW, not one polling interval later
 
-    # -- restoring (always) -------------------------------------------------------------------
+    # -- restoring (always): cancel scans, restore containers, then record cleanup ---------------
+    def _scan_states(self, scan_ids: list[int]) -> dict[int, str]:
+        if not scan_ids:
+            return {}
+        with session_scope() as db:
+            return {i: st for i, st in db.execute(select(Scan.id, Scan.state)
+                                                  .where(Scan.id.in_(scan_ids)))}
+
     def _restoring(self, sid: str) -> None:
         with session_scope() as db:
             row = db.get(ResourceSession, sid)
-            reserved = (row.result or {}).get("reserved", True)
+            result = dict(row.result or {})
             state, attempts = row.state, row.restore_attempts or 0
-            final = (row.result or {}).get("final", "failed")
+            scan_ids = list(row.scan_ids or [])
             last = row.broker.get("_last_try") if row.broker else None
-            if last and state in ("restoring", "restore_failed") and attempts:
+        reserved = result.get("reserved", True)
+        restored = bool(result.get("restored")) or self.rsm is None or reserved is False
+        final = result.get("final", "failed")
+
+        # 1. cancel every associated scan (idempotent, every tick). queued -> cancelled at
+        #    once; running -> flagged and stopped at its next fence. The task queue's
+        #    lease/fencing rules are untouched: a cancelled task is never retried.
+        for scan_id, st in self._scan_states(scan_ids).items():
+            if st not in SCAN_TERMINAL:
+                self.queue.cancel(scan_id)
+
+        # 2. restore containers (never delayed by scan cleanup)
+        if not restored:
+            if last and attempts:
                 due = datetime.fromisoformat(last) + RESTORE_RETRY_AFTER
                 if self.now().replace(tzinfo=None) < due.replace(tzinfo=None):
                     return
-        # stop whatever scans are still pending: the session is over
-        with session_scope() as db:
-            scan_ids = list(db.get(ResourceSession, sid).scan_ids or [])
-        for scan_id in scan_ids:
-            self.queue.cancel(scan_id)
-
-        ok, detail = True, {}
-        if self.rsm is not None and reserved is not False:
             try:
                 res = self.rsm.restore(sid)
                 ok, detail = bool(res.get("ok")), res
             except RsmUnavailable as exc:
                 ok, detail = False, {"code": "unavailable", "failures": {"broker": str(exc)}}
+            if not ok:
+                return self._restore_failed(sid, state, attempts, detail)
+            self._record_restored(sid)
 
-        if ok:
-            self._notify_completion(sid, final)
-            self._finish(sid, state, final)
-            return
+        # 3. the lock is released only after every scan is terminal and the cleanup is
+        #    recorded; if one refuses to stop within the grace period, say so loudly
+        states = self._scan_states(scan_ids)
+        active = [i for i, st in states.items() if st not in SCAN_TERMINAL]
+        if active:
+            since = result.get("restored_at")
+            waited = (self.now().replace(tzinfo=None) - datetime.fromisoformat(since)
+                      .replace(tzinfo=None)) if since else timedelta(0)
+            if waited < CLEANUP_GRACE:
+                return
+            self._notify(sid, f"Scan(s) {active} did not stop within "
+                              f"{int(CLEANUP_GRACE.total_seconds() // 60)} minutes of the end "
+                              "of the reservation; containers are restored.", kind="alert")
+        cleanup = {"scans": {str(i): st for i, st in states.items()},
+                   "incomplete": [str(i) for i in active]}
+        self._notify_end(sid, final, result)
+        self._finish(sid, state, final, cleanup=cleanup)
+
+    def _record_restored(self, sid: str) -> None:
+        with session_scope() as db:
+            row = db.get(ResourceSession, sid)
+            row.result = {**(row.result or {}), "restored": True,
+                          "restored_at": self.now().isoformat()}
+            alerted = bool((row.broker or {}).get("_last_alert"))
+        if alerted:
+            self._notify(sid, "Restoration recovered: all containers are running again.")
+
+    def _restore_failed(self, sid: str, state: str, attempts: int, detail: dict) -> None:
         with session_scope() as db:
             row = db.get(ResourceSession, sid)
             row.restore_attempts = attempts + 1
-            row.broker = {**(row.broker or {}), "_last_try": self.now().isoformat(),
-                          "restore": detail}
-            first = attempts == 0
+            broker = {**(row.broker or {}), "_last_try": self.now().isoformat(),
+                      "restore": detail}
+            last_alert = broker.get("_last_alert")
+            due = (last_alert is None or self.now().replace(tzinfo=None) -
+                   datetime.fromisoformat(last_alert).replace(tzinfo=None) >= ALERT_MIN_INTERVAL)
+            if due:
+                broker["_last_alert"] = self.now().isoformat()
+            row.broker = broker
             if attempts + 1 >= RESTORE_MAX_FAST_ATTEMPTS and row.state == "restoring":
                 row.state = "restore_failed"
-        if first:
+        if due:   # rate limited: one alert per ALERT_MIN_INTERVAL while it keeps failing
             names = sorted((detail.get("failures") or {}).keys()) or detail.get("code")
-            self._notify(sid, f"RESTORATION FAILED: some containers are still stopped ({names})."
-                              " Retrying automatically; the host watchdog is also retrying. "
-                              "Use /restore to force it.", kind="alert")
+            self._notify(sid, f"RESTORATION FAILED: some containers are still stopped "
+                              f"({names}). Retrying automatically; the host watchdog is also "
+                              "retrying. Use /restore to force it, or an administrator can "
+                              "run `hunter.rsm admin`.", kind="alert")
 
-    def _notify_completion(self, sid: str, final: str) -> None:
+    def _notify_end(self, sid: str, final: str, result: dict) -> None:
         with session_scope() as db:
             row = db.get(ResourceSession, sid)
             ids = list(row.scan_ids or [])
-            reason = (row.result or {}).get("reason")
-            reserved = (row.result or {}).get("reserved", False)
+            reserved = result.get("reserved", False)
             scans = list(db.execute(select(Scan.id, Scan.state, Scan.discovered)
                                     .where(Scan.id.in_(ids)))) if ids else []
             new_jobs = db.scalar(
                 select(func.count(distinct(Job.id))).select_from(Job)
                 .join(ScanJob, ScanJob.job_id == Job.id).where(ScanJob.scan_id.in_(ids))
             ) if ids else 0
+        cause, reason = result.get("cause", ""), result.get("reason")
         summary = ", ".join(f"#{i}:{st}" for i, st, _ in scans) or "no scans"
         restored = "All containers restored." if reserved else "No containers were changed."
-        head = {"completed": "Research session finished.",
-                "failed": f"Research session ended with problems ({reason}).",
-                "blocked": f"Research session did not run ({reason})."}.get(final, final)
+        heads = {
+            "watchdog": f"UNEXPECTED: the host watchdog ended the session ({reason}); the "
+                        "scans were cancelled.",
+            "abandoned": f"The session was abandoned by an administrator ({reason}); the "
+                         "scans were cancelled.",
+            "owner": "Session ended at your request; the scans were cancelled.",
+            "owner_emergency": "Session ended by an emergency restore on the host; the scans "
+                               "were cancelled.",
+            "timeout": "Research session timed out; the scans were cancelled.",
+        }
+        head = heads.get(cause) or {
+            "completed": "Research session finished.",
+            "failed": f"Research session ended with problems ({reason}).",
+            "blocked": f"Research session did not run ({reason}).",
+        }.get(final, final)
+        unexpected = cause in ("watchdog", "abandoned", "unknown", "host")
         self._notify(sid, f"{head} Scans: {summary}. Jobs seen: {new_jobs}. {restored}",
-                     kind="info" if final == "completed" else "alert")
+                     kind="info" if final == "completed" or cause in ("owner", "owner_emergency")
+                     else "alert" if unexpected or final != "completed" else "info")
 
 
 def main() -> None:  # pragma: no cover - process entry point

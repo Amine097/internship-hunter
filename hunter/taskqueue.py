@@ -145,6 +145,17 @@ class TaskQueue:
         cond = [Task.id == task_id, Task.state == "running"]
         if expect_token is not None:
             cond.append(Task.lease_token == expect_token)
+        if db.scalar(select(Task.cancel_requested).where(Task.id == task_id)):
+            # cancellation outranks retry: a cancelled scan must never run again
+            rows = db.execute(update(Task).where(*cond).values(
+                state="cancelled", lease_token=None, lease_expires_at=None, finished_at=now,
+                last_error="cancelled")).rowcount
+            if rows == 1:
+                db.execute(update(Scan).where(
+                    Scan.id == scan_id, Scan.state.in_(("queued", "running")),
+                ).values(state="cancelled", error="cancelled", finished_at=now))
+                return "cancelled"
+            raise LeaseLost(f"task {task_id}: state changed concurrently")
         if attempts < max_attempts:
             rows = db.execute(update(Task).where(*cond).values(
                 state="queued", lease_token=None, lease_expires_at=None, last_error=error,
@@ -172,6 +183,9 @@ class TaskQueue:
         expiry and does consume one.)
         """
         now = self.now()
+        if db.scalar(select(Task.cancel_requested).where(Task.id == claim.task_id)):
+            self.cancel_running(db, claim)           # shutting down AND cancelled: stay cancelled
+            return
         rows = db.execute(
             update(Task).where(Task.id == claim.task_id, Task.lease_token == claim.token,
                                Task.state == "running")
@@ -219,7 +233,8 @@ class TaskQueue:
                 outcome = self._retry_or_fail(
                     db, t.id, t.scan_id, t.attempts, t.max_attempts,
                     "lease expired (worker crashed or stalled)", expect_token=t.lease_token)
-                out["retried" if outcome == "retry" else "failed"] += 1
+                key = {"retry": "retried", "cancelled": "cancelled"}.get(outcome, "failed")
+                out[key] = out.get(key, 0) + 1   # "cancelled" appears only when it happened
             old = db.execute(
                 select(Task).where(Task.state == "queued", Task.created_at < now - QUEUE_TTL)
                 .with_for_update(skip_locked=True)

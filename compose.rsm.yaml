@@ -6,7 +6,8 @@
 # Why user 0:0 is acceptable here: under ROOTLESS Docker, container root is the unprivileged
 # host user that owns the daemon. The socket is group-owned by that user's primary group, so
 # access needs no capability (cap_drop ALL still applies), and the broker additionally
-# checks the peer uid. A non-root container uid would map to a sub-uid that cannot connect.
+# checks the peer uid. `:ro` stops the container creating or deleting files in the directory;
+# connecting to a socket on a read-only mount is permitted. A non-root container uid would map to a sub-uid that cannot connect.
 services:
   session-controller:
     user: "0:0"
@@ -14,4 +15,6 @@ services:
       RSM_ENABLED: "true"
       RSM_SOCKET: /run/hunter-rsm/rsm.sock
     volumes:
-      - /run/hunter-rsm:/run/hunter-rsm
+      # Bind the DIRECTORY (not the socket file): systemd may recreate the socket inode, and
+      # the directory is stable, administrator-owned and outside /run and /etc.
+      - /var/lib/hunter-rsm-ipc:/run/hunter-rsm:ro

@@ -110,7 +110,7 @@ RSM = yaml.safe_load((ROOT / "compose.rsm.yaml").read_text())["services"]
 def test_broker_socket_is_confined_to_the_session_controller():
     assert set(RSM) == {"session-controller"}
     mounts = [v for v in RSM["session-controller"]["volumes"]]
-    assert mounts == ["/run/hunter-rsm:/run/hunter-rsm"]
+    assert mounts == ["/var/lib/hunter-rsm-ipc:/run/hunter-rsm:ro"]
     # nothing in the base file may mount a host path at all
     for name, svc in SERVICES.items():
         for v in svc.get("volumes", []):
