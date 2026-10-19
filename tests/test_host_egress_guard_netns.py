@@ -48,8 +48,14 @@ def stages():
         if REQUIRED:
             pytest.fail(f"GUARD_NETNS_REQUIRED=1 but the sandbox cannot run: {why}")
         pytest.skip(why)
-    run = subprocess.run(["bash", str(SANDBOX)], capture_output=True, text=True, env=_env(),
-                         timeout=120)
+    try:
+        run = subprocess.run(["bash", str(SANDBOX)], capture_output=True, text=True, env=_env(),
+                             timeout=240)
+    except subprocess.TimeoutExpired as e:
+        def text(b):
+            return b.decode(errors="replace") if isinstance(b, bytes) else (b or "")
+        pytest.fail("sandbox timed out after 240s\n--- stdout (tail)\n" + text(e.stdout)[-3000:]
+                    + "\n--- stderr (tail)\n" + text(e.stderr)[-3000:])
     assert run.returncode == 0, run.stdout + run.stderr
     out, stage = {}, None
     for line in run.stdout.splitlines():

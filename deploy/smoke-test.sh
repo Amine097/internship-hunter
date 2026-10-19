@@ -131,12 +131,26 @@ except OSError:
     print("blocked")
 PY
 }
-host_ports=()
-for ip in "${PROTECTED_IPS[@]}"; do host_ports+=("$ip:22" "$ip:8000"); done
 for target in postgres:5432 agent-claude-1:8100 api:8000 discovery:8100 egress-claude-1:3128 \
-              1.1.1.1:443 8.8.8.8:53 169.254.169.254:80 "${host_ports[@]}"; do
+              1.1.1.1:443 8.8.8.8:53 169.254.169.254:80; do
   [[ "$(reach agent-codex "$target")" == blocked ]] || fail "agent-codex can reach $target"
 done
+# The host's own addresses follow SMOKE_HOST_ISOLATION like deploy/check-host-isolation.sh: on a
+# rootful CI runner an internal network's gateway IS an address of the host (sshd listens on
+# 0.0.0.0), so there it is reported; on the production host it must be unreachable (enforce).
+host_leaks=()
+for ip in "${PROTECTED_IPS[@]}"; do
+  for port in 22 8000; do
+    [[ "$(reach agent-codex "$ip:$port")" == blocked ]] || host_leaks+=("$ip:$port")
+  done
+done
+if [[ ${#host_leaks[@]} -gt 0 ]]; then
+  case "${SMOKE_HOST_ISOLATION:-enforce}" in
+    report) echo "WARN agent-codex reaches host address(es) ${host_leaks[*]} (report mode: a rootful" \
+                 "daemon exposes the bridge gateway; NOT acceptable in production)" >&2 ;;
+    *) fail "agent-codex can reach host address(es): ${host_leaks[*]}" ;;
+  esac
+fi
 ok "agent cannot reach postgres / peers / api / orchestrator / other proxies / the host / the Internet directly"
 [[ "$(reach agent-codex egress-codex:3128)" == REACHABLE ]] || fail "agent cannot reach its own proxy"
 ok "agent reaches only its own egress proxy"

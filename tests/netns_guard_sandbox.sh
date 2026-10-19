@@ -123,6 +123,7 @@ gate_starts() {
 }
 matrix() {
   echo "STAGE $1"
+  echo "[$(date +%T)] matrix $1" >&2
   for t in tailnet_ssh:100.107.22.84:22 tailnet_gluetun:100.107.22.84:8000 host_public_ip:203.0.114.7:22 \
            slirp_gateway:10.0.2.2:22 bridge_gateway:172.30.0.1:7000 internet:8.8.8.8:443 \
            dns_tcp:10.0.2.3:53; do
