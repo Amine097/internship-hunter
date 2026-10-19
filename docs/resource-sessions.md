@@ -152,7 +152,7 @@ docker ps -q | xargs docker inspect --format '{{.Name}} {{.HostConfig.RestartPol
 6. **Probe API keys** live in root-owned files readable by `hunter-rsm`; treat as secrets.
 7. **Memory is the trigger, not a guarantee:** if stopping frees less than
    `min_available_mib`, the session is blocked and everything restored.
-8. **Port clash:** the application publishes `127.0.0.1:8000`; check the rootful services do
+8. **Port clash:** the application publishes `127.0.0.1:18000`; check the rootful services do
    not already use it (`ss -tlnp`).
 9. **Clock:** deadlines use the host clock; keep NTP on.
 10. **Alerts are rate limited** (one restoration-failure alert per 30 min per problem, in the

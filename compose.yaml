@@ -85,12 +85,17 @@ services:
       postgres: {condition: service_healthy}
   api:
     <<: *app
+    entrypoint: ["/usr/local/bin/isolation-gate.sh"]    # refuses to start unguarded (R7)
     command: ["uvicorn", "hunter.api:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       <<: *db-env
       ADMIN_TOKEN: ${ADMIN_TOKEN:?set_ADMIN_TOKEN}
+      EGRESS_FORBIDDEN_TARGETS: ${EGRESS_FORBIDDEN_TARGETS:-}
     networks: [data, edge]
-    ports: ["127.0.0.1:8000:8000"]   # loopback only; reach it over Tailscale / SSH forward
+    # Loopback only; reach it over Tailscale / SSH forward. Host port 18000, container port 8000:
+    # the production host already runs a rootful service on <tailscale ip>:8000 (Gluetun), so the
+    # default must not collide with, or be mistaken for, port 8000 on that machine.
+    ports: ["127.0.0.1:18000:8000"]
     depends_on:
       migrate: {condition: service_completed_successfully}
     healthcheck:
@@ -99,10 +104,12 @@ services:
       retries: 5
   discovery:
     <<: *app
+    entrypoint: ["/usr/local/bin/isolation-gate.sh"]    # refuses to start unguarded (R7)
     command: ["python", "-m", "hunter.worker"]
     stop_grace_period: 150s   # finish/release the current scan before SIGKILL (agents <= 110s)
     environment:
       <<: *db-env
+      EGRESS_FORBIDDEN_TARGETS: ${EGRESS_FORBIDDEN_TARGETS:-}
       AGENT_TOKEN_CLAUDE_1: ${AGENT_TOKEN_CLAUDE_1:?set_AGENT_TOKEN_CLAUDE_1}
       AGENT_TOKEN_CLAUDE_2: ${AGENT_TOKEN_CLAUDE_2:?set_AGENT_TOKEN_CLAUDE_2}
       AGENT_TOKEN_CODEX: ${AGENT_TOKEN_CODEX:?set_AGENT_TOKEN_CODEX}
@@ -133,9 +140,11 @@ services:
       migrate: {condition: service_completed_successfully}
   telegram:
     <<: *app
+    entrypoint: ["/usr/local/bin/isolation-gate.sh"]    # refuses to start unguarded (R7)
     command: ["python", "-m", "hunter.telegram"]
     environment:
       <<: *db-env
+      EGRESS_FORBIDDEN_TARGETS: ${EGRESS_FORBIDDEN_TARGETS:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
     networks: [data, egress]

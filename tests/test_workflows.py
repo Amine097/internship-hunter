@@ -137,3 +137,21 @@ def test_ci_smoke_reports_but_deploy_gate_enforces_host_isolation():
     assert "SMOKE_HOST_ISOLATION" not in (WF / "deploy.yaml").read_text()
     doc = (WF.parents[1] / "docs" / "deployment.md").read_text()
     assert "enforce" in doc and "SMOKE_EXPECT_ROOTLESS=1" in doc
+
+
+def test_ci_packet_level_guard_job_is_required_to_run_or_loudly_skip():
+    text = (WF / "ci.yaml").read_text()
+    doc = yaml.safe_load(text)
+    job = doc["jobs"]["host-guard-netns"]
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    # the project rule: never relax the AppArmor userns restriction, and no sudo outside rsm-systemd
+    assert "sysctl -w" not in code and "apparmor_restrict_unprivileged_userns=0" not in code
+    assert "sudo" not in yaml.safe_dump(job) and job["runs-on"] == "ubuntu-22.04"
+    # when it can run, a skip is a failure; when it cannot, the skip is announced, not silent
+    required = [s for s in job["steps"] if s.get("env", {}).get("GUARD_NETNS_REQUIRED") == "1"]
+    assert required and "skipped" in required[0]["run"]
+    skip = [s for s in job["steps"] if "EXPLICIT SKIP" in s.get("name", "")]
+    assert skip and "::warning" in skip[0]["run"] and "GITHUB_STEP_SUMMARY" in skip[0]["run"]
+    assert "V4" in skip[0]["run"] and "V5" in skip[0]["run"]    # names the replacement checks
+    pin = job["steps"][0]["uses"].split("@")[1].split(" ")[0]
+    assert pin == "11bd71901bbe5b1630ceea73d27597364c9af683"

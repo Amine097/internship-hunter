@@ -106,18 +106,27 @@ the handler, an allowed *name* that resolves to a private or host address is dia
 real `egress-proxy.sh`, `CONNECT <allow-listed-name>:443` whose A record is the host's Tailscale
 IP returned `200` without the guard and `500` with it (`docs/deployment.md`, evidence).
 
-Three layers, each answering a different question:
+Layers, each answering a different question (`docs/deployment.md`, "Host isolation"):
 
 1. **Prevent** - `deploy/host-egress-guard.sh`: iptables rules in the rootless daemon's own
    network namespace reject NEW connections from any Docker bridge to non-global space, to every
-   address of the host and to the namespace itself. DNS to the namespace's resolver and the public
-   Internet pass. Operator-applied, reversible, never touches the host's firewall.
-2. **Detect at runtime** - the proxy's healthcheck fails if it can reach anything listed in
-   `EGRESS_FORBIDDEN_TARGETS` (e.g. `100.107.22.84:22,100.107.22.84:8000`): agents behind it
-   do not start and `compose up --wait` (the deploy) fails and rolls back.
-3. **Verify** - `deploy/check-host-isolation.sh` (called by `smoke-test.sh`) dials every protected
-   address from every container with a route out, with raw TCP, including a canary listener on a
-   random port, and fails closed (no target, probe not run, no gateway, IPv6 route).
+   address of the host (rootful bridges included), to its default gateway and to the namespace
+   itself. DNS to the namespace's resolver and the public Internet pass. Operator-applied,
+   reversible, never touches the host's firewall. `status` verifies the *whole* IPv4+IPv6 policy
+   (chain contents, jump position, Docker's own jump) and proves the target process is this user's
+   rootless daemon; any missing, extra, reordered or edited rule fails it.
+2. **Refuse** - `remote-deploy.sh` will not deploy or roll back unless the root-owned guard reports
+   the full policy active and `EGRESS_FORBIDDEN_TARGETS` is set, and runs the enforce-mode check
+   after `up --wait` (failed first deploy: torn down; failed restore: stack stopped).
+3. **Start gate** - after a daemon restart the restart policy can start containers before the
+   guard is re-applied; `api`, `discovery`, `telegram` and the proxies therefore exit at start while
+   a forbidden target answers, before any application code runs.
+4. **Detect at runtime** - the proxy's healthcheck fails if it can reach anything listed in
+   `EGRESS_FORBIDDEN_TARGETS` (e.g. `100.107.22.84:22,100.107.22.84:8000`).
+5. **Verify** - `deploy/check-host-isolation.sh` dials every protected address from every container
+   with a route out (computed from `compose config`) with raw TCP, including a canary listener on a
+   random port. It counts an open port *and a refusal* as reaching the host, and fails closed unless
+   each container first passes its own positive controls.
 
 Compose gives each proxy its **own** outbound network (`egress_<name>`), so a compromised proxy
 cannot reach another proxy (and so another provider's allow-list) or `discovery`/`telegram`.

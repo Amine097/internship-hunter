@@ -102,6 +102,35 @@ def test_guard_is_idempotent_and_status_reports_it(stages):
     assert int(reapply[1]) < 40                  # the chain was rebuilt, not appended to
 
 
+def test_start_gate_stops_a_service_started_before_the_guard_and_lets_it_run_after(stages):
+    """R7: restart-policy window. Unguarded the gate makes the container exit; guarded it runs."""
+    assert stages["before"]["service_starts_through_gate"] == "blocked"
+    assert stages["guarded"]["service_starts_through_gate"] == "REACHABLE"
+    assert stages["removed"]["service_starts_through_gate"] == "blocked"
+
+
+TAMPERS = ["delete_cgnat_reject", "accept_before_jumps", "remove_docker0_jump", "flush_chain",
+           "accept_inside_chain", "edit_input_chain", "flush_ipv6_chain", "remove_input_jump"]
+
+
+def test_status_is_ok_with_the_persisted_parameters_alone(stages):
+    """status takes no arguments in production: the conf file next to the script carries them."""
+    assert "status active" in stages["_"]
+    assert "final_status ok" in stages["_"]
+
+
+@pytest.mark.parametrize("name", TAMPERS)
+def test_every_tampering_is_detected_and_apply_repairs_it(stages, name):
+    assert f"tamper_{name} status_failed" in stages["_"], name
+    assert f"repair_{name} ok" in stages["_"], name
+
+
+def test_displaced_docker_jump_is_detected(stages):
+    """If something is inserted before Docker's own jump into DOCKER-USER the guard is bypassed."""
+    assert "tamper_docker_jump_displaced status_failed" in stages["_"]
+    assert "undo_docker_jump_displaced ok" in stages["_"]
+
+
 def test_remove_restores_dockers_own_rules_exactly(stages):
     assert "status inactive" in stages["_"]
     assert stages["removed"] == stages["before"]

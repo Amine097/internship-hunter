@@ -15,10 +15,27 @@
 #  * schema compatibility with the rollback target is checked BEFORE anything changes
 #  * one deploy at a time (flock); failed deploys restore the previous release
 #  * rollback is only reported successful after images, health and schema were verified
-#  * refuses to run against a rootful Docker daemon unless HUNTER_ALLOW_ROOTFUL=1
+#  * talks only to the ROOTLESS daemon: DOCKER_HOST is pinned to the user's own socket (never the
+#    rootful /var/run/docker.sock) and a daemon that is not rootless is refused (exit 5)
+#  * refuses to deploy or roll back unless host isolation is in place (docs/deployment.md, "Host
+#    isolation"): the root-owned host-egress-guard.sh reports its FULL policy active (exit 12),
+#    EGRESS_FORBIDDEN_TARGETS is set (exit 11), and after `up --wait` the root-owned
+#    check-host-isolation.sh passes in ENFORCE mode from every container with a route out; a
+#    failure is a failed activation (previous release restored; a first deploy is torn down)
+#  * exit codes: 2 bad input, 3 missing files/ports, 4 locked, 5 not rootless, 7 integrity,
+#    8 backup, 9 schema, 10/6 restore failed (stack stopped), 11 isolation prerequisites, 12 guard
 set -Eeuo pipefail
 
 BASE="${HUNTER_BASE:-/opt/internship-hunter}"
+# HUNTER_TEST_MODE=1 exists only for tests/test_deploy_script.py (stub docker, files owned by the
+# test user); it relaxes the root-ownership checks and nothing else. It is never set by sshd.
+TEST_MODE="${HUNTER_TEST_MODE:-0}"
+# Trusted, root-owned copies; they are NOT taken from the (signed, but newer) release bundle, so a
+# bundle can never weaken the gate that is about to judge it.
+GUARD="$BASE/deploy/host-egress-guard.sh"
+ISOLATION_CHECK="$BASE/deploy/check-host-isolation.sh"
+ISOLATION_CONF="$BASE/deploy/host-isolation.conf"      # optional: ROOTFUL_TARGETS=ip:port,...
+API_PORT=18000          # host side; the container side stays 8000 (Gluetun lives on tailnet:8000)
 MAX_BUNDLE_BYTES="${HUNTER_MAX_BUNDLE_BYTES:-3221225472}"   # 3 GiB
 KEEP_RELEASES=5
 PROJECT=internship-hunter
@@ -28,10 +45,10 @@ die() { echo "deploy: $1" >&2; exit "${2:-1}"; }
 state() { echo "$BASE/state/$1"; }
 read_state() { cat "$(state "$1")" 2>/dev/null || true; }
 
-compose() { # compose <sha> <args...>   (optional env: ACCEPT_SCHEMA_REVISION)
+compose_args() { # compose_args <sha>: sets CARGS (project, files, env files) for that release
   # RELEASE_SHA goes through an env-file *and* env var so no env-forwarding quirk can make
   # compose fall back to a mutable tag (activate() additionally verifies what is running).
-  local sha="$1" relenv; shift
+  local sha="$1" relenv
   relenv="$BASE/state/release-$sha.env"
   {
     printf 'RELEASE_SHA=%s\n' "$sha"
@@ -41,9 +58,13 @@ compose() { # compose <sha> <args...>   (optional env: ACCEPT_SCHEMA_REVISION)
   local files=(-f compose.yaml)
   # opt-in: connect the session controller to the host broker (docs/resource-sessions.md)
   [[ -f "$BASE/shared/rsm.enabled" ]] && files+=(-f compose.rsm.yaml)
-  (cd "$BASE/releases/$sha" && RELEASE_SHA="$sha" \
-     docker compose -p "$PROJECT" "${files[@]}" --env-file "$BASE/shared/.env" \
-       --env-file "$relenv" "$@")
+  CARGS=(-p "$PROJECT" "${files[@]}" --env-file "$BASE/shared/.env" --env-file "$relenv")
+}
+
+compose() { # compose <sha> <args...>   (optional env: ACCEPT_SCHEMA_REVISION)
+  local sha="$1"; shift
+  compose_args "$sha"
+  (cd "$BASE/releases/$sha" && RELEASE_SHA="$sha" docker compose "${CARGS[@]}" "$@")
 }
 
 actual_db_revision() { # actual_db_revision <sha>: what the database REALLY says (never state files)
@@ -72,9 +93,97 @@ accept_revision() {
   return 1
 }
 
-health_check() {
-  curl -fsS --retry 10 --retry-delay 3 --retry-connrefused http://127.0.0.1:8000/ready >/dev/null
-  curl -fsS http://127.0.0.1:8000/health | grep -q '"submission_enabled":false'
+health_check() { # health_check <sha>: OUR api, on OUR published port - never whatever else listens
+  local sha="$1" published
+  published="$(compose "$sha" port api 8000 2>/dev/null | tr -d '\r')" || return 1
+  if [[ "$published" != "127.0.0.1:$API_PORT" ]]; then
+    echo "deploy: the api container publishes '${published:-nothing}', expected 127.0.0.1:$API_PORT" >&2
+    return 1
+  fi
+  curl -fsS --retry 10 --retry-delay 3 --retry-connrefused "http://127.0.0.1:$API_PORT/ready" >/dev/null
+  curl -fsS "http://127.0.0.1:$API_PORT/health" | grep -q '"submission_enabled":false'
+}
+
+# ---- host isolation gate ------------------------------------------------------------------------
+trusted_file() { # trusted_file <path>: a regular, executable file we can trust to enforce policy
+  local f="$1" want_uid=0 owner mode d
+  [[ "$TEST_MODE" == 1 ]] && want_uid="$(id -u)"
+  [[ -f "$f" && ! -L "$f" && -x "$f" ]] || return 1
+  for d in "$f" "$(dirname "$f")"; do
+    read -r owner mode < <(stat -c '%u %a' "$d")
+    if [[ "$owner" != "$want_uid" ]] || (( (8#$mode & 8#022) != 0 )); then return 1; fi
+  done
+}
+
+forbidden_targets() { # the effective EGRESS_FORBIDDEN_TARGETS (last assignment wins, as in compose)
+  local v t
+  v="$(sed -n 's/^EGRESS_FORBIDDEN_TARGETS=//p' "$BASE/shared/.env" | tail -1 | tr -d "\"' \r")"
+  [[ -n "$v" ]] || return 1
+  for t in ${v//,/ }; do
+    [[ "$t" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$ ]] || return 1
+  done
+  printf '%s' "$v"
+}
+
+rootful_targets() { # optional, root-owned: explicit ip:port of rootful containers that must stay unreachable
+  [[ -e "$ISOLATION_CONF" ]] || return 0
+  trusted_file_data "$ISOLATION_CONF" || return 1
+  sed -n 's/^ROOTFUL_TARGETS=//p' "$ISOLATION_CONF" | tail -1 | tr -d "\"' \r"
+}
+trusted_file_data() { # like trusted_file but for non-executable data
+  local owner mode want_uid=0; [[ "$TEST_MODE" == 1 ]] && want_uid="$(id -u)"
+  read -r owner mode < <(stat -c '%u %a' "$1")
+  [[ "$owner" == "$want_uid" ]] && (( (8#$mode & 8#022) == 0 )) && [[ ! -L "$1" ]]
+}
+
+require_isolation_prereqs() { # nothing is changed before these hold
+  local out
+  trusted_file "$GUARD" \
+    || die "host egress guard missing or untrusted: $GUARD must exist, be executable, root-owned and not writable by others (docs/deployment.md, \"Host isolation\")" 11
+  trusted_file "$ISOLATION_CHECK" \
+    || die "isolation check missing or untrusted: $ISOLATION_CHECK must exist, be executable, root-owned and not writable by others" 11
+  forbidden_targets >/dev/null \
+    || die "EGRESS_FORBIDDEN_TARGETS must be set in $BASE/shared/.env to a comma-separated ip:port list (e.g. <tailscale ip>:22,<tailscale ip>:8000)" 11
+  rootful_targets >/dev/null || die "$ISOLATION_CONF is untrusted or unreadable" 11
+  if ! out="$("$GUARD" status 2>&1)"; then
+    echo "$out" >&2
+    die "host egress guard is not active with the full expected policy (run '$GUARD apply'; docs/deployment.md)" 12
+  fi
+}
+
+isolation_gate() { # isolation_gate <sha>: ENFORCE mode, from every container with a route out
+  local sha="$1" targets ips t rootful
+  targets="$(forbidden_targets)" || return 1
+  rootful="$(rootful_targets)" || return 1
+  ips="$(for t in ${targets//,/ }; do echo "${t%:*}"; done | sort -u | tr '\n' ' ')"
+  compose_args "$sha"
+  if ! ( cd "$BASE/releases/$sha" && \
+         SMOKE_HOST_ISOLATION=enforce SMOKE_EXPECT_ROOTLESS=1 SMOKE_REQUIRE_TAILNET=1 \
+         SMOKE_AUTODETECT_HOST_IPS=1 SMOKE_PROTECTED_IPS="$ips" SMOKE_ROOTFUL_TARGETS="$rootful" \
+         "$ISOLATION_CHECK" "${CARGS[@]}" ); then
+    echo "deploy: host isolation check FAILED for $sha (enforce mode)" >&2
+    return 1
+  fi
+}
+
+port_preflight() { # read-only: 127.0.0.1:$API_PORT must be free, or held by OUR running api
+  local listeners running
+  listeners="$(ss -H -ltn "sport = :$API_PORT" 2>/dev/null)" \
+    || die "cannot inspect listening ports (ss missing?); refusing to guess" 3
+  [[ -n "$listeners" ]] || return 0
+  running="$(read_state current_sha)"
+  if [[ -n "$running" ]] \
+     && [[ "$(compose "$running" port api 8000 2>/dev/null | tr -d '\r')" == "127.0.0.1:$API_PORT" ]]; then
+    return 0
+  fi
+  die "host port $API_PORT is already in use by something that is not this application: $listeners" 3
+}
+
+stop_stack() { # fail closed: tear the project down (never volumes) rather than leave it exposed
+  local sha="$1"
+  echo "deploy: stopping the stack (docker compose down; volumes are kept)" >&2
+  compose "$sha" down --remove-orphans >/dev/null 2>&1 \
+    || echo "deploy: WARNING 'compose down' failed; stop the project by hand: docker compose -p $PROJECT down" >&2
 }
 
 verify_running_images() { # every first-party container must run exactly this release's images
@@ -100,13 +209,21 @@ activate() { # activate <sha>: start (never build) the release, then verify it
   compose "$sha" config -q || return 1
   compose "$sha" up -d --no-build --remove-orphans --wait --wait-timeout 300 || return 1
   verify_running_images "$sha" || return 1
-  health_check || return 1
+  health_check "$sha" || return 1
+  isolation_gate "$sha" || return 1
 }
 
 set_current() { ln -sfn "$BASE/releases/$1" "$BASE/current.new" && mv -Tf "$BASE/current.new" "$BASE/current"; }
 
 require_rootless() {
-  [[ "${HUNTER_ALLOW_ROOTFUL:-0}" == 1 ]] && return 0
+  if [[ "$TEST_MODE" != 1 ]]; then
+    # Only ever the user's own rootless daemon: pin the socket, so an inherited DOCKER_HOST,
+    # DOCKER_CONTEXT or a docker-group membership can never route a command to the rootful one.
+    local rd="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    [[ -S "$rd/docker.sock" ]] || die "rootless Docker socket $rd/docker.sock not found" 5
+    export DOCKER_HOST="unix://$rd/docker.sock"
+    unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+  fi
   docker info --format '{{.SecurityOptions}}' | grep -q rootless \
     || die "refusing to deploy: Docker daemon is not rootless (see docs/deployment.md)" 5
 }
@@ -137,6 +254,7 @@ MSG
 
 do_rollback() {
   local current previous cur_head prev_head db_now accept leaving_compat
+  require_isolation_prereqs
   current="$(read_state current_sha)"; previous="$(read_state previous_sha)"
   cur_head="$(read_state current_head)"; prev_head="$(read_state previous_head)"
   [[ "$previous" =~ ^[0-9a-f]{40}$ ]] || die "no previous release recorded" 3
@@ -155,7 +273,10 @@ do_rollback() {
   if ! activate "$previous"; then
     echo "deploy: rollback target $previous failed verification; re-activating $current" >&2
     export ACCEPT_SCHEMA_REVISION=""
-    activate "$current" || echo "deploy: could not re-activate $current either" >&2
+    if ! activate "$current"; then
+      echo "deploy: could not re-activate $current either" >&2
+      stop_stack "$current"          # neither release verified: fail closed, do not leave it up
+    fi
     manual_recovery
     exit 6
   fi
@@ -172,6 +293,8 @@ do_deploy() { # do_deploy <normal|irreversible>
   local mode="$1"
   [[ -f "$BASE/shared/.env" ]] || die "missing $BASE/shared/.env" 3
   [[ -f "$BASE/shared/allowed_signers" ]] || die "missing $BASE/shared/allowed_signers" 3
+  require_isolation_prereqs      # before the bundle is even read: nothing changes without them
+  port_preflight
 
   local stage; stage="$(mktemp -d "$BASE/staging/bundle.XXXXXX")"
   STAGE="$stage"
@@ -273,11 +396,18 @@ do_deploy() { # do_deploy <normal|irreversible>
       set_current "$previous"
       if ! activate "$previous"; then
         echo "deploy: RESTORE ALSO FAILED" >&2
+        stop_stack "$previous"
         manual_recovery
         exit 10
       fi
       echo "$db_now" > "$(state db_head)"
       echo "deploy: restored $previous (verified: images, health, schema)" >&2
+    else
+      # FIRST deploy: there is nothing to go back to, and a half-started or unisolated new
+      # release must not keep running. Tear it down and leave no 'current' behind.
+      stop_stack "$sha"
+      rm -f "$BASE/current" "$BASE/current.new"
+      echo "deploy: first deploy of $sha failed; stack stopped, nothing is current" >&2
     fi
     exit 1
   fi
@@ -309,6 +439,9 @@ STAGE=""
 trap '[[ -z "$STAGE" ]] || rm -rf "$STAGE"' EXIT
 
 main() {
+  # A caller's environment must not be able to loosen the gate or redirect compose.
+  local v
+  for v in $(compgen -e | grep -E '^(SMOKE_|EGRESS_FORBIDDEN_TARGETS$|COMPOSE_)' || true); do unset "$v"; done
   mkdir -p "$BASE"/{releases,state,staging,shared}
   exec 9>"$BASE/state/deploy.lock"
   flock -n 9 || die "another deploy is running" 4

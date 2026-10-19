@@ -19,7 +19,9 @@ trap cleanup EXIT
 ns() { local pid="$1"; shift; nsenter --preserve-credentials -U -n -t "$pid" -- "$@"; }
 unshare -Ur sleep 600 & R=$!; pids+=("$R"); sleep 0.3
 mk() { nsenter --preserve-credentials -U -t "$R" -- unshare -n sleep 600 & pids+=("$!"); eval "$1=$!"; }
-mk D; mk C; mk C2; mk C3; mk U; sleep 0.5
+# the "daemon" must pass the guard's identity checks: a process whose cmdline says dockerd
+nsenter --preserve-credentials -U -t "$R" -- unshare -n bash -c 'exec -a dockerd sleep 600' & D=$!; pids+=("$D")
+mk C; mk C2; mk C3; mk U; sleep 0.5
 for p in $D $C $C2 $C3 $U; do ns "$p" ip link set lo up; done
 
 ns "$D" ip link add br-a1b2c3d4e5f6 type bridge
@@ -90,6 +92,11 @@ try:
 except OSError:
     print("blocked")'
 }
+# does a container on docker0 get to run its service? (docker/isolation-gate.sh, python flavour)
+gate_starts() {
+  if ns "$C2" env EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22,100.107.22.84:2375 \
+       sh "$HERE/../docker/isolation-gate.sh" true >/dev/null 2>&1; then echo REACHABLE; else echo blocked; fi
+}
 matrix() {
   echo "STAGE $1"
   for t in tailnet_ssh:100.107.22.84:22 tailnet_gluetun:100.107.22.84:8000 host_public_ip:203.0.114.7:22 \
@@ -103,18 +110,50 @@ matrix() {
   echo "peer_same_bridge $(tcp_from "$C" 172.30.0.3 9100)"        # agent <-> proxy style traffic
   echo "default_bridge_tailnet_ssh $(tcp_from "$C2" 100.107.22.84 22)"   # ad-hoc `docker run`
   echo "default_bridge_internet $(tcp_from "$C2" 8.8.8.8 443)"
+  echo "service_starts_through_gate $(gate_starts)"
 }
 
 mkdir -p "$WORK/xdg/dockerd-rootless"; echo "$D" >"$WORK/xdg/dockerd-rootless/child_pid"
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$WORK/xdg/docker.sock"
 export XDG_RUNTIME_DIR="$WORK/xdg"
-ARGS=(--dns 10.0.2.3 --protect 203.0.114.7/32)
+export HUNTER_GUARD_TEST_MODE=1       # only so the guard finds the iptables wrappers on PATH
+# persistent parameters live in a conf file next to the script, as in production: later calls
+# (status, the systemd re-apply) then need no arguments and cannot disagree with the first apply
+mkdir -p "$WORK/g"; cp "$GUARD" "$WORK/g/host-egress-guard.sh"; GUARD="$WORK/g/host-egress-guard.sh"
+printf 'DNS=10.0.2.3\nPROTECT=203.0.114.7/32\n' >"$WORK/g/host-egress-guard.conf"; chmod 644 "$WORK/g/host-egress-guard.conf"
+ARGS=()
 
 matrix before
-"$GUARD" apply "${ARGS[@]}" >/dev/null
+"$GUARD" apply >/dev/null
 "$GUARD" status >/dev/null && echo "status active"
 matrix guarded
-"$GUARD" apply "${ARGS[@]}" >/dev/null           # idempotent: no duplicated rules, still guarded
+"$GUARD" apply >/dev/null           # idempotent: no duplicated rules, still guarded
 echo "rules_after_reapply $(ns "$D" iptables -S HUNTER-EGRESS-GUARD | wc -l) jumps $(ns "$D" iptables -S DOCKER-USER | grep -c HUNTER-EGRESS-GUARD)"
+
+# ---- integrity: every tampering must make `status` fail; most are repaired by `apply` ----------
+tamper() { # tamper <name> <repairable yes|no> <undo cmd or "-"> -- <iptables cmd...>
+  local name="$1" repair="$2" undo="$3"; shift 4
+  ns "$D" "$@" >/dev/null 2>&1 || { echo "tamper_$name SETUP-FAILED"; return; }
+  if "$GUARD" status >/dev/null 2>&1; then echo "tamper_$name status_passed"; else echo "tamper_$name status_failed"; fi
+  if [[ "$repair" == yes ]]; then
+    "$GUARD" apply >/dev/null 2>&1 || true
+    if "$GUARD" status >/dev/null 2>&1; then echo "repair_$name ok"; else echo "repair_$name FAILED"; fi
+  else
+    ns "$D" $undo >/dev/null 2>&1; if "$GUARD" status >/dev/null 2>&1; then echo "undo_$name ok"; else echo "undo_$name FAILED"; fi
+  fi
+}
+G=HUNTER-EGRESS-GUARD
+REJ=(-j REJECT --reject-with icmp-admin-prohibited)
+tamper delete_cgnat_reject yes - -- iptables -D $G -d 100.64.0.0/10 "${REJ[@]}"
+tamper accept_before_jumps yes - -- iptables -I DOCKER-USER 1 -j ACCEPT
+tamper remove_docker0_jump yes - -- iptables -D DOCKER-USER -i docker0 -j $G
+tamper flush_chain yes - -- iptables -F $G
+tamper accept_inside_chain yes - -- iptables -I $G 1 -d 100.107.22.84/32 -j ACCEPT
+tamper edit_input_chain yes - -- iptables -D $G-IN -j REJECT --reject-with icmp-admin-prohibited
+tamper flush_ipv6_chain yes - -- ip6tables -F ${G}6
+tamper remove_input_jump yes - -- iptables -D INPUT -i br-+ -j $G-IN
+tamper docker_jump_displaced no "iptables -D FORWARD 1" -- iptables -I FORWARD 1 -j ACCEPT
+echo "final_status $("$GUARD" status >/dev/null 2>&1 && echo ok || echo bad)"
 "$GUARD" remove >/dev/null
 "$GUARD" status >/dev/null 2>&1 || echo "status inactive"
 matrix removed

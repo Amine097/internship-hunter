@@ -188,3 +188,27 @@ def test_proxy_healthcheck_detects_a_reachable_host_and_the_target_list_is_passe
         assert svc["environment"]["EGRESS_FORBIDDEN_TARGETS"] == "${EGRESS_FORBIDDEN_TARGETS:-}"
     for agent, proxy in PROXIES.items():     # agents wait for a healthy (i.e. isolated) proxy
         assert SERVICES[agent]["depends_on"][proxy] == {"condition": "service_healthy"}
+
+
+def test_api_is_published_on_loopback_18000_and_nothing_publishes_host_port_8000():
+    """The production host has a rootful Gluetun on <tailscale ip>:8000: the application's default
+    host port must be different, and every tool must reach the API through that port."""
+    assert SERVICES["api"]["ports"] == ["127.0.0.1:18000:8000"]      # container side stays 8000
+    for name, svc in SERVICES.items():
+        for port in svc.get("ports", []):
+            host_side = str(port).split(":")[-2]
+            assert host_side != "8000", (name, port)
+    for rel in ("deploy/remote-deploy.sh", "deploy/smoke-test.sh", "README.md"):
+        text = (ROOT / rel).read_text()
+        assert "127.0.0.1:8000" not in text, rel
+    assert "API_PORT=18000" in (ROOT / "deploy" / "remote-deploy.sh").read_text()
+    assert "http://127.0.0.1:18000" in (ROOT / "deploy" / "smoke-test.sh").read_text()
+
+
+def test_smoke_test_only_sends_the_admin_token_to_the_composes_own_api():
+    smoke = (ROOT / "deploy" / "smoke-test.sh").read_text()
+    guard_at = smoke.index("refusing to send ADMIN_TOKEN")
+    first_token_use = smoke.index('-H "X-Admin-Token:')
+    assert guard_at < first_token_use                    # identity is proven before any token use
+    assert '"${COMPOSE[@]}" port api 8000' in smoke
+    assert "(127\\.0\\.0\\.1|localhost)" in smoke           # never a remote URL

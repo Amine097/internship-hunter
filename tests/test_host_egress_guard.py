@@ -2,6 +2,7 @@
 The packet-level behaviour is proven in tests/test_host_egress_guard_netns.py."""
 import os
 import re
+import socket
 import stat
 import subprocess
 import textwrap
@@ -16,29 +17,44 @@ pytestmark = pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0,
 
 @pytest.fixture
 def env(tmp_path):
-    """A fake /proc with a rootless daemon in ANOTHER network namespace, and a fake `ip`."""
+    """A fake /proc with a rootless daemon in ANOTHER network+user namespace, a fake `ip`, and a
+    fake rootless socket. Only usable because HUNTER_GUARD_TEST_MODE=1 is set explicitly."""
     proc = tmp_path / "proc"
     (proc / "4242" / "ns").mkdir(parents=True)
     (proc / "4242" / "root" / "etc").mkdir(parents=True)
     (proc / "4242" / "ns" / "net").symlink_to("net:[4026532227]")
+    (proc / "4242" / "ns" / "user").symlink_to("user:[4026532226]")
+    (proc / "4242" / "cmdline").write_bytes(b"dockerd\0--host=unix:///x\0")
+    (proc / "4242" / "uid_map").write_text(f"         0       {os.getuid()}          1\n")
     (proc / "self" / "ns").mkdir(parents=True)
     (proc / "self" / "ns" / "net").symlink_to("net:[4026531840]")
+    (proc / "self" / "ns" / "user").symlink_to("user:[4026531837]")
     (proc / "4242" / "root" / "etc" / "resolv.conf").write_text(
         "nameserver 127.0.0.53\nnameserver 10.0.2.3\nnameserver fd00::1\n")
     state = tmp_path / "xdg" / "dockerd-rootless"
     state.mkdir(parents=True)
     (state / "child_pid").write_text("4242\n")
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(tmp_path / "xdg" / "docker.sock"))
     bin_ = tmp_path / "bin"
     bin_.mkdir()
     ip = bin_ / "ip"
     ip.write_text(textwrap.dedent("""\
         #!/bin/sh
-        echo "2: eth0    inet 203.0.113.9/24 brd 203.0.113.255 scope global eth0"
-        echo "5: tailscale0    inet 100.107.22.84/32 scope global tailscale0"
+        case "$*" in
+          *route*) echo "default via 203.0.113.1 dev eth0 proto dhcp" ;;
+          *addr*)
+            echo "2: eth0    inet 203.0.113.9/24 brd 203.0.113.255 scope global eth0"
+            echo "5: tailscale0    inet 100.107.22.84/32 scope global tailscale0"
+            echo "7: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0"
+            echo "9: br-0123456789ab    inet 172.20.0.1/16 scope global br-0123456789ab" ;;
+        esac
     """))
     ip.chmod(ip.stat().st_mode | stat.S_IEXEC)
-    return {"PATH": f"{bin_}:{os.environ['PATH']}", "HUNTER_GUARD_PROC": str(proc),
-            "XDG_RUNTIME_DIR": str(tmp_path / "xdg"), "HOME": str(tmp_path)}
+    yield {"PATH": f"{bin_}:{os.environ['PATH']}", "HUNTER_GUARD_PROC": str(proc),
+           "HUNTER_GUARD_TEST_MODE": "1", "XDG_RUNTIME_DIR": str(tmp_path / "xdg"),
+           "HOME": str(tmp_path)}
+    sock.close()
 
 
 def guard(env, *args):
@@ -53,6 +69,9 @@ def test_plan_rejects_tailnet_non_global_space_and_the_hosts_own_addresses(env):
                  "169.254.0.0/16", "224.0.0.0/4"):
         assert f"-A HUNTER-EGRESS-GUARD -d {cidr} -j REJECT" in r.stdout, cidr
     assert "-d 203.0.113.9/32 -j REJECT" in r.stdout            # host public/LAN address
+    assert "-d 203.0.113.1/32 -j REJECT" in r.stdout            # the host's default gateway
+    # rootful Docker bridges' gateway addresses: rootful containers' published ports listen there
+    assert "-d 172.17.0.1/32 -j REJECT" in r.stdout and "-d 172.20.0.1/32 -j REJECT" in r.stdout
     assert "-d 100.107.22.84/32 -j REJECT" in r.stdout          # the real Tailscale IP, by address
     assert "-A HUNTER-EGRESS-GUARD-IN" in r.stdout and "-j REJECT" in r.stdout
 
@@ -121,10 +140,71 @@ def test_bad_usage_is_rejected(env, args):
 def test_script_only_edits_the_daemon_namespace_and_never_runs_as_root():
     text = GUARD.read_text()
     code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
-    assert 'die "refusing to run as root' in code and '"$(id -u)" != 0' in code
+    assert 'die "refusing to run as root' in code and '"$MYUID" != 0' in code
     # every firewall command goes through the nsenter wrapper (ipt/ipt6/${NS[@]})
     for ln in code.splitlines():
         s = ln.strip()
         assert not re.match(r"^(sudo|iptables\S*|ip6tables\S*|nft|ufw|firewall-cmd)\b", s), s
     for forbidden in ("ufw", "tailscale", "systemctl", "docker ", "nft ", "sshd", "gluetun"):
         assert forbidden not in code, forbidden
+
+
+# ---- R5: the target must be proven to be this user's rootless daemon -------------------------
+def test_proc_override_is_refused_outside_explicit_test_mode(env):
+    env = {k: v for k, v in env.items() if k != "HUNTER_GUARD_TEST_MODE"}
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "only honoured with HUNTER_GUARD_TEST_MODE=1" in r.stderr
+
+
+def test_test_mode_is_announced_loudly(env):
+    assert "WARNING test mode" in guard(env, "plan").stderr
+
+
+def test_refuses_a_process_that_is_not_a_docker_daemon(env, tmp_path):
+    (tmp_path / "proc" / "4242" / "cmdline").write_bytes(b"sleep\x00600\x00")
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "not a Docker daemon" in r.stderr
+
+
+def test_refuses_a_process_not_in_a_user_namespace_mapped_to_this_uid(env, tmp_path):
+    (tmp_path / "proc" / "4242" / "uid_map").write_text("         0          0 4294967295\n")
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "not rootless Docker" in r.stderr
+
+
+def test_refuses_a_process_sharing_our_user_namespace(env, tmp_path):
+    link = tmp_path / "proc" / "4242" / "ns" / "user"
+    link.unlink()
+    link.symlink_to("user:[4026531837]")
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "shares this user namespace" in r.stderr
+
+
+def test_refuses_without_the_rootless_socket(env, tmp_path):
+    (tmp_path / "xdg" / "docker.sock").unlink()
+    assert "no rootless Docker socket" in guard(env, "plan").stderr
+
+
+def test_refuses_a_pidfile_owned_by_someone_else(env, tmp_path):
+    # stat is the same user in a test, so check the guard compares against the current uid
+    assert '"$(stat -c %u "$PIDFILE")" == "$MYUID"' in GUARD.read_text()
+
+
+def test_conf_file_supplies_dns_and_protect_and_must_be_trusted(env, tmp_path):
+    d = tmp_path / "g"
+    d.mkdir()
+    script = d / "host-egress-guard.sh"
+    script.write_text(GUARD.read_text())
+    conf = d / "host-egress-guard.conf"
+    conf.write_text("# comment\nDNS=192.168.7.7\nPROTECT=198.51.100.9/32\n")
+    conf.chmod(0o644)
+    r = subprocess.run(["bash", str(script), "plan"], capture_output=True, text=True, env=env)
+    assert r.returncode == 0 and "-d 192.168.7.7/32 -p udp --dport 53" in r.stdout
+    assert "-d 198.51.100.9/32 -j REJECT" in r.stdout
+    conf.chmod(0o666)                                           # world-writable: not trusted
+    r = subprocess.run(["bash", str(script), "plan"], capture_output=True, text=True, env=env)
+    assert r.returncode == 1 and "not group/world-writable" in r.stderr
+    conf.chmod(0o644)
+    conf.write_text("EVIL=1\n")
+    r = subprocess.run(["bash", str(script), "plan"], capture_output=True, text=True, env=env)
+    assert r.returncode == 1 and "unknown line" in r.stderr
