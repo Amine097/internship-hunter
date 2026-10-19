@@ -83,12 +83,22 @@ For `deploy`, `deploy-irreversible` **and** `rollback`, before anything is read,
 |---|---|
 | `/opt/internship-hunter/deploy/host-egress-guard.sh` and `check-host-isolation.sh` exist, are executable regular files (not symlinks), root-owned, not group/world-writable, in a directory that is too | exit 11 |
 | `shared/.env` sets `EGRESS_FORBIDDEN_TARGETS` to a non-empty, well-formed `ip:port` list (the last assignment wins, as in compose; the caller's environment is ignored) | exit 11 |
-| optional `deploy/host-isolation.conf` (`ROOTFUL_TARGETS=ip:port,...`) is trusted | exit 11 |
+| `deploy/host-isolation.conf` exists (regular file, not a symlink, root-owned, not group/world-writable) and sets `ROOTFUL_TARGETS=ip:port[,...]` with **at least one** entry | exit 11 |
+| every target is **real**: each `EGRESS_FORBIDDEN_TARGETS` address is an address of this host, and every forbidden and rootful target either connects or is **refused** from the host's own namespace (safe TCP connect, no payload) - a silent timeout, `unreachable`, a typo or a moved address is rejected (`check-host-isolation.sh --verify-targets`) | exit 11 |
 | `host-egress-guard.sh status` exits 0: the **full** policy is installed and unmodified | exit 12 |
 | `127.0.0.1:18000` is free, or held by this application's own running `api` (read-only `ss`) | exit 3 |
 
 After `compose up --wait` and the health checks, `check-host-isolation.sh` runs in **enforce**
-mode with `SMOKE_PROTECTED_IPS` taken from the targets (ambient `SMOKE_*` variables are removed first).
+mode with `SMOKE_PROTECTED_IPS` taken from the targets and `SMOKE_ROOTFUL_TARGETS` from the conf
+(ambient `SMOKE_*` variables are removed first).
+
+**The forced-command boundary.** Whatever environment the SSH session arrives with, production runs
+only against `/opt/internship-hunter`, with `PATH` fixed and `BASH_ENV`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
+`PYTHONPATH`, `HUNTER_BASE`, `HUNTER_MAX_BUNDLE_BYTES`, `HUNTER_GUARD_*` and the schema-accept variable
+removed. `HUNTER_TEST_MODE` (the test hooks) is honoured only together with a `HUNTER_BASE` outside
+`/opt/internship-hunter`, so it cannot be turned on against production. `DOCKER_HOST` is pinned to the
+user's own rootless socket (never `/var/run/docker.sock`); no script here ever connects to the rootful
+Docker socket, and none modifies or restarts a rootful container.
 A failure is a failed activation: the previous release is restored (and gated again); a failed
 *first* deploy is torn down (`compose down`, no `current`); a restore that cannot be verified either
 stops the stack - an unreachable service is preferred to an exposed one.
@@ -103,7 +113,7 @@ D=/opt/internship-hunter/deploy; GUARD=$D/host-egress-guard.sh
 
 0. **Install** (root; the deploy user must not be able to edit a security control or its directory):
    `sudo install -o root -g root -m 0755 deploy/host-egress-guard.sh deploy/check-host-isolation.sh "$D"/`
-   Needs `iptables`, `ip6tables`, `nsenter`, `ss`, `python3` on the host (`iptables --version` should
+   Also `host-egress-guard.conf` and `host-isolation.conf` (step 2 and 7). Needs `iptables`, `ip6tables`, `nsenter`, `ss`, `python3` on the host (`iptables --version` should
    say `nf_tables`; Docker's `DOCKER-USER` chain must exist - the iptables backend; `apply` refuses
    otherwise, and also refuses without `ip6tables`).
 1. **Baseline** (expect `REACHABLE`: this reproduces the finding, nothing is changed):
@@ -136,10 +146,21 @@ D=/opt/internship-hunter/deploy; GUARD=$D/host-egress-guard.sh
    ```
    `systemctl --user daemon-reload && systemctl --user restart docker` (this user's daemon only),
    then `"$GUARD" status`. `loginctl enable-linger hunter-deploy` must already be set.
-7. **Tell the stack what must stay unreachable** in `shared/.env` (mode 600):
-   `EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22,100.107.22.84:8000`. Optional, root-owned
-   `"$D/host-isolation.conf"` with `ROOTFUL_TARGETS=172.17.0.2:8080,...` lists specific rootful
-   container `ip:port`s to probe (nothing is scanned; only what you list). `docker network rm probe-net`.
+7. **Tell the stack what must stay unreachable.** Two lists, both validated as *real* before every
+   deploy and rollback (see "The deploy gate"):
+   - `shared/.env` (mode 600): `EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22,100.107.22.84:8000` - addresses
+     **of this host** (sshd on the tailnet IP, Gluetun's listener). Each must connect or be refused
+     from the host itself. Any stable host-owned address with a closed port also works as a liveness
+     target, e.g. the rootful `docker0` gateway: **detect it, never assume `172.17.0.1`**
+     (`ip -4 -o addr show docker0`, `docker network inspect bridge` by the rootful Docker admin).
+   - **required**, root-owned `"$D/host-isolation.conf"` (mode 0644): `ROOTFUL_TARGETS=<ip:port>[,...]`
+     naming at least one EXISTING rootful container. The operator chooses it with read-only inspection
+     as the rootful Docker admin (never as `hunter-deploy`, which has no access to that socket):
+     `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' <container>`, then
+     pick a **closed** TCP port on that IP (`nc -vz <ip> <port>` from the host must say *refused*) so no
+     media application receives a request; a refusal still proves a probe reached it. If the container's
+     IP drifts the next deploy fails (`not live from the host`): update the file. Nothing is scanned;
+     only what you list is probed. `docker network rm probe-net`.
 8. **Validate** the whole stack (plan below).
 
 **R - Roll back** (restores Docker's own rules exactly): `"$GUARD" remove`; delete the drop-in and
@@ -173,9 +194,11 @@ stopped before `apply`, running after, stopped again after `remove`) and with th
 | agents | not affected: internal networks, no route to the host |
 
 **What the gate does not do** (accepted for `AGENT_MODE=demo`, documented): it only knows the
-targets it was given - the guard is the complete policy; it checks at *start* only (a guard removed
-later is caught by the proxies' healthcheck, within ~50 s, and by the next deploy's gate, not
-for `discovery`/`telegram`/`api` while they run); a host that silently drops (rather than answers)
+targets it was given - the guard is the complete policy; it checks at *start* only. **Removing the
+guard while the stack runs is not stopped by anything**: the proxies' healthcheck then only *reports*
+`unhealthy` (an unhealthy container is neither stopped nor restarted; `depends_on` consults health
+only when something starts), and `discovery`/`telegram`/`api` have no runtime check at all - the next
+deploy's gate catches it. This is a documented **blocker for `AGENT_MODE=cli`**, accepted for demo; a host that silently drops (rather than answers)
 packets from the daemon would make an unguarded start look guarded for those targets.
 
 **Stronger design (not implemented; needs a change on the production host; required before
@@ -198,7 +221,7 @@ within about a minute, `docker compose -p internship-hunter start` the rest, the
 | V1 | `"$GUARD" status` | `active (pid ...)` |
 | V2 | step 5 probes | tailnet `22`/`8000` blocked; `1.1.1.1:443` and DNS work |
 | V3 | `docker compose up -d --wait` | proxies healthy with `EGRESS_FORBIDDEN_TARGETS` set |
-| V4 | `ADMIN_TOKEN=... SMOKE_EXPECT_ROOTLESS=1 SMOKE_PROTECTED_IPS=$HOST_TS_IP deploy/smoke-test.sh` | `SMOKE TEST PASSED`; includes `CONNECT api.anthropic.com` / `api.openai.com` = 200 (`SMOKE_EXTERNAL=1`, the default), "controls verified" for every container |
+| V4 | `ADMIN_TOKEN=... SMOKE_EXPECT_ROOTLESS=1 SMOKE_PROTECTED_IPS=$HOST_TS_IP SMOKE_ROOTFUL_TARGETS=<ip:port from host-isolation.conf> deploy/smoke-test.sh` (`API_URL` must be the literal `http://127.0.0.1:18000`) | `SMOKE TEST PASSED`; includes `CONNECT api.anthropic.com` / `api.openai.com` = 200 (`SMOKE_EXTERNAL=1`, the default), "controls verified" for every container |
 | V5 | negative control: `"$GUARD" remove`, re-run V4 | **fails** naming `egress-* reaches 100.107.22.84:22 (connection OPEN)` and `... :2375 (connection REFUSED ...)`; then `apply` again |
 | V6 | idempotence: run `"$GUARD" apply` twice, then `status` | still `active`; exactly two jumps per chain, no duplicated rules |
 | V7 | `systemctl --user restart docker`; `"$GUARD" status` | `active` without manual action |
@@ -238,13 +261,21 @@ with **Alpine 3.20's own busybox `nc`** (1.36.1): `nc -vv -z` prints `Connection
 `Host is unreachable` / `Network unreachable` / `Operation timed out`, and **`nc -z` alone is silent on a
 refusal** - which is why the probes use `-vv` and calibrate against it.
 
-**CI.** The `host-guard-netns` job runs those packet tests on `ubuntu-22.04` (no sudo, no AppArmor
-change - this repository never relaxes either). If namespaces cannot be created there it ends with a
-**warning annotation and a step summary that say the tests did not run** and list the replacement
-checks (V1, V2, V4, V5, V6, V8 above); a skipped test is never reported as a pass. On Ubuntu 24.04 the
-same tests skip locally unless user namespaces are allowed - the *production host* checks V1-V9 are the
-authoritative evidence there. Not verified anywhere: the production host itself, slirp4netns/pasta,
-Docker's rule order on that host, Alpine's tinyproxy build.
+**CI.** The `host-guard-netns` job is a **mandatory security job that fails when it cannot do its
+work**. It runs the packet tests on `ubuntu-22.04` (no sudo, no AppArmor change - this repository never
+relaxes either); every step runs under `shell: bash` with `set -euo pipefail`, because GitHub's default
+`bash -e` lets `pytest | tee` swallow a failing pytest (reproduced and covered by
+`tests/test_workflows.py`, which executes the real CI step scripts with a failing, a skipping and a passing
+pytest). If user+network namespaces or `iptables` are unavailable the job ends **red** with an `::error`
+annotation and a `BLOCKED` step summary - there is no success-on-skip path. **This is a genuine CI
+blocker to resolve, not to bypass:** a compatible runner is `ubuntu-22.04` (what the job uses);
+`ubuntu-24.04` restricts unprivileged user namespaces via AppArmor and would need a per-binary profile for
+`/usr/bin/unshare` (as `rsm-pilot.yaml` does for rootlesskit), which requires elevated privileges and is a
+policy decision. Not verified anywhere in this repository's history: the job on GitHub's runners, the
+production host, slirp4netns/pasta, Docker's rule order on that host, Alpine's tinyproxy build. The
+`docker` job additionally runs `check-host-isolation.sh` against the **real images** (Alpine `nc`,
+Python): in report mode only reachability is a warning; a broken or missing probe tool, a failed exec or an
+incomplete result fails the job.
 
 ### Limits you accept
 
@@ -254,8 +285,15 @@ Docker's rule order on that host, Alpine's tinyproxy build.
   (above) keep application code from running in between, for the listed targets only.
 - A host address acquired after `apply` (DHCP) makes `status` fail (`chain ... differs`) and so
   blocks the next deploy until `apply` is re-run; established connections are not cut.
-- IPv4/iptables only for the allow path (IPv6 is rejected wholesale for new forwarded traffic;
-  containers are IPv4-only). Docker's nftables mode (no `DOCKER-USER`) is refused, not worked around.
+- **IPv6.** Investigated, not assumed: Docker's default bridges (and every compose network here:
+  `enable_ipv6` is forbidden by a test) give containers no IPv6 default route, and the check refuses to
+  validate if any container has one or any outbound network enables IPv6. As defence in depth the guard
+  also rejects every NEW IPv6 connection from a Docker bridge, both forwarded and to the daemon namespace
+  (ICMPv6 kept), and `status` verifies those chains. Proven with **real IPv6 packets** in the sandbox
+  (host's IPv6 tailnet address, IPv6 Internet, daemon namespace: reachable without the guard, blocked with
+  it) - not inferred from IPv4 tests. Consequence: IPv6 egress is unavailable, by design. Not verified:
+  how slirp4netns/pasta on the production host handles IPv6 for the daemon namespace itself.
+  Docker's nftables mode (no `DOCKER-USER`) is refused, not worked around.
 - The deploy gate cannot defend against root on the host, or against a Docker daemon that is
   restarted by someone else between the gate and the next container start (the start gates cover that).
 

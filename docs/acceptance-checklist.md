@@ -98,7 +98,16 @@ Derived checks (also run in CI against the Docker runner, in report mode, withou
       failed enforce check, first-deploy teardown, rollback prerequisites, rootful daemon never used
 - [x] **L** real `egress-proxy.sh` CONNECT to an allow-listed public name keeps working with the guard;
       Alpine's busybox `nc -vv -z` texts observed and the probes calibrated against them
-- [ ] **CI** `host-guard-netns` job ran the packet tests (not the explicit SKIP annotation)
+- [x] **L** F-2 start check/healthcheck fail closed (missing/broken nc, unsupported option, silent or
+      localised output, reachable/refused/odd target) - the old script FAILS these tests
+- [x] **L** F-5 report mode softens only reachability; 15 kinds of defect fatal in both modes
+- [x] **L** F-3/F-6 `--verify-targets`: typo, dropped packet, unreachable, refused, reachable listener;
+      required rootful target; deploy gate re-verifies on every deploy and rollback
+- [x] **L** F-1 CI step scripts executed with failing/skipping/passing pytest (the old `pytest | tee` stays green
+      under `bash -e`: reproduced); unavailable namespaces fail the job
+- [x] **L** IPv6 with real packets (host IPv6 address, IPv6 Internet, daemon namespace) blocked by the guard
+- [ ] **CI** the `host-guard-netns` job is GREEN on GitHub (it fails, it does not skip, if namespaces are
+      unavailable) - never run on GitHub from here
 - [x] **L** only loopback-published ports; proxy refuses tailnet (100.64/10, 100.100.100.100),
       RFC1918, link-local, loopback literals and `localhost`
 - [ ] **S** host guard installed + applied + persisted; `EGRESS_FORBIDDEN_TARGETS` set; validation V1-V9

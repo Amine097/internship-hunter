@@ -26,17 +26,38 @@
 #    8 backup, 9 schema, 10/6 restore failed (stack stopped), 11 isolation prerequisites, 12 guard
 set -Eeuo pipefail
 
-BASE="${HUNTER_BASE:-/opt/internship-hunter}"
-# HUNTER_TEST_MODE=1 exists only for tests/test_deploy_script.py (stub docker, files owned by the
-# test user); it relaxes the root-ownership checks and nothing else. It is never set by sshd.
-TEST_MODE="${HUNTER_TEST_MODE:-0}"
+# ---- the forced-command boundary --------------------------------------------------------------
+# Whatever environment the caller arrives with, production runs ONLY against /opt/internship-hunter
+# with the system's tools and none of the test hooks. The hooks (HUNTER_TEST_MODE, HUNTER_BASE,
+# HUNTER_MAX_BUNDLE_BYTES; they exist for tests/test_deploy_script.py: stub docker, files owned by
+# the test user) are honoured together or not at all, and never against the production directory.
+PROD_BASE=/opt/internship-hunter
+if [[ "${HUNTER_TEST_MODE:-0}" == 1 ]]; then
+  TEST_MODE=1
+  BASE="${HUNTER_BASE:-}"
+  if [[ -z "$BASE" || "$BASE" == "$PROD_BASE" || "$BASE" == "$PROD_BASE"/* ]]; then
+    echo "deploy: HUNTER_TEST_MODE requires HUNTER_BASE outside $PROD_BASE" >&2; exit 2
+  fi
+  MAX_BUNDLE_BYTES="${HUNTER_MAX_BUNDLE_BYTES:-3221225472}"
+else
+  TEST_MODE=0
+  BASE="$PROD_BASE"
+  MAX_BUNDLE_BYTES=3221225472   # 3 GiB
+  unset HUNTER_TEST_MODE HUNTER_BASE HUNTER_MAX_BUNDLE_BYTES
+  # nothing that makes a shell, the loader or Python load foreign code, and a fixed PATH
+  unset BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PYTHONPATH PYTHONHOME PYTHONSTARTUP \
+        PYTHONUSERBASE PYTHONINSPECT
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  export PATH
+fi
+# guard / schema overrides are test hooks of other scripts: never inherited from the caller
+unset HUNTER_GUARD_PROC HUNTER_GUARD_TEST_MODE HUNTER_ACCEPT_SCHEMA_REVISION ACCEPT_SCHEMA_REVISION
 # Trusted, root-owned copies; they are NOT taken from the (signed, but newer) release bundle, so a
 # bundle can never weaken the gate that is about to judge it.
 GUARD="$BASE/deploy/host-egress-guard.sh"
 ISOLATION_CHECK="$BASE/deploy/check-host-isolation.sh"
-ISOLATION_CONF="$BASE/deploy/host-isolation.conf"      # optional: ROOTFUL_TARGETS=ip:port,...
+ISOLATION_CONF="$BASE/deploy/host-isolation.conf"      # REQUIRED: ROOTFUL_TARGETS=ip:port,...
 API_PORT=18000          # host side; the container side stays 8000 (Gluetun lives on tailnet:8000)
-MAX_BUNDLE_BYTES="${HUNTER_MAX_BUNDLE_BYTES:-3221225472}"   # 3 GiB
 KEEP_RELEASES=5
 PROJECT=internship-hunter
 SIGN_NAMESPACE=hunter-release
@@ -125,10 +146,13 @@ forbidden_targets() { # the effective EGRESS_FORBIDDEN_TARGETS (last assignment 
   printf '%s' "$v"
 }
 
-rootful_targets() { # optional, root-owned: explicit ip:port of rootful containers that must stay unreachable
-  [[ -e "$ISOLATION_CONF" ]] || return 0
+rootful_targets() { # REQUIRED, root-owned: ROOTFUL_TARGETS=ip:port,... (at least one existing rootful target)
+  local v
+  [[ -f "$ISOLATION_CONF" && ! -L "$ISOLATION_CONF" ]] || return 1
   trusted_file_data "$ISOLATION_CONF" || return 1
-  sed -n 's/^ROOTFUL_TARGETS=//p' "$ISOLATION_CONF" | tail -1 | tr -d "\"' \r"
+  v="$(sed -n 's/^ROOTFUL_TARGETS=//p' "$ISOLATION_CONF" | tail -1 | tr -d "\"' \r")"
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
 }
 trusted_file_data() { # like trusted_file but for non-executable data
   local owner mode want_uid=0; [[ "$TEST_MODE" == 1 ]] && want_uid="$(id -u)"
@@ -144,7 +168,16 @@ require_isolation_prereqs() { # nothing is changed before these hold
     || die "isolation check missing or untrusted: $ISOLATION_CHECK must exist, be executable, root-owned and not writable by others" 11
   forbidden_targets >/dev/null \
     || die "EGRESS_FORBIDDEN_TARGETS must be set in $BASE/shared/.env to a comma-separated ip:port list (e.g. <tailscale ip>:22,<tailscale ip>:8000)" 11
-  rootful_targets >/dev/null || die "$ISOLATION_CONF is untrusted or unreadable" 11
+  rootful_targets >/dev/null \
+    || die "$ISOLATION_CONF must exist (root-owned, not writable by others) and set ROOTFUL_TARGETS=<ip:port>[,...]: name at least one EXISTING rootful container target (a closed port on its IP is ideal; docs/deployment.md)" 11
+  # The targets must be REAL: forbidden ones are addresses of this host, every target answers (or
+  # refuses) from the host's own namespace. A typo, a dropped packet or a moved container/bridge
+  # would otherwise leave the protection testing nothing. Safe TCP connects only, no payload.
+  if ! out="$(EGRESS_FORBIDDEN_TARGETS="$(forbidden_targets)" SMOKE_ROOTFUL_TARGETS="$(rootful_targets)" \
+              SMOKE_EXPECT_ROOTLESS=1 "$ISOLATION_CHECK" --verify-targets 2>&1)"; then
+    echo "$out" >&2
+    die "configured isolation targets are not live from the host (typo, dropped packet, or the address moved): fix $BASE/shared/.env / $ISOLATION_CONF" 11
+  fi
   if ! out="$("$GUARD" status 2>&1)"; then
     echo "$out" >&2
     die "host egress guard is not active with the full expected policy (run '$GUARD apply'; docs/deployment.md)" 12
@@ -216,10 +249,11 @@ activate() { # activate <sha>: start (never build) the release, then verify it
 set_current() { ln -sfn "$BASE/releases/$1" "$BASE/current.new" && mv -Tf "$BASE/current.new" "$BASE/current"; }
 
 require_rootless() {
-  if [[ "$TEST_MODE" != 1 ]]; then
-    # Only ever the user's own rootless daemon: pin the socket, so an inherited DOCKER_HOST,
-    # DOCKER_CONTEXT or a docker-group membership can never route a command to the rootful one.
-    local rd="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  # Only ever the user's own rootless daemon: pin the socket, so an inherited DOCKER_HOST,
+  # DOCKER_CONTEXT or a docker-group membership can never route a command to the rootful one.
+  # (Tests have no daemon: with HUNTER_TEST_MODE the pin applies only when a socket exists.)
+  local rd="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  if [[ "$TEST_MODE" != 1 || -S "$rd/docker.sock" ]]; then
     [[ -S "$rd/docker.sock" ]] || die "rootless Docker socket $rd/docker.sock not found" 5
     export DOCKER_HOST="unix://$rd/docker.sock"
     unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
@@ -442,14 +476,17 @@ main() {
   # A caller's environment must not be able to loosen the gate or redirect compose.
   local v
   for v in $(compgen -e | grep -E '^(SMOKE_|EGRESS_FORBIDDEN_TARGETS$|COMPOSE_)' || true); do unset "$v"; done
+  case "${SSH_ORIGINAL_COMMAND:-}" in
+    deploy|deploy-irreversible|rollback) require_rootless ;;   # before anything is written
+    *)                                   die "unsupported command" 2 ;;
+  esac
   mkdir -p "$BASE"/{releases,state,staging,shared}
   exec 9>"$BASE/state/deploy.lock"
   flock -n 9 || die "another deploy is running" 4
-  case "${SSH_ORIGINAL_COMMAND:-}" in
-    deploy)              require_rootless; do_deploy normal ;;
-    deploy-irreversible) require_rootless; do_deploy irreversible ;;
-    rollback)            require_rootless; do_rollback ;;
-    *)                   die "unsupported command" 2 ;;
+  case "$SSH_ORIGINAL_COMMAND" in
+    deploy)              do_deploy normal ;;
+    deploy-irreversible) do_deploy irreversible ;;
+    rollback)            do_rollback ;;
   esac
 }
 main

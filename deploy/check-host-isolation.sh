@@ -32,10 +32,18 @@
 # RESULT, ERROR (unclassifiable) all fail. A canary listener on every protected address is a
 # reachable positive control that does not depend on any real service listening.
 #
+#   deploy/check-host-isolation.sh --verify-targets   (host side only, no docker: are the configured
+#        EGRESS_FORBIDDEN_TARGETS / SMOKE_ROOTFUL_TARGETS real? used by remote-deploy.sh)
+#
 # Environment:
 #   SMOKE_HOST_ISOLATION=enforce (default) | report
-#       enforce: any breach, or any check that could not be performed, fails (exit 1).
-#       report: print WARN lines and exit 0 (CI on rootful runners).
+#       enforce: any reachability breach, and any defect, fails (exit 1).
+#       report:  ONLY actual network reachability violations (a container connected to / was
+#                refused by a protected destination, or has an IPv6 route out) become WARN lines
+#                with exit 0 (CI on rootful runners). A DEFECT is fatal in BOTH modes: a broken
+#                positive control, UNVERIFIED, a tool error, missing/malformed/duplicate probe
+#                output, a failed `docker exec`, incomplete service coverage, a canary that could
+#                not be created. A check that cannot see must never look like a pass.
 #   SMOKE_PROTECTED_IPS="100.107.22.84 ..."   extra host addresses to protect (space/comma list)
 #   SMOKE_AUTODETECT_HOST_IPS=1 (default)     also protect every global address of this host on
 #                                             EVERY interface (rootful docker0/br-* gateways
@@ -44,7 +52,11 @@
 #                                             each container's own gateway
 #   SMOKE_ROOTFUL_TARGETS="172.17.0.2:8080,..."      explicit IP:port of rootful containers (or any
 #                                             other service) that must be unreachable. Only what you
-#                                             list is probed - nothing is scanned.
+#                                             list is probed - nothing is scanned. Prefer a CLOSED
+#                                             port on a rootful container's IP: no media application
+#                                             receives a request, and a refusal still proves reach.
+#   SMOKE_REQUIRE_ROOTFUL_TARGET=0|1          enforce mode fails unless at least one is given
+#                                             (default: 1 when SMOKE_EXPECT_ROOTLESS=1)
 #   SMOKE_REQUIRE_TAILNET=0|1                 enforce mode fails unless a 100.64.0.0/10 address
 #                                             is among the protected ones (default: 1 when
 #                                             SMOKE_EXPECT_ROOTLESS=1, i.e. on the production host)
@@ -57,6 +69,7 @@ MODE="${SMOKE_HOST_ISOLATION:-enforce}"
 PORTS="${SMOKE_PROTECTED_PORTS:-22 8000 2375 2376 5432}"
 AUTODETECT="${SMOKE_AUTODETECT_HOST_IPS:-1}"
 REQUIRE_TAILNET="${SMOKE_REQUIRE_TAILNET:-${SMOKE_EXPECT_ROOTLESS:-0}}"
+REQUIRE_ROOTFUL="${SMOKE_REQUIRE_ROOTFUL_TARGET:-${SMOKE_EXPECT_ROOTLESS:-0}}"
 # Services the stack is known to expose to a route out: if one of them disappears from the
 # computed set, the topology changed and this check must be looked at, not silently shrink.
 REQUIRED_OUT=(egress-claude-1 egress-claude-2 egress-codex discovery telegram api)
@@ -98,6 +111,58 @@ collect_ips() {
   } | awk 'NF' | sort -u
 }
 
+# Host-side liveness of a configured target: from THIS network namespace a safe TCP connect (no
+# payload) must either connect or be REFUSED. A silent timeout / unreachable means the address is
+# a typo, gone (container IP drift, interface change) or filtered - the protection it is meant to
+# test would then silently test nothing.
+host_connect() { # host_connect ip port -> OPEN | REFUSED | OTHER:<why>
+  python3 - "$1" "$2" <<'PY'
+import errno, socket, sys
+try:
+    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3).close()
+    print("OPEN")
+except (ConnectionRefusedError, ConnectionResetError):
+    print("REFUSED")
+except TimeoutError:
+    print("OTHER:timed out")
+except OSError as e:
+    print(f"OTHER:{errno.errorcode.get(e.errno, e.errno)}")
+PY
+}
+host_owns() { ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' | grep -qx -- "$1"; }
+
+verify_targets() {
+  local t kind res bad=0 nfor=0 nroot=0 list
+  for kind in forbidden rootful; do
+    if [[ "$kind" == forbidden ]]; then list="${EGRESS_FORBIDDEN_TARGETS:-}"; else list="${SMOKE_ROOTFUL_TARGETS:-}"; fi
+    for t in $(tr ',' ' ' <<<"$list"); do
+      is_target "$t" || { echo "FAIL $kind target '$t' is not a literal ip:port" >&2; bad=1; continue; }
+      if [[ "$kind" == forbidden ]]; then
+        nfor=$((nfor + 1))
+        host_owns "${t%:*}" \
+          || { echo "FAIL forbidden target $t: ${t%:*} is not an address of this host (typo, or the address is gone)" >&2; bad=1; continue; }
+      else
+        nroot=$((nroot + 1))
+      fi
+      res="$(host_connect "${t%:*}" "${t##*:}")"
+      case "$res" in
+        OPEN|REFUSED) ok "$kind target $t is live from the host ($res)" ;;
+        *) echo "FAIL $kind target $t is not live from the host (${res#OTHER:}): a typo, a dropped packet," \
+                "or a container/interface that moved. Fix the configuration; protection against a" \
+                "non-existent target is no protection." >&2; bad=1 ;;
+      esac
+    done
+  done
+  [[ "$nfor" -gt 0 ]] || { echo "FAIL EGRESS_FORBIDDEN_TARGETS is empty" >&2; bad=1; }
+  if [[ "$nroot" -eq 0 && "$REQUIRE_ROOTFUL" == 1 ]]; then
+    echo "FAIL no rootful container target configured: list at least one ip:port in" \
+         "host-isolation.conf (ROOTFUL_TARGETS=), preferably a closed port on a rootful container's IP" >&2
+    bad=1
+  fi
+  return "$bad"
+}
+if [[ "${1:-}" == "--verify-targets" ]]; then verify_targets; exit $?; fi
+
 mapfile -t IPS < <(collect_ips)
 for ip in "${IPS[@]}"; do is_ipv4 "$ip" || fail "not an IPv4 address: '$ip' (SMOKE_PROTECTED_IPS / detected)"; done
 
@@ -110,10 +175,9 @@ COMPOSE=(docker compose "$@")
 exec_in() { local svc="$1"; shift; "${COMPOSE[@]}" exec -T "$svc" "$@"; }
 
 # ---- preconditions: a check that cannot see anything must not pass -------------------------
-if [[ ${#IPS[@]} -eq 0 ]]; then
-  [[ "$MODE" == report ]] || fail "no host address to protect: set SMOKE_PROTECTED_IPS" \
+if [[ ${#IPS[@]} -eq 0 ]]; then      # incomplete coverage is a defect, in report mode too
+  fail "no host address to protect: set SMOKE_PROTECTED_IPS" \
     "(e.g. the Tailscale IP) - refusing to certify host isolation without a target"
-  warn "no host address found; only the gateways are probed (report mode)"
 fi
 have_tailnet=0; for ip in "${IPS[@]}"; do is_cgnat "$ip" && have_tailnet=1; done
 if [[ "$REQUIRE_TAILNET" == 1 && "$MODE" == enforce && "$have_tailnet" != 1 ]]; then
@@ -125,6 +189,10 @@ for t in $(tr ',' ' ' <<<"${SMOKE_ROOTFUL_TARGETS:-}"); do
   is_target "$t" || fail "invalid SMOKE_ROOTFUL_TARGETS entry (want ip:port): '$t'"
   ROOTFUL+=("$t")
 done
+if [[ "$REQUIRE_ROOTFUL" == 1 && "$MODE" == enforce && ${#ROOTFUL[@]} -eq 0 ]]; then
+  fail "no rootful container target configured (SMOKE_ROOTFUL_TARGETS / host-isolation.conf):" \
+       "the operator must name at least one ip:port of an existing rootful container"
+fi
 
 # ---- which services have a route out? (computed, never a hard-coded shortlist) ---------------
 OUT_SERVICES=()
@@ -132,11 +200,20 @@ if ! mapfile -t OUT_SERVICES < <("${COMPOSE[@]}" config --format json 2>/dev/nul
 import json, sys
 cfg = json.load(sys.stdin)
 nets = cfg.get("networks") or {}
+for n, net in sorted(nets.items()):
+    if (net or {}).get("enable_ipv6") and not (net or {}).get("internal", False):
+        print("!IPV6 " + n)
 for name, svc in sorted((cfg.get("services") or {}).items()):
     attached = list((svc.get("networks") or {"default": None}).keys())
     if any(not (nets.get(n) or {}).get("internal", False) for n in attached):
         print(name)
 '); then OUT_SERVICES=(); fi
+V6NETS="$(printf '%s\n' ${OUT_SERVICES[@]+"${OUT_SERVICES[@]}"} | sed -n 's/^!IPV6 //p' | tr '\n' ' ')"
+if [[ -n "$V6NETS" ]]; then
+  fail "IPv6 is enabled on outbound network(s) $V6NETS: the guard's IPv4 allow path was not" \
+       "validated for IPv6; refusing to validate (docs/deployment.md, IPv6)"
+fi
+mapfile -t OUT_SERVICES < <(printf '%s\n' "${OUT_SERVICES[@]}" | awk 'NF && !/^!IPV6 /')
 if [[ ${#OUT_SERVICES[@]} -eq 0 ]]; then
   fail "cannot determine which services have a route out (docker compose config failed)"
 fi
@@ -186,10 +263,8 @@ fi
 TARGETS=()
 for c in "${CANARIES[@]}"; do
   if [[ "$c" == *:UNBOUND ]]; then
-    # a configured address that this host does not own cannot be probed: not a pass
-    [[ "$MODE" == report ]] || fail "cannot open a canary on ${c%:UNBOUND}: not an address of this host"
-    warn "cannot open a canary on ${c%:UNBOUND} (report mode)"
-    continue
+    # a configured address that this host does not own cannot be probed: a defect in every mode
+    fail "cannot open a canary on ${c%:UNBOUND}: not an address of this host"
   fi
   # control: the canary MUST be reachable from the host itself, or "blocked" means nothing
   timeout 3 bash -c ": </dev/tcp/${c%:*}/${c##*:}" 2>/dev/null \
@@ -295,48 +370,50 @@ print("DONE", len(res))
 ASSESS='
 import re, sys
 svc, expected = sys.argv[1], set(sys.argv[2].split())
-bad, tool, controls, gw, v6, done, results = [], None, {}, None, None, None, {}
+out, tool, controls, gw, v6, done, results = [], None, {}, None, None, None, {}
+def reach(m): out.append("REACH " + m)
+def defect(m): out.append("DEFECT " + m)
 for ln in sys.stdin.read().splitlines():
     if not ln.strip(): continue
     m = re.fullmatch(r"TOOL (nc|python)", ln)
     if m: tool = m.group(1); continue
     m = re.fullmatch(r"TOOLMISSING (\S+)", ln)
-    if m: bad.append(f"{svc}: probe tool {m.group(1)} is missing in the container; host isolation UNVERIFIED"); continue
+    if m: defect(f"{svc}: probe tool {m.group(1)} is missing in the container; host isolation UNVERIFIED"); continue
     m = re.fullmatch(r"CONTROL (open|refused) (ok|FAIL)", ln)
     if m: controls[m.group(1)] = m.group(2); continue
     m = re.fullmatch(r"GATEWAY (\d+\.\d+\.\d+\.\d+|none)", ln)
     if m: gw = m.group(1); continue
     m = re.fullmatch(r"RESULT (\d+\.\d+\.\d+\.\d+:\d+) (OPEN|REFUSED|BLOCKED|ERROR)", ln)
     if m:
-        if m.group(1) in results: bad.append(f"{svc}: duplicate result for {m.group(1)}")
+        if m.group(1) in results: defect(f"{svc}: duplicate result for {m.group(1)}")
         results[m.group(1)] = m.group(2); continue
     m = re.fullmatch(r"V6DEFAULT (yes|no)", ln)
     if m: v6 = m.group(1); continue
     m = re.fullmatch(r"DONE (\d+)", ln)
     if m: done = int(m.group(1)); continue
-    bad.append(f"{svc}: malformed probe output {ln[:80]!r}; host isolation UNVERIFIED")
+    defect(f"{svc}: malformed probe output {ln[:80]!r}; host isolation UNVERIFIED")
 if tool is None:
-    if not bad: bad.append(f"{svc}: probe did not run (no output); host isolation UNVERIFIED")
+    if not out: defect(f"{svc}: probe did not run (no output); host isolation UNVERIFIED")
 else:
     for c, why in (("open", "cannot connect to a listener inside the container"),
                    ("refused", "cannot recognise a connection refusal")):
         if controls.get(c) != "ok":
-            bad.append(f"{svc}: positive control failed - the probe tool {why}; host isolation UNVERIFIED")
+            defect(f"{svc}: positive control failed - the probe tool {why}; host isolation UNVERIFIED")
     if gw in (None, "none"):
-        bad.append(f"{svc}: no default gateway found; the gateway was NOT tested")
-    if v6 is None: bad.append(f"{svc}: no IPv6 verdict")
-    elif v6 == "yes": bad.append(f"{svc} has an IPv6 default route (the guard rules are IPv4)")
+        defect(f"{svc}: no default gateway found; the gateway was NOT tested")
+    if v6 is None: defect(f"{svc}: no IPv6 verdict")
+    elif v6 == "yes": reach(f"{svc} has an IPv6 default route (the guard rules are IPv4-allow + IPv6-reject; not validated here)")
     missing = sorted(t for t in expected if t not in results)
-    if missing: bad.append(f"{svc}: probe skipped {len(missing)} target(s), e.g. {missing[0]}; host isolation UNVERIFIED")
-    if done != len(results): bad.append(f"{svc}: probe reported DONE {done} but printed {len(results)} results")
+    if missing: defect(f"{svc}: probe skipped {len(missing)} target(s), e.g. {missing[0]}; host isolation UNVERIFIED")
+    if done != len(results): defect(f"{svc}: probe reported DONE {done} but printed {len(results)} results")
     for t, r in sorted(results.items()):
-        if r == "OPEN": bad.append(f"{svc} reaches {t} (connection OPEN)")
-        elif r == "REFUSED": bad.append(f"{svc} reaches {t} (connection REFUSED: the packet arrived and was answered)")
-        elif r == "ERROR": bad.append(f"{svc}: unclassifiable result for {t}; host isolation UNVERIFIED")
-for b in bad: print(b)
+        if r == "OPEN": reach(f"{svc} reaches {t} (connection OPEN)")
+        elif r == "REFUSED": reach(f"{svc} reaches {t} (connection REFUSED: the packet arrived and was answered)")
+        elif r == "ERROR": defect(f"{svc}: unclassifiable result for {t}; host isolation UNVERIFIED")
+for o in out: print(o)
 '
 
-BREACH=()
+REACHED=(); DEFECTS=()
 probe_service() { # probe_service <service>
   local svc="$1" out err expected="$TARGET_LIST" gw p line
   err="$(mktemp)"
@@ -349,28 +426,41 @@ probe_service() { # probe_service <service>
   # the container's own gateway is only known inside it: expect its ports as well
   gw="$(sed -n 's/^GATEWAY \([0-9.]*\)$/\1/p' <<<"$out" | head -1)"
   if [[ -n "$gw" ]]; then for p in $PORTS; do expected="$expected $gw:$p"; done; fi
-  while IFS= read -r line; do [[ -z "$line" ]] || BREACH+=("$line"); done \
-    < <(printf '%s\n' "$out" | python3 -c "$ASSESS" "$svc" "$expected")
+  while IFS= read -r line; do
+    case "$line" in
+      "REACH "*) REACHED+=("${line#REACH }") ;;
+      "DEFECT "*) DEFECTS+=("${line#DEFECT }") ;;
+      '') ;;
+      *) DEFECTS+=("$svc: assessor produced an unexpected line: ${line:0:80}") ;;
+    esac
+  done < <(printf '%s\n' "$out" | python3 -c "$ASSESS" "$svc" "$expected" 2>&1 || echo "DEFECT $svc: the assessor itself failed")
   if [[ -z "$out" ]]; then
-    BREACH+=("$svc: docker exec produced no output ($(head -c 160 "$err" | tr '\n' ' ')); host isolation UNVERIFIED")
+    DEFECTS+=("$svc: docker exec produced no output ($(head -c 160 "$err" | tr '\n' ' ')); host isolation UNVERIFIED")
   fi
   rm -f "$err"
 }
 for svc in "${OUT_SERVICES[@]}"; do probe_service "$svc"; done
 
-if [[ ${#BREACH[@]} -eq 0 ]]; then
+# DEFECTS are fatal in every mode; only REACHED may be softened by report mode.
+if [[ ${#DEFECTS[@]} -gt 0 ]]; then
+  printf 'FAIL host isolation could not be verified (%s mode) - defects are fatal in every mode:\n' "$MODE" >&2
+  printf '       - %s\n' "${DEFECTS[@]}" >&2
+  [[ ${#REACHED[@]} -eq 0 ]] || { printf '       reachability violations seen as well:\n' >&2; printf '       - %s\n' "${REACHED[@]}" >&2; }
+  exit 1
+fi
+ok "probe controls verified in ${#OUT_SERVICES[@]} service(s): ${OUT_SERVICES[*]} (probe tools exercised, results complete)"
+if [[ ${#REACHED[@]} -eq 0 ]]; then
   ok "no container with a route out reaches the host: ${#TARGETS[@]} destination(s) + gateway per container" \
-     "(${IPS[*]:-no host address}; ports: $PORTS; canaries: ${#CANARIES[@]}; rootful targets: ${#ROOTFUL[@]};" \
-     "controls verified) from ${OUT_SERVICES[*]}"
+     "(${IPS[*]:-no host address}; ports: $PORTS; canaries: ${#CANARIES[@]}; rootful targets: ${#ROOTFUL[@]})"
   exit 0
 fi
 if [[ "$MODE" == enforce ]]; then
   printf 'FAIL host isolation (enforce):\n' >&2
-  printf '       - %s\n' "${BREACH[@]}" >&2
+  printf '       - %s\n' "${REACHED[@]}" >&2
   echo "       Containers on a non-internal network can dial this host. Apply the host guard" \
        "(docs/deployment.md, \"Host isolation\") and re-run." >&2
   exit 1
 fi
-warn "host isolation (report mode) - NOT acceptable in production:"
-printf 'WARN   - %s\n' "${BREACH[@]}" >&2
+warn "host isolation (report mode) - reachability violations, NOT acceptable in production:"
+printf 'WARN   - %s\n' "${REACHED[@]}" >&2
 exit 0

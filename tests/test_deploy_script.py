@@ -84,6 +84,15 @@ GUARD_STUB = textwrap.dedent("""\
 """)
 CHECK_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
+    if [[ "${1:-}" == --verify-targets ]]; then
+      {
+        echo "verify EGRESS_FORBIDDEN_TARGETS=${EGRESS_FORBIDDEN_TARGETS:-}" \
+             "SMOKE_ROOTFUL_TARGETS=${SMOKE_ROOTFUL_TARGETS:-}" \
+             "SMOKE_EXPECT_ROOTLESS=${SMOKE_EXPECT_ROOTLESS:-}"
+      } >> "$STUB_DIR/verify.log"
+      [[ -n "${STUB_VERIFY_FAIL:-}" ]] && { echo "FAIL target is not live (stub)"; exit 1; }
+      exit 0
+    fi
     running="$(cat "$STUB_DIR/running" 2>/dev/null)"
     {
       echo "check running=$running args=$*"
@@ -123,6 +132,9 @@ class Env:
         self.env_file = self.base / "shared" / ".env"
         self.env_file.write_text("X=1\nEGRESS_FORBIDDEN_TARGETS=100.107.22.84:22,100.107.22.84:8000\n")
         (self.base / "deploy").mkdir()
+        self.conf = self.base / "deploy" / "host-isolation.conf"
+        self.conf.write_text("ROOTFUL_TARGETS=172.17.0.2:9\n")
+        self.conf.chmod(0o644)
         for name, body in (("host-egress-guard.sh", GUARD_STUB),
                            ("check-host-isolation.sh", CHECK_STUB)):
             (self.base / "deploy" / name).write_text(body)
@@ -640,7 +652,7 @@ def test_caller_environment_cannot_supply_the_targets_or_loosen_the_check(env):
     assert "SMOKE_HOST_ISOLATION=enforce" in env.isolation_log
     assert "SMOKE_AUTODETECT_HOST_IPS=1" in env.isolation_log
     assert "SMOKE_PROTECTED_PORTS=unset" in env.isolation_log
-    assert "ROOTFUL_TARGETS= " in env.isolation_log
+    assert "SMOKE_ROOTFUL_TARGETS=172.17.0.2:9 " in env.isolation_log     # the conf, not "x"
 
 
 def test_isolation_check_runs_in_enforce_mode_after_up_with_the_stacks_compose_args(env):
@@ -757,7 +769,7 @@ def test_stub_docker_sees_a_pinned_host_in_production_mode(env, tmp_path):
         (env.bin / "docker").write_text("#!/usr/bin/env bash\n"
                                         "echo \"DOCKER_HOST=$DOCKER_HOST\" >> \"$STUB_DIR/hosts\"\n"
                                         "case \"$1\" in info) echo '[name=rootless]';; esac\n")
-        r = env.run("rollback", HUNTER_TEST_MODE="0", XDG_RUNTIME_DIR=str(sock.parent),
+        r = env.run("rollback", XDG_RUNTIME_DIR=str(sock.parent),
                     DOCKER_HOST="unix:///var/run/docker.sock")
         hosts = (env.stub / "hosts").read_text().split()
         assert hosts and set(hosts) == {f"DOCKER_HOST=unix://{sock}"}, (hosts, r.stderr)
@@ -797,3 +809,97 @@ def test_port_inspection_failure_fails_closed(env):
     (env.bin / "ss").write_text("#!/usr/bin/env bash\nexit 1\n")
     r = env.deploy(SHA_A)
     assert r.returncode == 3 and untouched(env)
+
+
+# ---- F-6: a rootful container target is REQUIRED ------------------------------------------------
+@pytest.mark.parametrize("content", [None, "", "# nothing\n", "ROOTFUL_TARGETS=\n", "OTHER=1\n"])
+def test_deploy_requires_a_rootful_container_target(env, content):
+    if content is None:
+        env.conf.unlink()
+    else:
+        env.conf.write_text(content)
+        env.conf.chmod(0o644)
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    err = r.stderr.decode()
+    assert "ROOTFUL_TARGETS" in err and "rootful container target" in err
+
+
+def test_rootful_conf_must_be_trusted(env):
+    env.conf.chmod(0o666)
+    assert env.deploy(SHA_A).returncode == 11
+    env.conf.chmod(0o644)
+    real = env.base / "real.conf"
+    real.write_text("ROOTFUL_TARGETS=172.17.0.2:9\n")
+    env.conf.unlink()
+    env.conf.symlink_to(real)
+    assert env.deploy(SHA_A).returncode == 11
+
+
+# ---- F-3: configured targets are verified live from the host before anything changes ------------
+def test_targets_are_verified_with_the_trusted_check_before_any_change(env):
+    r = env.deploy(SHA_A)
+    assert r.returncode == 0, r.stderr.decode()
+    log = (env.stub / "verify.log").read_text()
+    assert "EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22,100.107.22.84:8000" in log
+    assert "SMOKE_ROOTFUL_TARGETS=172.17.0.2:9" in log and "SMOKE_EXPECT_ROOTLESS=1" in log
+
+
+def test_dead_targets_fail_closed_before_anything_changes(env):
+    r = env.deploy(SHA_A, STUB_VERIFY_FAIL="1")
+    assert r.returncode == 11 and untouched(env)
+    assert "not live from the host" in r.stderr.decode()
+    assert "FAIL target is not live" in r.stderr.decode()
+
+
+def test_rollback_also_re_verifies_the_targets(env):
+    env.deploy(SHA_A)
+    env.deploy(SHA_B)
+    (env.stub / "log").write_text("")
+    r = env.run("rollback", STUB_VERIFY_FAIL="1")
+    assert r.returncode == 11 and "up -d" not in env.log and env.current_link == SHA_B
+
+
+def test_host_networking_changes_between_deploys_fail_closed(env):
+    assert env.deploy(SHA_A).returncode == 0
+    assert env.deploy(SHA_B, STUB_VERIFY_FAIL="1").returncode == 11     # e.g. the address moved
+    assert env.current_link == SHA_A and env.state("current_sha") == SHA_A
+
+
+# ---- L-a: the forced-command boundary ------------------------------------------------------------
+def test_production_mode_ignores_every_test_hook_from_the_environment(env):
+    marker = env.tmp / "decoy"
+    r = env.run("deploy", b"", HUNTER_TEST_MODE="0", HUNTER_BASE=str(marker),
+                HUNTER_MAX_BUNDLE_BYTES="1", HUNTER_GUARD_PROC="/tmp/fake",
+                HUNTER_GUARD_TEST_MODE="1", ACCEPT_SCHEMA_REVISION="9999")
+    # the decoy base is never used or even created: production runs against /opt/internship-hunter
+    assert not marker.exists()
+    assert r.returncode in (5, 1)          # no rootless socket / no /opt/internship-hunter here
+
+
+def test_test_mode_is_refused_against_the_production_directory_or_without_a_base(env):
+    for base in ("/opt/internship-hunter", "/opt/internship-hunter/x", ""):
+        extra = {"HUNTER_BASE": base} if base else {}
+        r = subprocess.run(["bash", str(SCRIPT)], input=b"", capture_output=True, timeout=30, env={
+            "PATH": f"{env.bin}:{os.environ['PATH']}", "HOME": str(env.tmp),
+            "STUB_DIR": str(env.stub),
+            "SSH_ORIGINAL_COMMAND": "deploy", "HUNTER_TEST_MODE": "1", **extra})
+        assert r.returncode == 2 and b"HUNTER_TEST_MODE requires HUNTER_BASE" in r.stderr, base
+        assert env.log == ""
+
+
+def test_the_script_cleans_loader_and_interpreter_hooks_in_production_mode():
+    text = SCRIPT.read_text()
+    head = text[:text.index("# Trusted, root-owned copies")]
+    for var in ("BASH_ENV", "LD_PRELOAD", "PYTHONPATH", "HUNTER_GUARD_PROC",
+                "HUNTER_GUARD_TEST_MODE", "ACCEPT_SCHEMA_REVISION"):
+        assert var in head, var
+    assert "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in head
+
+
+def test_no_deploy_script_ever_names_the_rootful_docker_socket():
+    for name in ("remote-deploy.sh", "check-host-isolation.sh", "host-egress-guard.sh",
+                 "smoke-test.sh"):
+        code = "\n".join(ln for ln in (SCRIPT.parent / name).read_text().splitlines()
+                         if not ln.lstrip().startswith("#"))
+        assert "/var/run/docker.sock" not in code and "/run/docker.sock" not in code, name

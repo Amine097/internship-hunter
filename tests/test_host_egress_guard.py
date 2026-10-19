@@ -208,3 +208,11 @@ def test_conf_file_supplies_dns_and_protect_and_must_be_trusted(env, tmp_path):
     conf.write_text("EVIL=1\n")
     r = subprocess.run(["bash", str(script), "plan"], capture_output=True, text=True, env=env)
     assert r.returncode == 1 and "unknown line" in r.stderr
+
+
+def test_plan_covers_ipv6_forward_and_input(env):
+    r = guard(env, "plan")
+    assert "-A HUNTER-EGRESS-GUARD6 -j REJECT --reject-with icmp6-adm-prohibited" in r.stdout
+    assert "-A HUNTER-EGRESS-GUARD6-IN -p ipv6-icmp -j RETURN" in r.stdout
+    assert "-A HUNTER-EGRESS-GUARD6-IN -j REJECT --reject-with icmp6-adm-prohibited" in r.stdout
+    assert "ip6tables -I INPUT 1" in r.stdout and "ip6tables -I FORWARD 1" in r.stdout

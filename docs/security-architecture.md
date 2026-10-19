@@ -121,12 +121,18 @@ Layers, each answering a different question (`docs/deployment.md`, "Host isolati
 3. **Start gate** - after a daemon restart the restart policy can start containers before the
    guard is re-applied; `api`, `discovery`, `telegram` and the proxies therefore exit at start while
    a forbidden target answers, before any application code runs.
-4. **Detect at runtime** - the proxy's healthcheck fails if it can reach anything listed in
-   `EGRESS_FORBIDDEN_TARGETS` (e.g. `100.107.22.84:22,100.107.22.84:8000`).
+4. **Detect at runtime** - the proxy's healthcheck *reports* unhealthy if it can reach anything listed in
+   `EGRESS_FORBIDDEN_TARGETS` (e.g. `100.107.22.84:22,100.107.22.84:8000`). That only prevents agents
+   from *starting* behind it and fails `compose up --wait`; an unhealthy container is not stopped or
+   restarted, and nothing at all watches `discovery`/`telegram`/`api` while they run. Removing the
+   guard at runtime is therefore a documented blocker for `AGENT_MODE=cli`.
 5. **Verify** - `deploy/check-host-isolation.sh` dials every protected address from every container
    with a route out (computed from `compose config`) with raw TCP, including a canary listener on a
    random port. It counts an open port *and a refusal* as reaching the host, and fails closed unless
-   each container first passes its own positive controls.
+   each container first passes its own positive controls. In `report` mode (rootful CI runners) only
+   reachability becomes a warning; broken tools, missing output and incomplete coverage stay fatal.
+   The proxy's start check and healthcheck use the same rule: only "unreachable", "prohibited" or
+   "timed out" count as isolation, after a self-test proves `nc` works here.
 
 Compose gives each proxy its **own** outbound network (`egress_<name>`), so a compromised proxy
 cannot reach another proxy (and so another provider's allow-list) or `discovery`/`telegram`.

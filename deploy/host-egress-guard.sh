@@ -27,7 +27,8 @@
 #                           are untouched, so CONNECT to the providers works.
 #   HUNTER-EGRESS-GUARD-IN  in INPUT: containers may not open NEW connections to the daemon
 #                           namespace itself (bridge gateway, docker-proxy listeners).
-#   HUNTER-EGRESS-GUARD6    in the IPv6 FORWARD chain: NEW forwarded IPv6 is rejected.
+#   HUNTER-EGRESS-GUARD6    in the IPv6 FORWARD chain: NEW forwarded IPv6 is rejected, and
+#   HUNTER-EGRESS-GUARD6-IN in the IPv6 INPUT chain: NEW IPv6 to the namespace itself (ICMPv6 kept).
 #
 # `status` does not just look for the jump rules: it renders the expected policy into scratch
 # chains, lets the kernel canonicalise it, and compares chain contents, the position of the jump
@@ -60,6 +61,7 @@ BRIDGES=("br-+" "docker0")               # Docker's user-defined bridges and its
 CHAIN="HUNTER-EGRESS-GUARD"
 CHAIN_IN="HUNTER-EGRESS-GUARD-IN"
 CHAIN6="HUNTER-EGRESS-GUARD6"
+CHAIN6_IN="HUNTER-EGRESS-GUARD6-IN"
 # Destinations that are never "the public Internet" (IANA special-purpose + multicast/reserved)
 NON_GLOBAL=(0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12
             192.0.0.0/24 192.0.2.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24
@@ -179,12 +181,19 @@ render_v4() { # iptables-restore --noflush input; redefining a chain replaces it
   echo "COMMIT"
 }
 render_v6() {
-  local c="$CHAIN6$SUFFIX"
+  local c="$CHAIN6$SUFFIX" ci="$CHAIN6_IN$SUFFIX"
   echo "*filter"
   echo ":$c - [0:0]"
+  echo ":$ci - [0:0]"
   echo "-F $c"
+  echo "-F $ci"
   echo "-A $c -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
   echo "-A $c -j REJECT --reject-with icmp6-adm-prohibited"
+  # to the daemon namespace itself (INPUT): neighbour discovery and friends must keep working,
+  # everything else NEW is rejected. Containers are IPv4-only; this is for the day one is not.
+  echo "-A $ci -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
+  echo "-A $ci -p ipv6-icmp -j RETURN"
+  echo "-A $ci -j REJECT --reject-with icmp6-adm-prohibited"
   echo "COMMIT"
 }
 
@@ -199,6 +208,7 @@ do_plan() {
 #   iptables -I INPUT 1       -i <${BRIDGES[*]}> -j $CHAIN_IN
 #   ip6tables-restore --noflush     <  the IPv6 ruleset (required: apply/status fail without ip6tables)
 #   ip6tables -I FORWARD 1    -i <${BRIDGES[*]}> -j $CHAIN6
+#   ip6tables -I INPUT 1      -i <${BRIDGES[*]}> -j $CHAIN6_IN
 EOF
   render_v4
   echo "# --- IPv6"
@@ -239,7 +249,9 @@ canon() { sed -E "s/^(-[NA] HUNTER-EGRESS-GUARD[A-Z0-9-]*)-X/\\1/"; }
 cleanup_scratch() {
   local c
   for c in "$CHAIN-X" "$CHAIN_IN-X"; do ipt -F "$c" 2>/dev/null && ipt -X "$c" 2>/dev/null || true; done
-  if ipt6 -S "$CHAIN6-X" >/dev/null 2>&1; then ipt6 -F "$CHAIN6-X" && ipt6 -X "$CHAIN6-X" || true; fi
+  for c in "$CHAIN6-X" "$CHAIN6_IN-X"; do
+    if ipt6 -S "$c" >/dev/null 2>&1; then ipt6 -F "$c" && ipt6 -X "$c" || true; fi
+  done
 }
 check_jumps() { # check_jumps <fn> <chain> <target>: our jumps are the first rules, nothing before
   local fn="$1" from="$2" to="$3"
@@ -263,12 +275,14 @@ verify_policy() {
   check_jumps ipt DOCKER-USER "$CHAIN"
   check_jumps ipt INPUT "$CHAIN_IN"
   check_jumps ipt6 FORWARD "$CHAIN6"
+  check_jumps ipt6 INPUT "$CHAIN6_IN"
   if [[ "$(first_rules ipt FORWARD 1)" != "-A FORWARD -j DOCKER-USER" ]]; then
     PROBLEMS+=("FORWARD no longer starts with Docker's jump into DOCKER-USER: the guard can be bypassed")
   fi
   compare_chain ipt "$CHAIN"
   compare_chain ipt "$CHAIN_IN"
   compare_chain ipt6 "$CHAIN6"
+  compare_chain ipt6 "$CHAIN6_IN"
   cleanup_scratch
   [[ ${#PROBLEMS[@]} -eq 0 ]] && return 0
   printf 'NOT active: %s\n' "${PROBLEMS[@]}"
@@ -287,6 +301,7 @@ do_apply() {
   ensure_jump ipt INPUT "$CHAIN_IN"
   render_v6 | "${NS[@]}" ip6tables-restore -w 5 --noflush
   ensure_jump ipt6 FORWARD "$CHAIN6"
+  ensure_jump ipt6 INPUT "$CHAIN6_IN"
   note "applied: ${#HOSTS[@]} host address(es), ${#NON_GLOBAL[@]} non-global ranges, DNS ${DNS[*]}"
   verify_policy || die "policy was applied but does not verify: see messages above"
   note "existing connections are not cut; restart the stack and run deploy/smoke-test.sh to validate"
@@ -309,7 +324,10 @@ do_remove() {
   cleanup_scratch
   if "${NS[@]}" ip6tables -S >/dev/null 2>&1; then
     drop_jump ipt6 FORWARD "$CHAIN6"
-    if ipt6 -S "$CHAIN6" >/dev/null 2>&1; then ipt6 -F "$CHAIN6" && ipt6 -X "$CHAIN6" || true; fi
+    drop_jump ipt6 INPUT "$CHAIN6_IN"
+    for c in "$CHAIN6" "$CHAIN6_IN"; do
+      if ipt6 -S "$c" >/dev/null 2>&1; then ipt6 -F "$c" && ipt6 -X "$c" || true; fi
+    done
   fi
   note "removed: the daemon namespace is back to Docker's own rules"
 }

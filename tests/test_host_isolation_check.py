@@ -382,9 +382,10 @@ def test_metadata_endpoint_is_probed_and_tailnet_dns_only_with_a_tailnet(stub):
     (stub / "targets").unlink()
     run(stub)
     assert "100.100.100.100" not in (stub / "targets").read_text()
-    (stub / "targets").unlink()
-    run(stub, mode="report", ips="100.107.22.84")
-    assert "100.100.100.100:53" in (stub / "targets").read_text()
+    # a tailnet address cannot be bound by a test (no such interface), so the positive case is
+    # asserted on the script: MagicDNS is added exactly when a 100.64.0.0/10 address is protected
+    magic = '[[ "$have_tailnet" == 1 ]] && TARGETS+=(100.100.100.100:53 100.100.100.100:80)'
+    assert magic in CHECK.read_text()
 
 
 def test_only_listed_addresses_are_ever_probed_no_scanning(stub):
@@ -410,7 +411,8 @@ def test_enforce_is_the_default_mode():
 def test_enforce_without_any_target_address_refuses_to_certify(stub):
     r = run(stub, ips="")
     assert r.returncode == 1 and "no host address to protect" in r.stderr
-    assert run(stub, mode="report", ips="").returncode == 0
+    # incomplete coverage is a defect: fatal in report mode as well
+    assert run(stub, mode="report", ips="").returncode == 1
 
 
 def test_configured_address_that_is_not_local_cannot_be_canaried(stub):
@@ -421,7 +423,8 @@ def test_configured_address_that_is_not_local_cannot_be_canaried(stub):
 def test_production_marker_requires_a_tailnet_address(stub):
     r = run(stub, extra={"SMOKE_EXPECT_ROOTLESS": "1"})
     assert r.returncode == 1 and "no Tailscale (100.64.0.0/10) address" in r.stderr
-    optout = {"SMOKE_EXPECT_ROOTLESS": "1", "SMOKE_REQUIRE_TAILNET": "0"}
+    optout = {"SMOKE_EXPECT_ROOTLESS": "1", "SMOKE_REQUIRE_TAILNET": "0",
+              "SMOKE_ROOTFUL_TARGETS": "172.18.0.5:8080"}
     assert run(stub, extra=optout).returncode == 0
 
 
@@ -479,3 +482,169 @@ def test_healthcheck_is_unhealthy_when_a_forbidden_target_answers(stub):
                                  "100.107.22.84:22x", "host.example:22"])
 def test_healthcheck_rejects_malformed_targets(stub, bad):
     assert health(stub, bad).returncode == 1
+
+
+# ---- F-5: report mode softens ONLY reachability; defects are fatal in every mode ---------------
+DEFECTS = [
+    ("broken_nc", {"STUB_NC_BROKEN": "egress-claude-1"}, "positive control failed"),
+    ("nc_cannot_tell_refusal", {"STUB_NC_NO_REFUSAL_TEXT": "egress-codex"}, "cannot recognise"),
+    ("unclassifiable_nc", {"STUB_NC_UNKNOWN_ERROR": "egress-codex"}, "unclassifiable"),
+    ("missing_nc", {"STUB_NO_NC": "egress-codex"}, "probe tool nc is missing"),
+    ("missing_python", {"STUB_NO_PYTHON": "telegram"}, "docker exec produced no output"),
+    ("python_controls_broken", {"STUB_PY_BREAK_CONTROLS": "discovery"}, "discovery"),
+    ("python_unclassifiable", {"STUB_PY_UNKNOWN_ERROR": "api"}, "unclassifiable"),
+    ("failed_exec", {"STUB_EXEC_FAIL": "egress-claude-2"}, "docker exec produced no output"),
+    ("truncated", {"STUB_TRUNCATE": "discovery"}, "probe reported DONE"),
+    ("skipped_target", {"STUB_DROP_RESULT": "egress-codex=127.0.0.1:5432"}, "probe skipped"),
+    ("duplicate", {"STUB_DUP_RESULT": "api"}, "duplicate result"),
+    ("garbage", {"STUB_GARBAGE": "telegram"}, "malformed probe output"),
+    ("no_results", {"STUB_NOISE": "egress-claude-1"}, "probe skipped"),
+    ("no_gateway", {"STUB_NO_GATEWAY": "1"}, "no default gateway found"),
+    ("compose_config_fails", {"STUB_CONFIG_FAIL": "1"}, "cannot determine which services"),
+]
+
+
+@pytest.mark.parametrize("mode", ["enforce", "report"])
+@pytest.mark.parametrize("name,extra,msg", DEFECTS, ids=[d[0] for d in DEFECTS])
+def test_defects_are_fatal_in_both_modes(stub, mode, name, extra, msg):
+    r = run(stub, mode=mode, extra=extra)
+    assert r.returncode == 1, (mode, name, r.stdout, r.stderr)
+    assert msg in r.stderr
+    assert "PASSED" not in r.stdout and "no container with a route out reaches" not in r.stdout
+
+
+@pytest.mark.parametrize("mode", ["enforce", "report"])
+def test_missing_required_service_and_unbindable_canary_are_fatal_in_both_modes(stub, mode):
+    (stub / "config.json").write_text(config_json(services=[s for s in OUTBOUND if s != "api"]))
+    assert run(stub, mode=mode).returncode == 1
+    (stub / "config.json").write_text(config_json())
+    r = run(stub, mode=mode, ips="100.107.22.84")                # not a local address
+    assert r.returncode == 1 and "cannot open a canary" in r.stderr
+
+
+def test_report_mode_still_warns_and_passes_for_pure_reachability(stub):
+    r = run(stub, mode="report", reachable="egress-codex@127.0.0.1:22",
+            extra={"STUB_REFUSED": "api@127.0.0.1:2375"})
+    assert r.returncode == 0
+    assert "egress-codex reaches 127.0.0.1:22 (connection OPEN)" in r.stderr
+    assert "api reaches 127.0.0.1:2375 (connection REFUSED" in r.stderr
+    # ... and proves the probe tools really ran (CI greps this line against the real images)
+    assert "probe controls verified in 6 service(s)" in r.stdout
+
+
+def test_report_mode_with_a_reachability_violation_and_a_defect_is_fatal_and_lists_both(stub):
+    r = run(stub, mode="report", reachable="egress-codex@127.0.0.1:22",
+            extra={"STUB_NC_BROKEN": "egress-claude-1"})
+    assert r.returncode == 1
+    assert "positive control failed" in r.stderr and "egress-codex reaches 127.0.0.1:22" in r.stderr
+
+
+def test_enforce_mode_fails_on_reachability_with_controls_verified(stub):
+    r = run(stub, reachable="egress-codex@127.0.0.1:22")
+    assert r.returncode == 1 and "probe controls verified" in r.stdout
+
+
+# ---- F-3 / F-6: configured targets must be real (host-side liveness, no payload) ---------------
+HOSTPY = '''
+import errno, os, socket
+def _create(addr, timeout=None, *a, **k):
+    key = f"{addr[0]}:{addr[1]}"
+    if key in os.environ.get("HOST_OPEN", "").split():
+        return socket.socket()
+    if key in os.environ.get("HOST_REFUSED", "").split():
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+    if key in os.environ.get("HOST_UNREACH", "").split():
+        raise OSError(errno.EHOSTUNREACH, "No route to host")
+    raise TimeoutError()                                         # a silent drop
+socket.create_connection = _create
+'''
+T22, T8000 = "100.107.22.84:22", "100.107.22.84:8000"
+
+
+def verify(stub, forbidden=f"{T22},{T8000}", rootful="172.17.0.2:9", addrs="100.107.22.84",
+           expect_rootless="1", **env_extra):
+    (stub / "hostpy").mkdir(exist_ok=True)
+    (stub / "hostpy" / "sitecustomize.py").write_text(HOSTPY)
+    env = {"PATH": f"{stub}/bin:{os.environ['PATH']}", "STUB_DIR": str(stub),
+           "PYTHONPATH": str(stub / "hostpy"), "STUB_HOST_ADDRS": addrs, "HOME": str(stub),
+           "EGRESS_FORBIDDEN_TARGETS": forbidden, "SMOKE_ROOTFUL_TARGETS": rootful,
+           "SMOKE_EXPECT_ROOTLESS": expect_rootless,
+           "HOST_REFUSED": f"{T22} {T8000} 172.17.0.2:9"}
+    env.update(env_extra)
+    return subprocess.run(["bash", str(CHECK), "--verify-targets"], capture_output=True, text=True,
+                          env=env, timeout=60)
+
+
+def test_live_targets_pass_whether_the_host_refuses_or_a_listener_answers(stub):
+    r = verify(stub)
+    assert r.returncode == 0, r.stderr
+    assert f"forbidden target {T22} is live from the host (REFUSED)" in r.stdout
+    r = verify(stub, HOST_OPEN=f"{T22} {T8000} 172.17.0.2:9", HOST_REFUSED="")
+    assert r.returncode == 0 and "(OPEN)" in r.stdout
+
+
+def test_a_typo_in_the_forbidden_address_is_rejected(stub):
+    """100.107.22.85 is not an address of this host: protection against it would test nothing."""
+    r = verify(stub, forbidden="100.107.22.85:22", HOST_REFUSED="100.107.22.85:22 172.17.0.2:9")
+    assert r.returncode == 1 and "is not an address of this host" in r.stderr
+
+
+def test_a_dropped_packet_is_not_accepted_as_a_live_target(stub):
+    r = verify(stub, HOST_REFUSED="172.17.0.2:9")               # 100.107.22.84:* silently times out
+    assert r.returncode == 1 and "is not live from the host (timed out)" in r.stderr
+
+
+def test_an_unreachable_target_is_not_accepted(stub):
+    r = verify(stub, HOST_REFUSED="172.17.0.2:9", HOST_UNREACH=f"{T22} {T8000}")
+    assert r.returncode == 1 and "EHOSTUNREACH" in r.stderr
+
+
+def test_a_stale_bridge_address_is_not_assumed_to_exist(stub):
+    """No 172.17.0.1 is baked in: a docker0 address that moved fails the liveness check."""
+    r = verify(stub, forbidden="172.17.0.1:22,100.107.22.84:22", addrs="100.107.22.84",
+               HOST_REFUSED=f"{T22} 172.17.0.2:9")
+    assert r.returncode == 1 and "172.17.0.1 is not an address of this host" in r.stderr
+    r = verify(stub, forbidden="172.17.0.1:22", addrs="172.17.0.1",
+               HOST_REFUSED="172.17.0.1:22 172.17.0.2:9")
+    assert r.returncode == 0
+
+
+def test_the_rootful_container_target_must_exist_and_be_live(stub):
+    r = verify(stub, rootful="", expect_rootless="1")
+    assert r.returncode == 1 and "no rootful container target configured" in r.stderr
+    r = verify(stub, rootful="")                                # without the production marker...
+    assert r.returncode == 1
+    r = verify(stub, rootful="", expect_rootless="0")           # ... a dev run may omit it
+    assert r.returncode == 0
+    r = verify(stub, rootful="172.17.0.9:9")                    # container IP drifted: times out
+    assert r.returncode == 1 and "rootful target 172.17.0.9:9 is not live from the host" in r.stderr
+
+
+@pytest.mark.parametrize("bad", ["172.17.0.2", "evil.example:80", "172.17.0.2:80;id",
+                                 "300.1.1.1:80", ":80", "172.17.0.2:"])
+def test_malformed_targets_are_rejected(stub, bad):
+    assert verify(stub, rootful=bad).returncode == 1
+    assert verify(stub, forbidden=bad).returncode == 1
+
+
+def test_empty_forbidden_list_is_rejected(stub):
+    r = verify(stub, forbidden="")
+    assert r.returncode == 1 and "EGRESS_FORBIDDEN_TARGETS is empty" in r.stderr
+
+
+def test_verify_mode_sends_no_application_payload():
+    text = CHECK.read_text()
+    block = text[text.index("host_connect()"):text.index("host_owns()")]
+    assert "create_connection" in block and ".close()" in block
+    for forbidden in ("send", "recv", "write", "GET ", "HEAD "):
+        assert forbidden not in block, forbidden
+
+
+# ---- IPv6 ---------------------------------------------------------------------------------------
+def test_ipv6_enabled_outbound_network_refuses_validation(stub):
+    cfg = json.loads(config_json())
+    cfg["networks"]["egress"] = {"enable_ipv6": True}
+    (stub / "config.json").write_text(json.dumps(cfg))
+    for mode in ("enforce", "report"):
+        r = run(stub, mode=mode)
+        assert r.returncode == 1 and "IPv6 is enabled on outbound network" in r.stderr

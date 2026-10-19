@@ -211,4 +211,47 @@ def test_smoke_test_only_sends_the_admin_token_to_the_composes_own_api():
     first_token_use = smoke.index('-H "X-Admin-Token:')
     assert guard_at < first_token_use                    # identity is proven before any token use
     assert '"${COMPOSE[@]}" port api 8000' in smoke
-    assert "(127\\.0\\.0\\.1|localhost)" in smoke           # never a remote URL
+    assert "^http://127\\.0\\.0\\.1:" in smoke and "localhost)" not in smoke   # literal IPv4 only
+
+
+# ---- L-f / N-11: nothing in the compose files may bypass the guard's interface matching ----------
+RSM_FILE = yaml.safe_load((ROOT / "compose.rsm.yaml").read_text())
+ALL_COMPOSE = {"compose.yaml": COMPOSE, "compose.rsm.yaml": RSM_FILE}
+
+
+def test_no_service_uses_host_or_foreign_network_modes():
+    """network_mode: host/none/container:/service: would put a container outside the bridges the
+    guard matches (br-*, docker0) - or in someone else's network namespace."""
+    for fname, doc in ALL_COMPOSE.items():
+        for name, svc in (doc.get("services") or {}).items():
+            assert "network_mode" not in svc, (fname, name, svc.get("network_mode"))
+            assert "pid" not in svc or svc["pid"] != "host", (fname, name)
+            assert not svc.get("ipc") == "host", (fname, name)
+
+
+def test_every_network_is_a_plain_docker_bridge_with_default_naming():
+    """A custom bridge name (com.docker.network.bridge.name), a non-bridge driver, an external
+    network or enabled IPv6 would route traffic around the guard's `-i br-+ / docker0` rules."""
+    for fname, doc in ALL_COMPOSE.items():
+        for net, cfg in (doc.get("networks") or {}).items():
+            cfg = cfg or {}
+            where = (fname, net)
+            assert cfg.get("driver", "bridge") == "bridge", where
+            assert not cfg.get("driver_opts"), where                  # incl. bridge.name
+            assert not cfg.get("external"), where
+            assert not cfg.get("enable_ipv6"), where
+            assert not cfg.get("ipam", {}).get("driver"), where
+            assert "name" not in cfg or cfg["name"].startswith("internship-hunter"), where
+    text = (ROOT / "compose.yaml").read_text() + (ROOT / "compose.rsm.yaml").read_text()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "com.docker.network.bridge.name" not in code
+    assert "network_mode" not in code
+
+
+def test_services_with_a_route_out_cannot_reconfigure_the_network():
+    for name in ("api", "discovery", "telegram", *PROXIES.values()):
+        svc = SERVICES[name]
+        assert not set(svc.get("cap_add", [])) & {"NET_ADMIN", "NET_RAW", "SYS_ADMIN"}, name
+        assert not svc.get("sysctls"), name
+        assert svc.get("cap_drop") == ["ALL"], name
+        assert not svc.get("devices"), name

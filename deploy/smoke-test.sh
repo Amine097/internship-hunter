@@ -19,10 +19,10 @@ COMPOSE=(docker compose "$@")
 # The admin token must only ever reach OUR api container. Never trust a port number alone
 # (the production host runs a rootful Gluetun on <tailscale ip>:8000): the URL must be loopback,
 # and compose itself must say that the api service publishes exactly that host:port.
-[[ "$API" =~ ^http://(127\.0\.0\.1|localhost):([0-9]{1,5})$ ]] \
-  || { echo "FAIL API_URL must be http://127.0.0.1:<port> (the admin token is sent to it)" >&2; exit 1; }
+[[ "$API" =~ ^http://127\.0\.0\.1:([0-9]{1,5})$ ]] \
+  || { echo "FAIL API_URL must be http://127.0.0.1:<port> - the literal IPv4 loopback, not 'localhost' (the admin token is sent to it)" >&2; exit 1; }
 api_published="$("${COMPOSE[@]}" port api 8000 2>/dev/null | tr -d '\r')"
-[[ "$api_published" == "127.0.0.1:${BASH_REMATCH[2]}" ]] \
+[[ "$api_published" == "127.0.0.1:${BASH_REMATCH[1]}" ]] \
   || { echo "FAIL compose says the api publishes '${api_published:-nothing}', not $API: refusing to send ADMIN_TOKEN" >&2; exit 1; }
 # host addresses that no container may reach (SMOKE_PROTECTED_IPS + this host's own addresses)
 mapfile -t PROTECTED_IPS < <("$HERE/check-host-isolation.sh" --list-ips)

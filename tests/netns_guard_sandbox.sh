@@ -43,6 +43,16 @@ ns "$U" ip addr add 10.0.2.2/24 dev up1; ns "$U" ip link set up1 up
 ns "$U" ip route add 172.30.0.0/24 via 10.0.2.100; ns "$U" ip route add 172.31.0.0/24 via 10.0.2.100
 ns "$D" sysctl -qw net.ipv4.ip_forward=1; ns "$U" sysctl -qw net.ipv4.ip_forward=1
 for a in 100.107.22.84 203.0.114.7 8.8.8.8 10.0.2.3; do ns "$U" ip addr add "$a/32" dev lo; done
+# IPv6: the production design gives containers NO IPv6 route; this topology deliberately gives one
+# (as if IPv6 were switched on) to prove the guard does not rely on that: fd7a::1 plays the host's
+# Tailscale IPv6 address, 2001:db8:8::8 the IPv6 Internet.
+ns "$D" sysctl -qw net.ipv6.conf.all.forwarding=1; ns "$U" sysctl -qw net.ipv6.conf.all.forwarding=1
+ns "$D" ip -6 addr add fd30::1/64 dev br-a1b2c3d4e5f6 nodad
+ns "$C" ip -6 addr add fd30::2/64 dev c0 nodad; ns "$C" ip -6 route add default via fd30::1 dev c0
+ns "$D" ip -6 addr add fd00:2::100/64 dev up0 nodad; ns "$D" ip -6 route add default via fd00:2::2 dev up0
+ns "$U" ip -6 addr add fd00:2::2/64 dev up1 nodad; ns "$U" ip -6 route add fd30::/64 via fd00:2::100
+for a in fd7a::1 2001:db8:8::8; do ns "$U" ip -6 addr add "$a/128" dev lo nodad; done
+sleep 1.5      # let the v6 addresses and routes settle
 # what Docker creates before our hook runs
 ns "$D" iptables -N DOCKER-USER; ns "$D" iptables -A DOCKER-USER -j RETURN
 ns "$D" iptables -A FORWARD -j DOCKER-USER
@@ -70,6 +80,20 @@ PY
 ns "$U" python3 "$WORK/listen.py" tcp:100.107.22.84:22 tcp:100.107.22.84:8000 tcp:203.0.114.7:22 \
    tcp:10.0.2.2:22 tcp:8.8.8.8:443 tcp:10.0.2.3:53 udp:10.0.2.3:53 & pids+=("$!")
 ns "$D" python3 "$WORK/listen.py" tcp:172.30.0.1:7000 & pids+=("$!")
+cat >"$WORK/listen6.py" <<'PY'
+import socket, sys, selectors
+sel = selectors.DefaultSelector()
+for spec in sys.argv[1:]:
+    ip, port = spec.rsplit(",", 1)
+    s = socket.socket(socket.AF_INET6)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((ip, int(port))); s.listen(16); sel.register(s, selectors.EVENT_READ)
+while True:
+    for key, _ in sel.select():
+        key.fileobj.accept()[0].close()
+PY
+ns "$U" python3 "$WORK/listen6.py" fd7a::1,22 2001:db8:8::8,443 & pids+=("$!")
+ns "$D" python3 "$WORK/listen6.py" fd30::1,7001 & pids+=("$!")
 ns "$C" python3 "$WORK/listen.py" tcp:172.30.0.2:9000 & pids+=("$!")
 ns "$C3" python3 "$WORK/listen.py" tcp:172.30.0.3:9100 & pids+=("$!")
 sleep 0.7
@@ -111,6 +135,9 @@ matrix() {
   echo "default_bridge_tailnet_ssh $(tcp_from "$C2" 100.107.22.84 22)"   # ad-hoc `docker run`
   echo "default_bridge_internet $(tcp_from "$C2" 8.8.8.8 443)"
   echo "service_starts_through_gate $(gate_starts)"
+  echo "ipv6_host_tailnet $(tcp_from "$C" fd7a::1 22)"           # IPv6, if a container had a route
+  echo "ipv6_internet $(tcp_from "$C" 2001:db8:8::8 443)"
+  echo "ipv6_daemon_namespace $(tcp_from "$C" fd30::1 7001)"     # INPUT, not FORWARD
 }
 
 mkdir -p "$WORK/xdg/dockerd-rootless"; echo "$D" >"$WORK/xdg/dockerd-rootless/child_pid"
@@ -151,6 +178,7 @@ tamper flush_chain yes - -- iptables -F $G
 tamper accept_inside_chain yes - -- iptables -I $G 1 -d 100.107.22.84/32 -j ACCEPT
 tamper edit_input_chain yes - -- iptables -D $G-IN -j REJECT --reject-with icmp-admin-prohibited
 tamper flush_ipv6_chain yes - -- ip6tables -F ${G}6
+tamper flush_ipv6_input_chain yes - -- ip6tables -F ${G}6-IN
 tamper remove_input_jump yes - -- iptables -D INPUT -i br-+ -j $G-IN
 tamper docker_jump_displaced no "iptables -D FORWARD 1" -- iptables -I FORWARD 1 -j ACCEPT
 echo "final_status $("$GUARD" status >/dev/null 2>&1 && echo ok || echo bad)"

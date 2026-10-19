@@ -21,13 +21,35 @@ pytestmark = pytest.mark.skipif(os.name != "posix", reason="shell scripts")
 
 NC = textwrap.dedent("""\
     #!/bin/sh
-    while [ "${1#-}" != "$1" ]; do [ "$1" = -w ] && shift; shift; done
+    # models Alpine busybox `nc` (-vv -z -w N host port | -l -p PORT); damage via STUB_NC_*
+    case " $* " in *" -l "*) sleep 0.2; exit 0 ;; esac
+    v=0
+    while [ "${1#-}" != "$1" ]; do
+      case "$1" in -w) shift ;; -v|-vv) v=1 ;; esac
+      shift
+    done
     t="$1:$2"
+    [ -z "${STUB_NC_BROKEN:-}" ] || exit 1                          # silent, always fails
+    if [ -n "${STUB_NC_NO_VV:-}" ] && [ "$v" = 1 ]; then
+      echo "nc: invalid option -- 'v'"; echo "Usage: nc [OPTIONS] HOST PORT"; exit 1
+    fi
+    case "$t" in
+      127.0.0.1:3128) echo "$1 ($t) open"; exit 0 ;;
+      127.0.0.1:1)
+        [ -z "${STUB_NC_SILENT_REFUSAL:-}" ] || exit 1
+        [ -z "${STUB_NC_LOCALISED:-}" ] || { echo "nc: $t: Connexion refusee"; exit 1; }
+        echo "nc: 127.0.0.1 ($t): Connection refused"; exit 1 ;;
+    esac
     for r in ${STUB_REACHABLE:-}; do [ "$r" = "$t" ] && { echo "$1 ($t) open"; exit 0; }; done
     for r in ${STUB_REFUSED:-}; do
-      [ "$r" = "$t" ] && { echo "nc: $t: Connection refused"; exit 1; }
+      [ "$r" = "$t" ] && { echo "nc: $1 ($t): Connection refused"; exit 1; }
     done
-    echo "nc: $t: Host is unreachable"; exit 1
+    for r in ${STUB_ODD:-}; do [ "$r" = "$t" ] && { echo "nc: banner grabbed"; exit 1; }; done
+    for r in ${STUB_SILENT:-}; do [ "$r" = "$t" ] && exit 1; done
+    for r in ${STUB_TIMEOUT:-}; do
+      [ "$r" = "$t" ] && { echo "nc: $1 ($t): Operation timed out"; exit 1; }
+    done
+    echo "nc: $1 ($t): Host is unreachable"; exit 1
 """)
 SITECUSTOMIZE = textwrap.dedent("""\
     import errno, os, socket
@@ -194,3 +216,103 @@ def test_images_ship_the_gate_scripts_executable():
 def test_services_without_a_route_out_do_not_carry_the_gate():
     for svc in ("postgres", "migrate", "scheduler", "session-controller", "agent-codex"):
         assert "entrypoint" not in COMPOSE[svc], svc
+
+
+# ---- F-2: the proxy start check and healthcheck FAIL CLOSED -----------------------------------
+HEALTH = ROOT / "docker" / "egress-healthcheck.sh"
+T = "100.107.22.84:22,100.107.22.84:8000"
+
+
+def run_check(stub, targets=T, path=None, **extra):
+    env = env_for(stub, **extra)
+    if path is not None:
+        env["PATH"] = path
+    env["EGRESS_FORBIDDEN_TARGETS"] = targets
+    return subprocess.run(["/bin/sh", str(CHECK)], capture_output=True, text=True, env=env,
+                          timeout=30)
+
+
+def run_health(stub, targets=T, path=None, **extra):
+    env = env_for(stub, **extra)
+    if path is not None:
+        env["PATH"] = path
+    env["EGRESS_FORBIDDEN_TARGETS"] = targets
+    return subprocess.run(["/bin/sh", str(HEALTH)], capture_output=True, text=True, env=env,
+                          timeout=30)
+
+
+def test_check_passes_only_on_recognised_isolation_errors(stub):
+    assert run_check(stub).returncode == 0                       # "Host is unreachable"
+    assert run_check(stub, STUB_TIMEOUT="100.107.22.84:22").returncode == 0
+    assert run_health(stub).returncode == 0
+
+
+@pytest.mark.parametrize("damage,msg", [
+    ({"STUB_REACHABLE": "100.107.22.84:8000"}, "is reachable"),
+    ({"STUB_REFUSED": "100.107.22.84:22"}, "connection refused"),
+    ({"STUB_ODD": "100.107.22.84:22"}, "unrecognised result"),        # unexpected stderr
+    ({"STUB_SILENT": "100.107.22.84:22"}, "unrecognised result"),     # NO text at all: not fine
+])
+def test_check_and_healthcheck_reject_everything_but_isolation(stub, damage, msg):
+    for runner in (run_check, run_health):
+        r = runner(stub, **damage)
+        assert r.returncode == 1 and msg in r.stderr, (runner.__name__, r.stderr)
+
+
+def test_missing_nc_fails_closed_for_start_check_healthcheck_and_proxy(stub):
+    empty = stub / "empty"
+    empty.mkdir()
+    r = run_check(stub, path=str(empty))
+    assert r.returncode == 1 and "nc is missing" in r.stderr
+    assert run_health(stub, path=str(empty)).returncode == 1
+    env = env_for(stub, EGRESS_ALLOW="api.openai.com", EGRESS_FORBIDDEN_TARGETS=T)
+    env["PATH"] = str(empty)
+    (stub / "started").unlink(missing_ok=True)
+    r = subprocess.run(["/bin/sh", str(PROXY)], capture_output=True, text=True, env=env, timeout=30)
+    assert r.returncode == 1 and not (stub / "started").exists()
+
+
+def test_broken_nc_that_always_fails_cannot_prove_isolation(stub):
+    """The reproduced fail-open: nc fails everything, so every target 'looks blocked'."""
+    for runner in (run_check, run_health):
+        r = runner(stub, STUB_NC_BROKEN="1")
+        assert r.returncode == 1, runner.__name__
+    r = start_proxy(stub, EGRESS_FORBIDDEN_TARGETS=T, STUB_NC_BROKEN="1")
+    assert r.returncode == 1 and not (stub / "started").exists()
+    assert "self-test" in run_check(stub, STUB_NC_BROKEN="1").stderr
+
+
+def test_nc_that_does_not_support_the_options_fails_closed(stub):
+    r = run_check(stub, STUB_NC_NO_VV="1")
+    assert r.returncode == 1 and "self-test" in r.stderr
+    assert run_health(stub, STUB_NC_NO_VV="1").returncode == 1
+    r = start_proxy(stub, EGRESS_FORBIDDEN_TARGETS=T, STUB_NC_NO_VV="1")
+    assert r.returncode == 1 and not (stub / "started").exists()
+
+
+def test_nc_that_is_silent_on_a_refusal_fails_the_self_test(stub):
+    """busybox `nc -z` without -vv: a refusal and a block look identical - refuse to guess."""
+    r = run_check(stub, STUB_NC_SILENT_REFUSAL="1")
+    assert r.returncode == 1 and "does not report 'Connection refused'" in r.stderr
+
+
+def test_localised_messages_are_not_recognised_so_the_script_pins_the_c_locale(stub):
+    text = CHECK.read_text()
+    assert "LC_ALL=C" in text and "export LC_ALL" in text
+    r = run_check(stub, STUB_NC_LOCALISED="1")                   # a French nc under another locale
+    assert r.returncode == 1
+
+
+def test_malformed_targets_fail_the_check(stub):
+    for bad in ("100.107.22.84", "x:22", "100.107.22.84:22;id", "100.107.22.84:", "a:b:1"):
+        assert run_check(stub, targets=bad).returncode == 1, bad
+
+
+def test_empty_list_still_means_development_and_passes_without_nc(stub):
+    empty = stub / "empty2"
+    empty.mkdir()
+    env = env_for(stub)
+    env["PATH"] = str(empty)
+    env.pop("EGRESS_FORBIDDEN_TARGETS", None)
+    r = subprocess.run(["/bin/sh", str(CHECK)], capture_output=True, text=True, env=env, timeout=30)
+    assert r.returncode == 0

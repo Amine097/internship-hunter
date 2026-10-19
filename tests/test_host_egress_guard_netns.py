@@ -102,6 +102,18 @@ def test_guard_is_idempotent_and_status_reports_it(stages):
     assert int(reapply[1]) < 40                  # the chain was rebuilt, not appended to
 
 
+def test_ipv6_is_actually_filtered_not_assumed_from_ipv4_tests(stages):
+    """Real IPv6 packets. The production design gives containers no IPv6 route; this topology gives
+    one anyway. Without the guard the host's IPv6 tailnet address, the IPv6 Internet and the daemon
+    namespace are all reachable; with it every NEW IPv6 connection from a Docker bridge is rejected
+    (FORWARD and INPUT). IPv6 is therefore never an unfiltered path - and the check script refuses
+    to validate when a container has an IPv6 default route at all."""
+    for label in ("ipv6_host_tailnet", "ipv6_internet", "ipv6_daemon_namespace"):
+        assert stages["before"][label] == "REACHABLE", label
+        assert stages["guarded"][label] == "blocked", label
+        assert stages["removed"][label] == "REACHABLE", label
+
+
 def test_start_gate_stops_a_service_started_before_the_guard_and_lets_it_run_after(stages):
     """R7: restart-policy window. Unguarded the gate makes the container exit; guarded it runs."""
     assert stages["before"]["service_starts_through_gate"] == "blocked"
@@ -110,7 +122,8 @@ def test_start_gate_stops_a_service_started_before_the_guard_and_lets_it_run_aft
 
 
 TAMPERS = ["delete_cgnat_reject", "accept_before_jumps", "remove_docker0_jump", "flush_chain",
-           "accept_inside_chain", "edit_input_chain", "flush_ipv6_chain", "remove_input_jump"]
+           "accept_inside_chain", "edit_input_chain", "flush_ipv6_chain", "flush_ipv6_input_chain",
+           "remove_input_jump"]
 
 
 def test_status_is_ok_with_the_persisted_parameters_alone(stages):
