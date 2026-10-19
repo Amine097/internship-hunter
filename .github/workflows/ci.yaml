@@ -83,9 +83,11 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: |
-          docker run --rm -v "$PWD/deploy:/mnt:ro" koalaman/shellcheck:v0.10.0 -x \
+          docker run --rm -v "$PWD/deploy:/mnt:ro" -v "$PWD/docker:/mnt-docker:ro" \
+            koalaman/shellcheck:v0.10.0 -x \
             /mnt/remote-deploy.sh /mnt/smoke-test.sh /mnt/verify-restore.sh /mnt/make-bundle.sh \
-            /mnt/build-artifacts.sh /mnt/sign-bundle.sh
+            /mnt/build-artifacts.sh /mnt/sign-bundle.sh /mnt/check-host-isolation.sh \
+            /mnt/host-egress-guard.sh /mnt-docker/egress-proxy.sh /mnt-docker/egress-healthcheck.sh
 
   dependency-audit:
     runs-on: ubuntu-latest

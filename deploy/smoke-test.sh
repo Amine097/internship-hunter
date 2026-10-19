@@ -4,15 +4,20 @@
 # SMOKE_EXTERNAL=0 skips the checks that need real Internet access (allowed-host CONNECT).
 # SMOKE_EXPECT_ROOTLESS=1 additionally asserts the Docker daemon is rootless (production host).
 # SMOKE_HOST_ISOLATION=enforce (default) | report
-#   The proxy->host-gateway probe depends on the HOST, not on this repository: on a rootful
-#   Docker host any container can reach services the host listens on at the bridge gateway
-#   (e.g. sshd on 0.0.0.0, as on GitHub-hosted runners). CI therefore runs "report" and prints
-#   what is reachable; the production smoke test MUST run "enforce" (docs/deployment.md).
+#   Whether containers with a route out can dial the HOST (its Tailscale IP, its other
+#   addresses, the bridge gateway) depends on the HOST, not on this repository: rootless
+#   Docker's user-space NAT, or sshd on 0.0.0.0 on a rootful runner, make them reachable. CI
+#   therefore runs "report" and prints what is reachable; the production smoke test MUST run
+#   "enforce" with SMOKE_PROTECTED_IPS=<tailscale ip> (docs/deployment.md, "Host isolation").
+#   The checks live in deploy/check-host-isolation.sh (see its header for all knobs).
 set -Eeuo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${ADMIN_TOKEN:?set ADMIN_TOKEN}"
 API="${API_URL:-http://127.0.0.1:8000}"
 EXTERNAL="${SMOKE_EXTERNAL:-1}"
 COMPOSE=(docker compose "$@")
+# host addresses that no container may reach (SMOKE_PROTECTED_IPS + this host's own addresses)
+mapfile -t PROTECTED_IPS < <("$HERE/check-host-isolation.sh" --list-ips)
 ok() { echo "ok   $*"; }
 fail() { echo "FAIL $*" >&2; exit 1; }
 api() { curl -fsS -H "X-Admin-Token: $ADMIN_TOKEN" "$@"; }
@@ -118,11 +123,13 @@ except OSError:
     print("blocked")
 PY
 }
+host_ports=()
+for ip in "${PROTECTED_IPS[@]}"; do host_ports+=("$ip:22" "$ip:8000"); done
 for target in postgres:5432 agent-claude-1:8100 api:8000 discovery:8100 egress-claude-1:3128 \
-              1.1.1.1:443 8.8.8.8:53 169.254.169.254:80; do
+              1.1.1.1:443 8.8.8.8:53 169.254.169.254:80 "${host_ports[@]}"; do
   [[ "$(reach agent-codex "$target")" == blocked ]] || fail "agent-codex can reach $target"
 done
-ok "agent cannot reach postgres / peers / api / orchestrator / other proxies / the Internet directly"
+ok "agent cannot reach postgres / peers / api / orchestrator / other proxies / the host / the Internet directly"
 [[ "$(reach agent-codex egress-codex:3128)" == REACHABLE ]] || fail "agent cannot reach its own proxy"
 ok "agent reaches only its own egress proxy"
 
@@ -168,6 +175,15 @@ except Exception:
 PY
 }
 denied() { [[ "$1" != 200 ]] && return 0 || return 1; }
+# the proxy must also refuse CONNECT to the real host addresses (hostname filtering; the
+# network-level proof that the host is unreachable is deploy/check-host-isolation.sh below)
+host_targets=()
+for ip in "${PROTECTED_IPS[@]}"; do host_targets+=("$ip 22" "$ip 8000" "$ip 443"); done
+for t in "${host_targets[@]}"; do
+  read -r host port <<<"$t"
+  denied "$(connect agent-claude-1 egress-claude-1 "$host" "$port")" || fail "claude-1 proxy allowed CONNECT to host $host:$port"
+  denied "$(connect agent-codex egress-codex "$host" "$port")" || fail "codex proxy allowed CONNECT to host $host:$port"
+done
 for t in "example.com 443" "1.1.1.1 443" "169.254.169.254 443" "10.0.0.1 443" "host.docker.internal 443" \
          "100.64.0.1 443" "100.100.100.100 443" "192.168.0.1 443" "172.16.0.1 443" \
          "127.0.0.1 443" "localhost 443" \
@@ -210,28 +226,10 @@ if [[ "${SMOKE_EXPECT_ROOTLESS:-0}" == 1 ]]; then
   ok "Docker daemon is rootless"
 fi
 ok "no container mounts the Docker socket or runs privileged"
-# (2) the only container with an outbound route cannot reach host-side services
-HOST_ISOLATION="${SMOKE_HOST_ISOLATION:-enforce}"
-[[ "$HOST_ISOLATION" == enforce || "$HOST_ISOLATION" == report ]] \
-  || fail "SMOKE_HOST_ISOLATION must be enforce or report"
-gw="$(exec_in egress-codex sh -c "ip route | awk '/default/ {print \$3; exit}'" | tr -d '\r')"
-if [[ -n "$gw" ]]; then
-  reachable=""
-  for port in 22 2375 2376 5432 8000; do
-    if exec_in egress-codex nc -z -w 3 "$gw" "$port" >/dev/null 2>&1; then
-      reachable="$reachable $port"
-    fi
-  done
-  if [[ -z "$reachable" ]]; then
-    ok "egress proxy cannot reach its gateway/host ($gw) on ssh, docker API, postgres or API port"
-  elif [[ "$HOST_ISOLATION" == enforce ]]; then
-    fail "egress proxy container can reach host/gateway $gw on port(s):$reachable"
-  else
-    echo "WARN host-isolation (report mode): proxy container reaches $gw on port(s):$reachable" \
-         "- host services are exposed to containers on this Docker host; NOT acceptable in" \
-         "production (needs rootless Docker + sshd bound to the tailnet interface)"
-  fi
-fi
+# (2) no container with a route out (the three egress proxies, discovery, telegram, api) can
+# dial the host: Tailscale IP, other host addresses, canaries, bridge gateway. This is the
+# NETWORK boundary; the CONNECT checks above only test the proxy's hostname filter.
+"$HERE/check-host-isolation.sh" "$@"
 # (3) no listening port other than the published loopback API on the host side
 published="$("${COMPOSE[@]}" ps --format '{{.Publishers}}' | grep -v '^\[\]$' | grep -v '^$' || true)"
 if grep -E '0\.0\.0\.0|::' <<<"$published" | grep -vq '^$'; then

@@ -3,8 +3,14 @@ name: internship-hunter
 # Trust boundaries (see docs/security-architecture.md)
 #   data           (internal)  postgres, migrate, api, discovery, scheduler, telegram
 #   edge                       api (published on 127.0.0.1 only)
-#   egress                     discovery (ATS boards), telegram (Telegram API), egress proxies
+#   egress                     discovery (ATS boards), telegram (Telegram API)
+#   egress_<name>              exactly ONE egress proxy each: proxies cannot see each other
 #   agent_<name>   (internal)  exactly one untrusted agent, its egress proxy, the orchestrator
+# Every non-internal network (edge, egress, egress_<name>) has a route out. On rootless Docker
+# that route ends in the daemon's user-space NAT, which can dial any address the HOST can,
+# including its Tailscale IP. Hostname filtering in the proxy is not a network boundary; the
+# host-level guard is (deploy/host-egress-guard.sh, docs/deployment.md "Host isolation"), and
+# EGRESS_FORBIDDEN_TARGETS makes the proxies report when it is missing.
 # The work queue lives in PostgreSQL (no Redis). Agent containers have NO database access,
 # NO admin/Telegram secrets, cannot reach each other, and have NO route to anything except
 # their own allow-listing egress proxy: the agent networks are internal, so ignoring
@@ -189,27 +195,35 @@ services:
       dockerfile: docker/egress-proxy.Dockerfile
     environment:
       EGRESS_ALLOW: ${EGRESS_ALLOW_ANTHROPIC:-api.anthropic.com,console.anthropic.com,claude.ai,statsig.anthropic.com}
-    networks: [egress, agent_claude_1]
+      EGRESS_FORBIDDEN_TARGETS: ${EGRESS_FORBIDDEN_TARGETS:-}
+    networks: [egress_claude_1, agent_claude_1]
     mem_limit: 64m
     cpus: 0.25
+    # Listening AND (when EGRESS_FORBIDDEN_TARGETS is set) unable to reach any host address
+    # listed there: a proxy that can reach the host is "unhealthy", so agents do not start
+    # and `up --wait` (the deploy) fails closed. Detection, not prevention: see the guard.
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 3128"]
+      test: ["CMD-SHELL", "/usr/local/bin/egress-healthcheck.sh"]
       interval: 10s
-      timeout: 3s
+      timeout: 15s
       retries: 5
   egress-claude-2:
     <<: *egress
-    networks: [egress, agent_claude_2]
+    networks: [egress_claude_2, agent_claude_2]
   egress-codex:
     <<: *egress
     environment:
       EGRESS_ALLOW: ${EGRESS_ALLOW_OPENAI:-api.openai.com,auth.openai.com,chatgpt.com}
-    networks: [egress, agent_codex]
+      EGRESS_FORBIDDEN_TARGETS: ${EGRESS_FORBIDDEN_TARGETS:-}
+    networks: [egress_codex, agent_codex]
 
 networks:
   data: {internal: true}
   edge: {}
-  egress: {}
+  egress: {}                          # discovery, telegram
+  egress_claude_1: {}                 # one network per proxy: they cannot reach each other
+  egress_claude_2: {}
+  egress_codex: {}
   agent_claude_1: {internal: true}   # no route out: only the egress proxy is reachable
   agent_claude_2: {internal: true}
   agent_codex: {internal: true}

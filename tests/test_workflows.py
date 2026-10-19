@@ -131,7 +131,9 @@ def test_ci_smoke_reports_but_deploy_gate_enforces_host_isolation():
     ci = (WF / "ci.yaml").read_text()
     assert "SMOKE_HOST_ISOLATION: report" in ci            # explicit, never implicit
     smoke = (WF.parents[1] / "deploy" / "smoke-test.sh").read_text()
-    assert 'SMOKE_HOST_ISOLATION:-enforce' in smoke        # strict unless told otherwise
+    check = (WF.parents[1] / "deploy" / "check-host-isolation.sh").read_text()
+    assert 'SMOKE_HOST_ISOLATION:-enforce' in check        # strict unless told otherwise
+    assert 'check-host-isolation.sh" "$@"' in smoke        # and the smoke test cannot skip it
     assert "SMOKE_HOST_ISOLATION" not in (WF / "deploy.yaml").read_text()
     doc = (WF.parents[1] / "docs" / "deployment.md").read_text()
     assert "enforce" in doc and "SMOKE_EXPECT_ROOTLESS=1" in doc

@@ -40,7 +40,9 @@ def test_each_agent_network_holds_exactly_agent_proxy_and_orchestrator():
 def test_egress_proxies_are_the_only_agent_path_out_and_are_allowlisted():
     for agent, proxy in PROXIES.items():
         svc = SERVICES[proxy]
-        assert "egress" in svc["networks"] and SERVICES[agent]["networks"][0] in svc["networks"]
+        out_nets = [n for n in svc["networks"] if not COMPOSE["networks"][n].get("internal")]
+        assert len(out_nets) == 1 and out_nets[0].startswith("egress_"), proxy
+        assert SERVICES[agent]["networks"][0] in svc["networks"]
         allow = svc["environment"]["EGRESS_ALLOW"]
         assert "*" not in allow and "${" in allow  # explicit hostnames with env override
     assert COMPOSE["networks"]["egress"].get("internal") is not True
@@ -140,3 +142,49 @@ def test_session_controller_has_database_only_and_no_agent_or_egress_reach():
 def test_broker_is_disabled_unless_the_override_is_used():
     assert SERVICES["session-controller"]["environment"]["RSM_ENABLED"] == "false"
     assert RSM["session-controller"]["environment"]["RSM_ENABLED"] == "true"
+
+
+OUTBOUND_NETS = [n for n, cfg in COMPOSE["networks"].items() if not (cfg or {}).get("internal")]
+
+
+def test_the_set_of_networks_with_a_route_out_is_explicit():
+    """Every one of these is a way to dial the host unless deploy/host-egress-guard.sh is active;
+    adding one must be a conscious decision that also updates docs/deployment.md."""
+    assert set(OUTBOUND_NETS) == {"edge", "egress", "egress_claude_1", "egress_claude_2",
+                                  "egress_codex"}
+    guard = (ROOT / "deploy" / "host-egress-guard.sh").read_text()
+    assert 'BRIDGES=("br-+" "docker0")' in guard     # Docker's naming; covers all of the above
+
+
+def test_only_known_services_have_a_route_out():
+    """A new service on a non-internal network is a new way to dial the host: make it explicit."""
+    out = {n: sorted(s for s, v in SERVICES.items() if set(v.get("networks", [])) & {n})
+           for n in OUTBOUND_NETS}
+    assert out == {"edge": ["api"], "egress": ["discovery", "telegram"],
+                   "egress_claude_1": ["egress-claude-1"], "egress_claude_2": ["egress-claude-2"],
+                   "egress_codex": ["egress-codex"]}
+    for agent in AGENTS:
+        assert not set(SERVICES[agent]["networks"]) & set(OUTBOUND_NETS), agent
+
+
+def test_proxies_do_not_share_a_network_with_each_other_or_with_trusted_services():
+    """A compromised proxy must not be able to use another proxy's allow-list or reach discovery
+    (discovery legitimately shares each AGENT network with an agent and its proxy)."""
+    own = {p: set(SERVICES[p]["networks"]) & set(OUTBOUND_NETS) for p in PROXIES.values()}
+    for a in own:
+        assert len(own[a]) == 1
+        for other, svc in SERVICES.items():
+            if other != a:
+                assert not own[a] & set(svc.get("networks", [])), (a, other)
+        assert not set(SERVICES[a]["networks"]) & {"data", "edge", "egress"}, a
+
+
+def test_proxy_healthcheck_detects_a_reachable_host_and_the_target_list_is_passed_through():
+    dockerfile = (ROOT / "docker" / "egress-proxy.Dockerfile").read_text()
+    assert "egress-healthcheck.sh" in dockerfile
+    for proxy in PROXIES.values():
+        svc = SERVICES[proxy]
+        assert svc["healthcheck"]["test"] == ["CMD-SHELL", "/usr/local/bin/egress-healthcheck.sh"]
+        assert svc["environment"]["EGRESS_FORBIDDEN_TARGETS"] == "${EGRESS_FORBIDDEN_TARGETS:-}"
+    for agent, proxy in PROXIES.items():     # agents wait for a healthy (i.e. isolated) proxy
+        assert SERVICES[agent]["depends_on"][proxy] == {"condition": "service_healthy"}

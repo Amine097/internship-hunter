@@ -99,6 +99,9 @@ gitleaks, shellcheck, hadolint, image builds, and a real-daemon compose smoke/is
 (`deploy/smoke-test.sh`). No secrets or
 paid model calls. Deployment is a separate **manual** workflow over Tailscale; see
 `docs/deployment.md` and `docs/acceptance-checklist.md`. Never expose SSH to the Internet.
+On a rootless-Docker host the containers with a route out can dial the host itself unless the
+operator-applied host guard is active (`docs/deployment.md`, "Host isolation"); the smoke test
+must pass in `enforce` mode there before deployment is enabled.
 
 ### Create your private GitHub repository
 

@@ -82,15 +82,23 @@ revision; **S** = must be done on the real server. Nothing marked S has been don
 - [ ] **S** provider hostname lists confirmed against the pinned CLI versions (UNVERIFIED);
       behaviour under rootless Docker (slirp4netns/pasta)
 
-## Rootless-host isolation (run `SMOKE_EXPECT_ROOTLESS=1 deploy/smoke-test.sh` on the server)
-Derived checks (also run in CI against the Docker runner, without the rootless assertion):
+## Rootless-host isolation (run `SMOKE_EXPECT_ROOTLESS=1 SMOKE_PROTECTED_IPS=<tailscale ip> deploy/smoke-test.sh` on the server)
+Derived checks (also run in CI against the Docker runner, in report mode, without the rootless assertion):
 - [x] **L** no container mounts the Docker socket or runs privileged; daemon is rootless (**S**)
-- [x] **L** (Docker Desktop VM) the egress proxy cannot reach its gateway/host on ssh, the
-      Docker API, postgres or the API port. **GitHub runner (rootful, sshd on 0.0.0.0): it CAN
-      reach `172.19.0.1:22`** — host-dependent, so CI reports it and the server must enforce it
+- [x] **L** `deploy/check-host-isolation.sh` logic (stubbed containers): every proxy, discovery,
+      telegram and api probed against every host address on 22/8000/2375/2376/5432, a canary
+      listener and the gateway; fails closed on missing target, failed probe, no gateway, IPv6 route
+- [x] **L** host guard against real iptables and real packets in throwaway namespaces
+      (`tests/test_host_egress_guard_netns.py`): tailnet/host/gateway blocked, Internet + DNS +
+      same-bridge + docker-proxy traffic kept, idempotent, `remove` restores exactly
+- [x] **L** real `egress-proxy.sh` CONNECT to an allow-listed public name keeps working with the guard
 - [x] **L** only loopback-published ports; proxy refuses tailnet (100.64/10, 100.100.100.100),
       RFC1918, link-local, loopback literals and `localhost`
-- [ ] **S** the same three, on the rootless production host, plus Tailscale ACL review
+- [ ] **S** host guard applied + persisted; `EGRESS_FORBIDDEN_TARGETS` set; validation V1-V7 of
+      `docs/deployment.md` ("Host isolation") including the negative control
+- [ ] **S** smoke test passes in **enforce** mode on the rootless production host
+- [ ] **S** (GitHub runner, rootful, sshd on 0.0.0.0) the proxies CAN reach the runner's address:
+      CI reports it, the server must not
 
 ## Server (demo mode) — all **S**
 - [ ] `ss -tlnp`: only the API on loopback; Telegram from owner works, others get no reply
