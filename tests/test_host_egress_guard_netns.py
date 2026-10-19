@@ -9,6 +9,7 @@ missing, unless GUARD_NETNS_REQUIRED=1 (CI), where a skip would hide a broken gu
 """
 import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
@@ -48,14 +49,23 @@ def stages():
         if REQUIRED:
             pytest.fail(f"GUARD_NETNS_REQUIRED=1 but the sandbox cannot run: {why}")
         pytest.skip(why)
+    # own session: whatever the script leaves behind (listeners inside the namespaces hold the
+    # stdout pipe open) is killed with the group, so the harness always sees EOF
+    proc = subprocess.Popen(["bash", str(SANDBOX)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=_env(), start_new_session=True)
     try:
-        run = subprocess.run(["bash", str(SANDBOX)], capture_output=True, text=True, env=_env(),
-                             timeout=240)
-    except subprocess.TimeoutExpired as e:
-        def text(b):
-            return b.decode(errors="replace") if isinstance(b, bytes) else (b or "")
-        pytest.fail("sandbox timed out after 240s\n--- stdout (tail)\n" + text(e.stdout)[-3000:]
-                    + "\n--- stderr (tail)\n" + text(e.stderr)[-3000:])
+        stdout, stderr = proc.communicate(timeout=240)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        stdout, stderr = proc.communicate()
+        pytest.fail("sandbox timed out after 240s\n--- stdout (tail)\n" + stdout[-3000:]
+                    + "\n--- stderr (tail)\n" + stderr[-3000:])
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    run = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
     assert run.returncode == 0, run.stdout + run.stderr
     out, stage = {}, None
     for line in run.stdout.splitlines():

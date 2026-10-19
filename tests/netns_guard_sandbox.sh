@@ -13,7 +13,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARD="${GUARD:-$HERE/../deploy/host-egress-guard.sh}"
 WORK="$(mktemp -d)"
 pids=()
-cleanup() { kill "${pids[@]}" 2>/dev/null || true; rm -rf "$WORK"; }
+kill_tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null || true); do kill_tree "$c"; done; kill "$1" 2>/dev/null || true; }
+cleanup() { local p; for p in "${pids[@]}"; do kill_tree "$p"; done; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 ns() { local pid="$1"; shift; nsenter --preserve-credentials -U -n -t "$pid" -- "$@"; }

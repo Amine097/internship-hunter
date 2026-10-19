@@ -151,7 +151,11 @@ if [[ ${#host_leaks[@]} -gt 0 ]]; then
     *) fail "agent-codex can reach host address(es): ${host_leaks[*]}" ;;
   esac
 fi
-ok "agent cannot reach postgres / peers / api / orchestrator / other proxies / the host / the Internet directly"
+if [[ ${#host_leaks[@]} -eq 0 ]]; then
+  ok "agent cannot reach postgres / peers / api / orchestrator / other proxies / the host / the Internet directly"
+else
+  ok "agent cannot reach postgres / peers / api / orchestrator / other proxies / the Internet directly (host: see WARN)"
+fi
 [[ "$(reach agent-codex egress-codex:3128)" == REACHABLE ]] || fail "agent cannot reach its own proxy"
 ok "agent reaches only its own egress proxy"
 

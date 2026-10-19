@@ -229,8 +229,16 @@ CANARY_FILE="$(mktemp)"; CANARY_PID=""
 cleanup() { [[ -z "$CANARY_PID" ]] || kill "$CANARY_PID" 2>/dev/null || true; rm -f "$CANARY_FILE"; }
 trap cleanup EXIT
 CANARIES=()
-if [[ ${#IPS[@]} -gt 0 ]]; then
-  python3 - "$CANARY_FILE" "${IPS[@]}" <<'PY' &
+# A canary can only be bound on an address THIS host owns. The host's default gateway is protected
+# and probed like the others but belongs to the router: it gets no canary. An address the operator
+# listed explicitly (SMOKE_PROTECTED_IPS) that the host does not own is a configuration error.
+EXPLICIT=" $(tr ',' ' ' <<<"${SMOKE_PROTECTED_IPS:-}") "
+CANARY_IPS=()
+for ip in "${IPS[@]}"; do
+  if host_owns "$ip" || [[ "$EXPLICIT" == *" $ip "* ]]; then CANARY_IPS+=("$ip"); fi
+done
+if [[ ${#CANARY_IPS[@]} -gt 0 ]]; then
+  python3 - "$CANARY_FILE" "${CANARY_IPS[@]}" <<'PY' &
 import os, selectors, socket, sys
 out, ips = sys.argv[1], sys.argv[2:]
 socks, lines = [], []

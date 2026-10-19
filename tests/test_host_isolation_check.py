@@ -648,3 +648,15 @@ def test_ipv6_enabled_outbound_network_refuses_validation(stub):
     for mode in ("enforce", "report"):
         r = run(stub, mode=mode)
         assert r.returncode == 1 and "IPv6 is enabled on outbound network" in r.stderr
+
+
+def test_autodetected_default_gateway_is_probed_but_gets_no_canary(stub):
+    """First real CI run: the runner's gateway (10.1.0.1) is protected but belongs to the router -
+    a canary cannot be bound there, which must not fail the check."""
+    r = run(stub, ips="", addrs="127.0.0.1", extra={"STUB_HOST_GATEWAYS": "203.0.113.1"})
+    assert r.returncode == 0, r.stderr
+    targets = (stub / "targets").read_text()
+    assert "203.0.113.1:22" in targets and "203.0.113.1:8000" in targets
+    r = run(stub, ips="", addrs="127.0.0.1",
+            extra={"STUB_HOST_GATEWAYS": "203.0.113.1", "STUB_REACHABLE": "api@203.0.113.1:8000"})
+    assert r.returncode == 1 and "api reaches 203.0.113.1:8000" in r.stderr
