@@ -138,7 +138,9 @@ detect_dns() {
   awk '$1 == "nameserver" {print $2}' "$PROC/$PID/root/etc/resolv.conf" 2>/dev/null || true
 }
 mapfile -t DNS < <(detect_dns | awk 'NF && $0 !~ /^127\./ && $0 !~ /:/')
-for d in "${DNS[@]}"; do cidr_ok "$d" && [[ "$d" != */* ]] || die "invalid DNS address: $d"; done
+for d in "${DNS[@]}"; do
+  if ! cidr_ok "$d" || [[ "$d" == */* ]]; then die "invalid DNS address: $d"; fi
+done
 [[ ${#DNS[@]} -gt 0 || "$cmd" == remove ]] \
   || die "no usable DNS resolver found in the daemon namespace: pass --dns <ip> (see docs/deployment.md)"
 
@@ -242,15 +244,18 @@ need_ip6tables() {
 
 # ---- full-policy verification ---------------------------------------------------------------
 PROBLEMS=()
+drop_chain() { # drop_chain <iptables-fn> <chain>: flush and delete it if it exists; never fails
+  if "$1" -F "$2" >/dev/null 2>&1; then "$1" -X "$2" >/dev/null 2>&1 || true; fi
+}
 first_rules() { # first_rules <fn> <chain> <n>: the first n rules of a chain, one per line
   "$1" -S "$2" 2>/dev/null | grep '^-A ' | head -n "$3" || true
 }
 canon() { sed -E "s/^(-[NA] HUNTER-EGRESS-GUARD[A-Z0-9-]*)-X/\\1/"; }
 cleanup_scratch() {
   local c
-  for c in "$CHAIN-X" "$CHAIN_IN-X"; do ipt -F "$c" 2>/dev/null && ipt -X "$c" 2>/dev/null || true; done
+  for c in "$CHAIN-X" "$CHAIN_IN-X"; do drop_chain ipt "$c"; done
   for c in "$CHAIN6-X" "$CHAIN6_IN-X"; do
-    if ipt6 -S "$c" >/dev/null 2>&1; then ipt6 -F "$c" && ipt6 -X "$c" || true; fi
+    if ipt6 -S "$c" >/dev/null 2>&1; then drop_chain ipt6 "$c"; fi
   done
 }
 check_jumps() { # check_jumps <fn> <chain> <target>: our jumps are the first rules, nothing before
@@ -320,13 +325,13 @@ do_remove() {
   lock
   drop_jump ipt DOCKER-USER "$CHAIN"
   drop_jump ipt INPUT "$CHAIN_IN"
-  for c in "$CHAIN" "$CHAIN_IN"; do ipt -F "$c" 2>/dev/null && ipt -X "$c" 2>/dev/null || true; done
+  for c in "$CHAIN" "$CHAIN_IN"; do drop_chain ipt "$c"; done
   cleanup_scratch
   if "${NS[@]}" ip6tables -S >/dev/null 2>&1; then
     drop_jump ipt6 FORWARD "$CHAIN6"
     drop_jump ipt6 INPUT "$CHAIN6_IN"
     for c in "$CHAIN6" "$CHAIN6_IN"; do
-      if ipt6 -S "$c" >/dev/null 2>&1; then ipt6 -F "$c" && ipt6 -X "$c" || true; fi
+      if ipt6 -S "$c" >/dev/null 2>&1; then drop_chain ipt6 "$c"; fi
     done
   fi
   note "removed: the daemon namespace is back to Docker's own rules"

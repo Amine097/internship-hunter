@@ -6,6 +6,6 @@ COPY hunter ./hunter
 RUN pip install --no-cache-dir .
 COPY config ./config
 COPY docker/isolation-gate.sh /usr/local/bin/isolation-gate.sh
-RUN chmod 0755 /usr/local/bin/isolation-gate.sh
-RUN useradd --no-create-home --uid 10001 hunter
+RUN chmod 0755 /usr/local/bin/isolation-gate.sh \
+ && useradd --no-create-home --uid 10001 hunter
 USER hunter

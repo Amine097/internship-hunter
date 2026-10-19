@@ -107,7 +107,7 @@ collect_ips() {
   local extra="${SMOKE_PROTECTED_IPS:-}"
   { # shellcheck disable=SC2086  # word splitting of a space/comma separated list is the point
     printf '%s\n' ${extra//,/ }
-    [[ "$AUTODETECT" == 1 ]] && detect_host_ips || true
+    if [[ "$AUTODETECT" == 1 ]]; then detect_host_ips; fi
   } | awk 'NF' | sort -u
 }
 
@@ -225,7 +225,7 @@ done
 
 # ---- canary listeners on the protected addresses (host side) -------------------------------
 CANARY_FILE="$(mktemp)"; CANARY_PID=""
-# shellcheck disable=SC2329  # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap
 cleanup() { [[ -z "$CANARY_PID" ]] || kill "$CANARY_PID" 2>/dev/null || true; rm -f "$CANARY_FILE"; }
 trap cleanup EXIT
 CANARIES=()
