@@ -36,6 +36,16 @@
 # own jump into DOCKER-USER is still first in FORWARD. Any missing, extra, reordered or edited
 # rule, or an address of this host the policy does not know yet, makes it fail.
 #
+# WHICH NAMESPACE. With rootlesskit --detach-netns (the production layout) the daemon's namespace
+# is a detached one, bind-mounted at <state dir>/netns inside rootlesskit's mount namespace; the
+# child process itself stays in the host's. The guard enters exactly that namespace (user + mount
+# namespaces of the rootlesskit child, network namespace from the detached file), records its
+# identity (net:[inode]) and refuses before ANY change if it is absent, not a namespace file,
+# ambiguous, the host's own, or not Docker's (no DOCKER-USER / FORWARD jump). Every command is
+# re-checked against that identity as it starts, so a daemon restart or a recycled pid fails
+# closed. Without --detach-netns the child process is in the daemon's namespace and is used
+# instead - only when it is NOT the host's. There is never a fallback to the host namespace.
+#
 # WHAT IT NEVER TOUCHES: the host's iptables/nftables/UFW, sshd, Tailscale, Gluetun and the
 # rootful daemon's containers (a different daemon in a different namespace). It refuses to run as
 # root and refuses a target namespace equal to the host's, or one that is not this user's
@@ -48,12 +58,16 @@ set -Eeuo pipefail
 
 TEST_MODE="${HUNTER_GUARD_TEST_MODE:-0}"
 PROC=/proc
+NSFS_TYPE=nsfs                           # what a namespace file's filesystem is called
 if [[ "$TEST_MODE" == 1 ]]; then
   PROC="${HUNTER_GUARD_PROC:-/proc}"
+  NSFS_TYPE="${HUNTER_GUARD_TEST_NSFS_TYPE:-nsfs}"
   echo "host-egress-guard: WARNING test mode: process table is '$PROC'" >&2
 else
   [[ -z "${HUNTER_GUARD_PROC:-}" ]] \
     || { echo "host-egress-guard: HUNTER_GUARD_PROC is only honoured with HUNTER_GUARD_TEST_MODE=1" >&2; exit 1; }
+  [[ -z "${HUNTER_GUARD_TEST_NSFS_TYPE:-}" ]] \
+    || { echo "host-egress-guard: HUNTER_GUARD_TEST_NSFS_TYPE is only honoured with HUNTER_GUARD_TEST_MODE=1" >&2; exit 1; }
   PATH=/usr/sbin:/usr/bin:/sbin:/bin     # never resolve iptables/nsenter through a caller's PATH
 fi
 
@@ -121,16 +135,83 @@ tr '\0' ' ' <"$PROC/$PID/cmdline" 2>/dev/null | grep -Eq '(dockerd|rootlesskit)'
   || die "process $PID is not a Docker daemon / rootlesskit process"
 awk -v u="$MYUID" '$2 == u {f=1} END {exit !f}' "$PROC/$PID/uid_map" 2>/dev/null \
   || die "process $PID does not run in a user namespace mapped to uid $MYUID (not rootless Docker)"
-[[ "$(readlink "$PROC/$PID/ns/user" 2>/dev/null)" != "$(readlink "$PROC/self/ns/user")" ]] \
-  || die "process $PID shares this user namespace: not a rootless daemon"
-target_ns="$(readlink "$PROC/$PID/ns/net" 2>/dev/null)" || die "process $PID has no network namespace"
-own_ns="$(readlink "$PROC/self/ns/net")"
-[[ "$target_ns" != "$own_ns" ]] \
-  || die "process $PID is in the HOST network namespace: refusing (this tool must never edit the host's firewall)"
+OWN_USER="$(readlink "$PROC/self/ns/user" 2>/dev/null)" || die "cannot read this process' user namespace"
+PID_USER="$(readlink "$PROC/$PID/ns/user" 2>/dev/null)" || die "process $PID has no readable user namespace"
+[[ "$PID_USER" != "$OWN_USER" ]] || die "process $PID shares this user namespace: not a rootless daemon"
+OWN_NET="$(readlink "$PROC/self/ns/net" 2>/dev/null)" || die "cannot read this process' network namespace"
+PID_NET="$(readlink "$PROC/$PID/ns/net" 2>/dev/null)" || die "process $PID has no readable network namespace"
 [[ -S "$RUNTIME_DIR/docker.sock" ]] || die "no rootless Docker socket at $RUNTIME_DIR/docker.sock"
-NS=(nsenter --preserve-credentials -U -n -t "$PID" --)
+
+# Which network namespace is the DAEMON's? RootlessKit has two layouts and the answer differs:
+#  * --detach-netns (this repository's production host): the child process stays in the HOST's
+#    network namespace; the daemon's namespace is a separate, detached one, bind-mounted at
+#    <state dir>/netns INSIDE rootlesskit's mount namespace (so it is only visible through
+#    /proc/<child>/root/..., never at the host path).
+#  * no --detach-netns: the child process itself lives in the daemon's network namespace.
+# Both are resolved to ONE explicit namespace identity (net:[inode]) that must not be this
+# process' own (= the host's); there is no fallback from one layout to the other: a child in the
+# host namespace without a detached namespace is an error, not "use the child's".
+NETNS_FILE="$PROC/$PID/root$STATE_DIR/netns"
+if [[ -e "$NETNS_FILE" || -L "$NETNS_FILE" ]]; then
+  MODE=detached
+  [[ ! -L "$NETNS_FILE" ]] \
+    || die "$NETNS_FILE is a symbolic link: rootlesskit bind-mounts the namespace file, a link could point anywhere (host namespace included): refusing"
+  [[ "$(stat -L -f -c %T "$NETNS_FILE" 2>/dev/null)" == "$NSFS_TYPE" ]] \
+    || die "$NETNS_FILE is not a namespace file (filesystem '$(stat -L -f -c %T "$NETNS_FILE" 2>/dev/null)', expected $NSFS_TYPE): refusing"
+  ino="$(stat -L -c %i "$NETNS_FILE" 2>/dev/null || true)"
+  [[ "$ino" =~ ^[0-9]+$ ]] \
+    || die "cannot read the identity of the detached network namespace $NETNS_FILE"
+  TARGET_NET="net:[$ino]"
+  # the child must be in the host namespace (detach layout) or already in the detached one; a
+  # third namespace means this is not the layout we understand: ambiguous, refuse
+  [[ "$PID_NET" == "$OWN_NET" || "$PID_NET" == "$TARGET_NET" ]] \
+    || die "ambiguous layout: process $PID is in $PID_NET, the detached namespace is $TARGET_NET, this process is in $OWN_NET"
+else
+  MODE=child
+  [[ "$PID_NET" != "$OWN_NET" ]] \
+    || die "process $PID is in the HOST network namespace ($PID_NET) and there is no detached daemon namespace at $STATE_DIR/netns (as seen from the rootlesskit mount namespace): refusing, the daemon's namespace cannot be identified"
+  TARGET_NET="$PID_NET"
+fi
+[[ "$TARGET_NET" != "$OWN_NET" ]] \
+  || die "the target network namespace $TARGET_NET is the HOST network namespace: refusing (this tool must never edit the host's firewall)"
+start_time() { sed 's/^.*) //' "$PROC/$PID/stat" 2>/dev/null | awk '{print $20}' || true; }
+START_TIME="$(start_time)"
+[[ "$START_TIME" =~ ^[0-9]+$ ]] || die "cannot read the start time of process $PID"
+
+# Every firewall command runs through ONE entry point. The enclosing /bin/sh refuses to exec the
+# command unless the namespaces it landed in are exactly the ones verified above (the host
+# namespace is never equal to TARGET_NET), so a daemon restart or a recycled pid between the check
+# and the mutation makes the command fail instead of acting somewhere else. The mount namespace
+# is the daemon's too: its /run/xtables.lock is the one Docker's own iptables calls take.
+# shellcheck disable=SC2016  # intentionally single-quoted: expanded by the /bin/sh that runs it
+NS_GATE='if [ "$(readlink /proc/self/ns/net)" != "$1" ] || [ "$(readlink /proc/self/ns/user)" != "$2" ]; then
+  echo "host-egress-guard: refusing: not in the verified daemon namespaces (daemon restarted?)" >&2; exit 97; fi
+shift 2; exec "$@"'
+NS=(nsenter --preserve-credentials -t "$PID" --user --mount)
+if [[ "$MODE" == detached ]]; then NS+=("--net=$NETNS_FILE"); else NS+=(--net); fi
+NS+=(-- /bin/sh -c "$NS_GATE" guard-ns-gate "$TARGET_NET" "$PID_USER")
 ipt() { "${NS[@]}" iptables -w 5 "$@"; }
 ipt6() { "${NS[@]}" ip6tables -w 5 "$@"; }
+
+# Same process, same namespace, as verified at start; fails closed (never re-resolves) otherwise.
+verify_target() {
+  local now
+  [[ -d "$PROC/$PID" ]] || die "daemon process $PID is gone: the daemon restarted, nothing was changed"
+  now="$(start_time)"
+  [[ "$now" == "$START_TIME" ]] || die "process $PID is not the daemon process verified at start (pid reused?): nothing was changed"
+  [[ "$(readlink "$PROC/$PID/ns/net" 2>/dev/null)" == "$PID_NET" ]] \
+    || die "process $PID changed network namespace: nothing was changed"
+  if [[ "$MODE" == detached ]]; then
+    [[ "$(stat -L -c %i "$NETNS_FILE" 2>/dev/null)" == "${TARGET_NET//[^0-9]/}" ]] \
+      || die "the detached daemon namespace changed or vanished (daemon restarted?): nothing was changed"
+  fi
+  "${NS[@]}" true >/dev/null 2>&1 \
+    || die "cannot enter the verified daemon namespace $TARGET_NET (daemon restarted, or not permitted): nothing was changed"
+}
+# The chains the guard builds on must be Docker's own, created by the daemon in THIS namespace.
+docker_chains_ready() {
+  ipt -S DOCKER-USER >/dev/null 2>&1 && ipt -S FORWARD 2>/dev/null | grep -qx -- '-A FORWARD -j DOCKER-USER'
+}
 
 # ---- resolver(s) the containers' DNS queries are forwarded to (must stay reachable) ----------
 detect_dns() {
@@ -201,7 +282,7 @@ render_v6() {
 
 do_plan() {
   cat <<EOF
-# target: rootless daemon namespace of pid $PID ($target_ns); host namespace is $own_ns
+# target: rootless daemon namespace $TARGET_NET ($MODE layout, rootlesskit pid $PID); this process / the host is in $OWN_NET
 # DNS exceptions (port 53 only): ${DNS[*]}
 # host addresses protected: ${HOSTS[*]:-none found} ${EXTRA[*]:-}
 # commands (run via: ${NS[*]}):
@@ -273,6 +354,11 @@ compare_chain() { # compare_chain <fn> <chain>: live chain == canonical expected
 }
 verify_policy() {
   PROBLEMS=()
+  verify_target
+  if ! docker_chains_ready; then      # checked BEFORE the scratch chains are created
+    echo "NOT active: Docker's chains (DOCKER-USER and the FORWARD jump into it) are missing in the daemon namespace $TARGET_NET"
+    return 1
+  fi
   need_ip6tables
   cleanup_scratch
   SUFFIX="-X" render_v4 | "${NS[@]}" iptables-restore -w 5 --noflush
@@ -295,12 +381,14 @@ verify_policy() {
 }
 
 do_apply() {
-  lock; need_ip6tables
+  lock; verify_target; need_ip6tables
   local deadline=$((SECONDS + WAIT))
-  until ipt -S DOCKER-USER >/dev/null 2>&1; do
-    (( SECONDS < deadline )) || die "chain DOCKER-USER does not exist in the daemon namespace (daemon not up, or nftables backend)"
+  until docker_chains_ready; do
+    verify_target                            # a daemon that restarts while we wait is a different namespace
+    (( SECONDS < deadline )) || die "Docker's chains (DOCKER-USER and the FORWARD jump into it) do not exist in the daemon namespace $TARGET_NET (daemon not up, or nftables backend): nothing was changed"
     sleep 1
   done
+  verify_target                              # last identity proof before the first mutation
   render_v4 | "${NS[@]}" iptables-restore -w 5 --noflush
   ensure_jump ipt DOCKER-USER "$CHAIN"
   ensure_jump ipt INPUT "$CHAIN_IN"
@@ -315,14 +403,14 @@ do_apply() {
 do_status() {
   lock
   if verify_policy; then
-    echo "active (pid $PID; ${#HOSTS[@]} host address(es); DNS ${DNS[*]})"
+    echo "active ($MODE namespace $TARGET_NET, pid $PID; ${#HOSTS[@]} host address(es); DNS ${DNS[*]})"
   else
     return 1
   fi
 }
 
 do_remove() {
-  lock
+  lock; verify_target
   drop_jump ipt DOCKER-USER "$CHAIN"
   drop_jump ipt INPUT "$CHAIN_IN"
   for c in "$CHAIN" "$CHAIN_IN"; do drop_chain ipt "$c"; done

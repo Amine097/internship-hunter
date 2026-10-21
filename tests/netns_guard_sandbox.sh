@@ -20,8 +20,11 @@ trap cleanup EXIT
 ns() { local pid="$1"; shift; nsenter --preserve-credentials -U -n -t "$pid" -- "$@"; }
 unshare -Ur sleep 600 & R=$!; pids+=("$R"); sleep 0.3
 mk() { nsenter --preserve-credentials -U -t "$R" -- unshare -n sleep 600 & pids+=("$!"); eval "$1=$!"; }
-# the "daemon" must pass the guard's identity checks: a process whose cmdline says dockerd
-nsenter --preserve-credentials -U -t "$R" -- unshare -n bash -c 'exec -a dockerd sleep 600' & D=$!; pids+=("$D")
+# D only holds the daemon's network namespace. The "rootlesskit child" K reproduces the production
+# layout (rootlesskit --detach-netns): K lives in the user namespace R and its own mount namespace
+# but stays in the HOST network namespace; the daemon's namespace is bind-mounted at
+# <state dir>/netns INSIDE K's mount namespace only (the host path is an empty regular file).
+nsenter --preserve-credentials -U -t "$R" -- unshare -n sleep 600 & D=$!; pids+=("$D")
 mk C; mk C2; mk C3; mk U; sleep 0.5
 for p in $D $C $C2 $C3 $U; do ns "$p" ip link set lo up; done
 
@@ -142,7 +145,11 @@ matrix() {
   echo "ipv6_daemon_namespace $(tcp_from "$C" fd30::1 7001)"     # INPUT, not FORWARD
 }
 
-mkdir -p "$WORK/xdg/dockerd-rootless"; echo "$D" >"$WORK/xdg/dockerd-rootless/child_pid"
+mkdir -p "$WORK/xdg/dockerd-rootless"; : >"$WORK/xdg/dockerd-rootless/netns"
+nsenter --preserve-credentials -U -t "$R" -- unshare -m bash -c 'exec -a rootlesskit sleep 600' & K=$!; pids+=("$K"); sleep 0.5
+nsenter --preserve-credentials -U -m -t "$K" -- mount --bind "/proc/$D/ns/net" "$WORK/xdg/dockerd-rootless/netns"
+echo "$K" >"$WORK/xdg/dockerd-rootless/child_pid"
+echo "layout child_in_host_netns $([[ "$(readlink /proc/$K/ns/net)" == "$(readlink /proc/self/ns/net)" ]] && echo yes || echo no)"
 python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$WORK/xdg/docker.sock"
 export XDG_RUNTIME_DIR="$WORK/xdg"
 export HUNTER_GUARD_TEST_MODE=1       # only so the guard finds the iptables wrappers on PATH

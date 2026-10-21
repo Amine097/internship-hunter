@@ -892,7 +892,7 @@ def test_the_script_cleans_loader_and_interpreter_hooks_in_production_mode():
     text = SCRIPT.read_text()
     head = text[:text.index("# Trusted, root-owned copies")]
     for var in ("BASH_ENV", "LD_PRELOAD", "PYTHONPATH", "HUNTER_GUARD_PROC",
-                "HUNTER_GUARD_TEST_MODE", "ACCEPT_SCHEMA_REVISION"):
+                "HUNTER_GUARD_TEST_MODE", "HUNTER_GUARD_TEST_NSFS_TYPE", "ACCEPT_SCHEMA_REVISION"):
         assert var in head, var
     assert "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in head
 

@@ -94,6 +94,12 @@ Derived checks (also run in CI against the Docker runner, in report mode, withou
       (`tests/test_host_egress_guard_netns.py`): tailnet/host/gateway blocked (also closed ports and
       `docker0`), Internet + DNS + same-bridge + docker-proxy traffic kept, idempotent, `remove`
       restores exactly; 9 tamperings detected by `status`; start gate stops/starts a service
+- [x] **L** guard in the production rootlesskit `--detach-netns` layout, real user/mount/network namespaces
+      (`tests/test_host_egress_guard_detached_netns.py`): the daemon's namespace is the detached one, never
+      the child's (= host's); absent / non-namespace / symlink / host / ambiguous targets and missing Docker
+      chains refused before anything is changed; stale pid file, swapped namespace and killed daemon fail closed
+- [ ] **S** on the production host, read-only: `readlink /proc/self/ns/net /proc/$PID/ns/net` equal, the
+      detached file is `nsfs` with a different inode, `"$GUARD" plan` names that inode (docs/deployment.md)
 - [x] **L** deploy script gate (stubbed docker): missing/untrusted/inactive guard, unset targets,
       failed enforce check, first-deploy teardown, rollback prerequisites, rootful daemon never used
 - [x] **L** real `egress-proxy.sh` CONNECT to an allow-listed public name keeps working with the guard;

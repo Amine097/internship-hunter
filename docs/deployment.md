@@ -70,10 +70,47 @@ the check in `report` mode and the production host must pass it in `enforce` mod
 
 The guard never touches the host's iptables/nftables/UFW, sshd, Tailscale, Gluetun or the rootful
 daemon and its containers: it refuses to run as root, refuses a target namespace equal to the
-host's, and before entering the namespace of `$XDG_RUNTIME_DIR/dockerd-rootless/child_pid` it
-proves that process is *this user's* rootless daemon (owned by the uid, a `dockerd`/`rootlesskit`
-command line, a user namespace mapped to this uid and different from ours, its socket present).
-`HUNTER_GUARD_PROC` (a fake `/proc` for tests) is refused unless `HUNTER_GUARD_TEST_MODE=1`.
+host's, and before entering anything it proves that the process in
+`$XDG_RUNTIME_DIR/dockerd-rootless/child_pid` is *this user's* rootless daemon (owned by the uid, a
+`dockerd`/`rootlesskit` command line, a user namespace mapped to this uid and different from ours, its
+socket present). `HUNTER_GUARD_PROC` (a fake `/proc` for tests) and `HUNTER_GUARD_TEST_NSFS_TYPE` are
+refused unless `HUNTER_GUARD_TEST_MODE=1`.
+
+#### Which network namespace is "the daemon's" (rootlesskit `--detach-netns`)
+
+The production daemon runs rootlesskit with `--net=slirp4netns --detach-netns`. In that layout the
+rootlesskit child process (`child_pid`) **stays in the host's network namespace**; the daemon's namespace is
+a separate, detached one, bind-mounted at `$XDG_RUNTIME_DIR/dockerd-rootless/netns` **inside rootlesskit's
+mount namespace only** (the same path on the host is not a namespace file). Entering the child's own network
+namespace (`nsenter -U -n -t <pid>`) therefore lands in the host's namespace as an unprivileged user and
+cannot work - and must never be made to. The guard resolves one explicit identity instead:
+
+| layout | what is entered | target identity |
+|---|---|---|
+| `--detach-netns` (file at `/proc/<child>/root$XDG_RUNTIME_DIR/dockerd-rootless/netns`) | the child's user + mount namespaces, network namespace **from that file** | `net:[inode]` of the file |
+| no detached file, child **not** in our network namespace | the child's user, mount and network namespaces | the child's `net:[inode]` |
+| no detached file, child in the host's network namespace | **nothing - refused** (the daemon's namespace cannot be identified) | - |
+
+Refused, before any command is sent into a namespace: the detached file is absent (child in the host
+namespace), is a regular file, a symbolic link or anything but a namespace file (`nsfs`), has the host's own
+identity, or the child is in a third namespace (ambiguous layout). There is no fallback from one layout to
+another and none to the host namespace. Every firewall command then runs through one gate (a `/bin/sh`
+that `exec`s the command only if `/proc/self/ns/net` and `/proc/self/ns/user` are exactly the verified
+identities, else exit 97), the process start time and the file's identity are re-checked before each phase,
+and `apply` only mutates after Docker's own `DOCKER-USER` chain and the `FORWARD` jump into it exist **in
+that namespace**. A daemon that restarts (new process, new namespace) while `apply --wait` is waiting makes
+it fail with `nothing was changed` instead of re-resolving; systemd then retries with a fresh resolution.
+The mount namespace entered is the daemon's, so `iptables -w` takes the same `/run/xtables.lock` as Docker's
+own calls. Read-only checks an operator can run to see the layout (nothing is changed):
+```bash
+PID=$(cat "$XDG_RUNTIME_DIR/dockerd-rootless/child_pid")
+readlink /proc/self/ns/net "/proc/$PID/ns/net"                      # detach layout: the same value
+stat -L -f -c %T "/proc/$PID/root$XDG_RUNTIME_DIR/dockerd-rootless/netns"   # nsfs
+stat -L -c 'net:[%i]' "/proc/$PID/root$XDG_RUNTIME_DIR/dockerd-rootless/netns"   # a DIFFERENT value
+"$GUARD" plan                                                       # names the target namespace
+```
+The systemd drop-in (step 6) needs no change: it already runs as the daemon's user with
+`XDG_RUNTIME_DIR` set, after rootlesskit has created the state directory.
 
 ### The deploy gate (what `remote-deploy.sh` now enforces)
 
@@ -241,7 +278,9 @@ mode. With `SMOKE_EXPECT_ROOTLESS=1` a Tailscale address must be among the targe
 ### Evidence and what CI can and cannot show
 
 Real `iptables` (nf_tables 1.8.11, WSL2 kernel 6.6) and real packets in throwaway user+network
-namespaces (`tests/test_host_egress_guard_netns.py`), running the actual scripts:
+namespaces (`tests/test_host_egress_guard_netns.py`), running the actual scripts, in the production
+`--detach-netns` layout (rootlesskit child in the host namespace, daemon namespace bind-mounted in the
+child's mount namespace only):
 
 | from a container | before | with guard |
 |---|---|---|
@@ -260,6 +299,17 @@ after; IP literals, other ports, other names -> `403` both ways. The probe and g
 with **Alpine 3.20's own busybox `nc`** (1.36.1): `nc -vv -z` prints `Connection refused` /
 `Host is unreachable` / `Network unreachable` / `Operation timed out`, and **`nc -z` alone is silent on a
 refusal** - which is why the probes use `-vv` and calibrate against it.
+
+The same layout is exercised for its failure behaviour with real user, mount and network namespaces
+(`tests/test_host_egress_guard_detached_netns.py`): the happy path and `remove`; absent, plain-file,
+symlink and wrong-namespace targets and an ambiguous layout are refused with **no `nsenter` call at all**;
+missing Docker chains change nothing; a namespace swapped, or a daemon killed, under a running
+`apply --wait` is detected and neither namespace is touched; a stale `child_pid` is refused; after a real
+restart the new namespace is unguarded until `apply` runs and never inherits anything; the gate refuses a
+wrong network or user namespace (exit 97, the command is not run). In this
+sandbox layout the previous guard (`main@597cf65`) stops at its host-namespace check; on the production host
+the same layout was reported to fail with `Operation not permitted` from `nsenter -U -n -t <pid>`. Either way
+entering the child's namespace means entering the host's, which is what the new resolution replaces.
 
 **CI.** The `host-guard-netns` job is a **mandatory security job that fails when it cannot do its
 work**. It runs the packet tests on `ubuntu-22.04` (no sudo, no AppArmor change - this repository never
