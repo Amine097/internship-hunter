@@ -74,10 +74,29 @@ pid=$1; shift
 echo deny > /proc/$pid/setgroups
 echo "$1 $2 $3" > /proc/$pid/gid_map
 MAP
-    # runc: with one gid mapped the default devpts option gid=5 cannot be applied
+    # runc wrapper. (1) with one gid mapped the default devpts option gid=5 cannot be applied;
+    # (2) a runner without a systemd user session cannot create the cgroup scope Docker asks for
+    # (limits are not under test), so the spec's cgroupsPath/resources are dropped.
     cat >"$LAB/bin/runcw" <<RUNC
 #!/bin/bash
-prev=""; for a in "\$@"; do if [ "\$prev" = "--bundle" ]; then sed -i 's/,"gid=5"//; s/"gid=5",\\?//' "\$a/config.json" 2>/dev/null; fi; prev="\$a"; done
+prev=""
+for a in "\$@"; do
+  if [ "\$prev" = "--bundle" ] && [ -f "\$a/config.json" ]; then
+    python3 - "\$a/config.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+for m in c.get("mounts", []):
+    if m.get("destination") == "/dev/pts":
+        m["options"] = [o for o in m.get("options", []) if o != "gid=5"]
+lin = c.get("linux", {})
+lin.pop("cgroupsPath", None)
+lin.pop("resources", None)
+json.dump(c, open(p, "w"))
+PY
+  fi
+  prev="\$a"
+done
 exec "$LAB/bin/runc" "\$@"
 RUNC
     chmod +x "$LAB/bin/getsubids" "$LAB/bin/newuidmap" "$LAB/bin/newgidmap" "$LAB/bin/runcw"
