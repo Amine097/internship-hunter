@@ -76,11 +76,15 @@ echo "$1 $2 $3" > /proc/$pid/gid_map
 MAP
     # runc wrapper. (1) with one gid mapped the default devpts option gid=5 cannot be applied;
     # (2) a runner without a systemd user session cannot create the cgroup scope Docker asks for
-    # (limits are not under test), so the spec's cgroupsPath/resources are dropped.
+    # (limits are not under test), so `--systemd-cgroup` is removed and the spec's cgroupsPath/resources
+    # are dropped.
     cat >"$LAB/bin/runcw" <<RUNC
 #!/bin/bash
 prev=""
+args=()
 for a in "\$@"; do
+  [ "\$a" = "--systemd-cgroup" ] && continue
+  args+=("\$a")
   if [ "\$prev" = "--bundle" ] && [ -f "\$a/config.json" ]; then
     python3 - "\$a/config.json" <<'PY'
 import json, sys
@@ -97,7 +101,7 @@ PY
   fi
   prev="\$a"
 done
-exec "$LAB/bin/runc" "\$@"
+exec "$LAB/bin/runc" "\${args[@]}"
 RUNC
     chmod +x "$LAB/bin/getsubids" "$LAB/bin/newuidmap" "$LAB/bin/newgidmap" "$LAB/bin/runcw"
   fi
