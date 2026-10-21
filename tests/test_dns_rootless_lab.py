@@ -234,6 +234,13 @@ def lab(tmp_path_factory):
     lab.env()
     yield lab
     lab.down()
+    keep = os.environ.get("HUNTER_LAB_LOG_DIR")        # CI: the daemon's logs outlive the lab
+    if keep:
+        Path(keep).mkdir(parents=True, exist_ok=True)
+        for name in ("dockerd.log", "runc.args"):
+            if (path / name).exists():
+                shutil.copy(path / name, Path(keep) / name)
+        shutil.copy(path / "home" / ".config" / "docker" / "daemon.json", Path(keep) / "daemon.json")
     lab.run([LAB_SH, "down"], check=False, timeout=120)
 
 

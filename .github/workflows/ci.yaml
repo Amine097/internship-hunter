@@ -158,6 +158,7 @@ jobs:
         env:
           HUNTER_ROOTLESS_LAB: "1"
           HUNTER_ROOTLESS_LAB_REQUIRED: "1"
+          HUNTER_LAB_LOG_DIR: ${{ runner.temp }}/lab-logs
         run: |
           set -euo pipefail
           python -m pytest -q -rs -p no:cacheprovider tests/test_dns_rootless_lab.py | tee lab.log
@@ -167,7 +168,8 @@ jobs:
           fi
       - name: Daemon log on failure
         if: failure()
-        run: find /tmp -name dockerd.log -path '*lab*' -exec tail -n 60 {} \; 2>/dev/null || true
+        run: |
+          for f in "$RUNNER_TEMP"/lab-logs/*; do echo "=== $f"; tail -n 60 "$f"; done || true
 
   shellcheck:
     runs-on: ubuntu-latest

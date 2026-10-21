@@ -82,6 +82,7 @@ MAP
 #!/bin/bash
 prev=""
 args=()
+echo "\$*" >>"$LAB/runc.args"
 for a in "\$@"; do
   [ "\$a" = "--systemd-cgroup" ] && continue
   args+=("\$a")
