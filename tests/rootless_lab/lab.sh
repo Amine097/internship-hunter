@@ -102,7 +102,8 @@ ENV
 start() {
   local dns="$1" j=""
   [[ -z "$dns" ]] || j=", \"dns\": [\"$dns\"]"
-  echo "{\"runtimes\": {\"runcw\": {\"path\": \"$LAB/bin/runcw\"}}, \"default-runtime\": \"runcw\"$j}" \
+  # cgroupfs: a CI runner has no systemd user session to hand cgroups to (limits are not under test)
+  echo "{\"runtimes\": {\"runcw\": {\"path\": \"$LAB/bin/runcw\"}}, \"default-runtime\": \"runcw\", \"exec-opts\": [\"native.cgroupdriver=cgroupfs\"]$j}" \
     >"$LAB/home/.config/docker/daemon.json"
   (
     export XDG_RUNTIME_DIR="$XDG" HOME="$LAB/home" PATH="$LAB/bin:$PATH" DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns

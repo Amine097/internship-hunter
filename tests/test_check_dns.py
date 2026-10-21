@@ -57,7 +57,14 @@ DOCKER = textwrap.dedent("""\
     #!/usr/bin/env bash
     [[ "$1" == compose ]] || exit 99
     shift
-    while [[ "$1" != exec && "$1" != config ]]; do shift; done
+    while [[ "$1" != exec && "$1" != config && "$1" != ps ]]; do shift; done
+    if [[ "$1" == ps ]]; then
+      python3 -c 'import json,os,sys
+skip = os.environ.get("STUB_NOT_RUNNING", "").split()
+for s in json.load(open(sys.argv[1]))["services"]:
+    print(s) if s not in skip else None' "$STUB_DIR/config.json"
+      exit 0
+    fi
     if [[ "$1" == config ]]; then
       [[ -n "${STUB_CONFIG_FAIL:-}" ]] && exit 1
       cat "$STUB_DIR/config.json"; exit 0
@@ -381,6 +388,34 @@ def test_a_container_with_neither_python_nor_nslookup_cannot_be_verified(env):
 def test_the_image_without_python_falls_back_to_nslookup_and_is_still_fully_checked(env):
     assert env.run(STUB_NO_PYTHON="api").returncode == 0
     assert env.run(STUB_NO_PYTHON="api", STUB_EXT_BROKEN="api").returncode == 1
+
+
+def test_the_one_shot_migrate_service_may_be_stopped_and_is_then_not_probed(env):
+    r = env.run(STUB_NOT_RUNNING="migrate")
+    assert r.returncode == 0, r.stderr
+    assert "migrate" not in (env.stub / "log").read_text()
+    assert "6 internal-only service(s) resolve nothing" in r.stdout
+
+
+@pytest.mark.parametrize("svc", ["api", "agent-codex", "egress-claude-1", "postgres"])
+def test_any_other_stopped_service_refuses_to_certify(env, svc):
+    r = env.run(STUB_NOT_RUNNING=svc)
+    assert r.returncode == 1 and f"service '{svc}' is not running" in r.stderr
+
+
+def test_a_public_resolver_as_the_expected_one_is_not_probed_twice(env):
+    """CI gives compose HUNTER_DNS=1.1.1.1 - the same address the leak probe uses."""
+    def public(cfg):
+        for n in OUT:
+            cfg["services"][n]["dns"] = ["1.1.1.1"]
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        e = Env(Path(d), public)
+        for n in OUT:
+            p = e.stub / "resolv" / n
+            p.write_text(p.read_text().replace("[10.0.2.3]", "[1.1.1.1]"))
+        r = e.run(SMOKE_DNS_EXPECT="1.1.1.1")
+        assert r.returncode == 0, r.stdout + r.stderr
 
 
 def test_a_changed_topology_is_refused_instead_of_silently_shrinking_the_check():

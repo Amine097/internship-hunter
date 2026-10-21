@@ -47,6 +47,8 @@ MODE="${SMOKE_HOST_ISOLATION:-enforce}"
 EXPECT_DNS="${SMOKE_DNS_EXPECT:-${HUNTER_DNS:-10.0.2.3}}"
 EXT_NAME="${SMOKE_DNS_NAME:-example.com}"
 PUBLIC_RESOLVER=1.1.1.1
+# one-shot services that legitimately are not running once the stack is up (their name does not resolve)
+ONESHOT=(migrate)
 REQUIRED_OUT=(egress-claude-1 egress-claude-2 egress-codex discovery telegram api)
 REQUIRED_IN=(agent-claude-1 agent-claude-2 agent-codex postgres)
 
@@ -81,7 +83,21 @@ for name, svc in sorted((cfg.get("services") or {}).items()):
 json.dump(out, sys.stdout)
 ')" || TOPO=""
 [[ -n "$TOPO" ]] || fail "cannot read the compose configuration (docker compose config failed)"
-mapfile -t SERVICES < <(python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])["services"]))' "$TOPO")
+mapfile -t RUNNING < <("${COMPOSE[@]}" ps --services --status running 2>/dev/null || true)
+[[ ${#RUNNING[@]} -gt 0 ]] || fail "no running service found (docker compose ps): is the stack up?"
+mapfile -t CONFIGURED < <(python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])["services"]))' "$TOPO")
+SERVICES=()
+for s in "${CONFIGURED[@]}"; do
+  if printf '%s\n' "${RUNNING[@]}" | grep -qx -- "$s"; then SERVICES+=("$s")
+  elif [[ " ${ONESHOT[*]} " != *" $s "* ]]; then fail "service '$s' is not running: refusing to certify DNS for a stack that is not up"
+  fi
+done
+# the stopped one-shot services leave the picture: Docker's DNS does not resolve a container that is not running
+TOPO="$(python3 -c '
+import json, sys
+t = json.loads(sys.argv[1]); keep = set(sys.argv[2:])
+t["services"] = {k: v for k, v in t["services"].items() if k in keep}
+json.dump(t, sys.stdout)' "$TOPO" "${SERVICES[@]}")"
 role_of() { python3 -c 'import json,sys; print("OUT" if json.loads(sys.argv[1])["services"][sys.argv[2]]["out"] else "IN")' "$TOPO" "$1"; }
 for need in "${REQUIRED_OUT[@]}"; do
   [[ "$(role_of "$need" 2>/dev/null || true)" == OUT ]] \
@@ -184,7 +200,7 @@ if tool is None:
     if not out: add("DEFECT", f"{svc}: probe did not run (no output); DNS UNVERIFIED")
 else:
     want_peers = sorted(S)
-    want_direct = ([expect_dns.split(",")[0], "1.1.1.1"] if role == "IN" else gateways)
+    want_direct = list(dict.fromkeys([expect_dns.split(",")[0], "1.1.1.1"] if role == "IN" else gateways))
     if selfr != "ok": add("DEFECT", f"{svc}: cannot resolve its own service name ({selfr}): the embedded resolver does not work; DNS UNVERIFIED")
     if extr is None: add("DEFECT", f"{svc}: no verdict for the public name")
     missing = [p for p in want_peers if p not in peers]
@@ -238,7 +254,8 @@ probe_service() { # probe_service <service>: writes $tmp/<service>.out and .err
   local svc="$1" role peers direct
   role="$(role_of "$svc")"
   peers="${SERVICES[*]}"
-  if [[ "$role" == IN ]]; then direct="${EXPECT_DNS%%,*} $PUBLIC_RESOLVER"; else direct="$GATEWAYS"; fi
+  if [[ "$role" == IN ]]; then direct="$(printf '%s\n' "${EXPECT_DNS%%,*}" "$PUBLIC_RESOLVER" | awk '!seen[$0]++' | tr '\n' ' ')"
+  else direct="$GATEWAYS"; fi
   # the python flavour where the image has python (app, agent), busybox nslookup otherwise (egress)
   if ! exec_in "$svc" sh -c 'command -v python >/dev/null 2>&1' </dev/null >/dev/null 2>&1; then
     printf '%s\n' "$SH_PROBE" | exec_in "$svc" sh -s -- "$svc" "$EXT_NAME" "$peers" "$direct" >"$tmp/$svc.out" 2>"$tmp/$svc.err" || true
