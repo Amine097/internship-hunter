@@ -25,6 +25,8 @@ def env(tmp_path):
     (proc / "4242" / "ns" / "net").symlink_to("net:[4026532227]")
     (proc / "4242" / "ns" / "user").symlink_to("user:[4026532226]")
     (proc / "4242" / "cmdline").write_bytes(b"dockerd\0--host=unix:///x\0")
+    # /proc/<pid>/stat: field 22 (start time) is the 20th token after the "(comm) "
+    (proc / "4242" / "stat").write_text("4242 (dockerd) S " + " ".join(["0"] * 18) + " 777 0 0\n")
     (proc / "4242" / "uid_map").write_text(f"         0       {os.getuid()}          1\n")
     (proc / "self" / "ns").mkdir(parents=True)
     (proc / "self" / "ns" / "net").symlink_to("net:[4026531840]")
@@ -216,3 +218,101 @@ def test_plan_covers_ipv6_forward_and_input(env):
     assert "-A HUNTER-EGRESS-GUARD6-IN -p ipv6-icmp -j RETURN" in r.stdout
     assert "-A HUNTER-EGRESS-GUARD6-IN -j REJECT --reject-with icmp6-adm-prohibited" in r.stdout
     assert "ip6tables -I INPUT 1" in r.stdout and "ip6tables -I FORWARD 1" in r.stdout
+
+
+# ---- the daemon's network namespace: rootlesskit --detach-netns ------------------------------
+HOST_NET = "net:[4026531840]"
+
+
+def _detached(env, tmp_path, own_net=HOST_NET, child_net=HOST_NET):
+    """The production layout: the rootlesskit child is in the HOST network namespace and the
+    daemon's namespace is a file under the child's root. The tests cannot make an nsfs file, so
+    the fake one is a plain file and the (test-mode-only) filesystem-type override says what to
+    expect; tests/test_host_egress_guard_detached_netns.py does it with real namespaces."""
+    root = tmp_path / "proc" / "4242" / "root"
+    f = root / str(tmp_path / "xdg").lstrip("/") / "dockerd-rootless" / "netns"
+    f.parent.mkdir(parents=True)
+    f.write_text("")
+    fstype = subprocess.run(["stat", "-f", "-c", "%T", str(f)], capture_output=True,
+                            text=True).stdout.strip()
+    ino = str(f.stat().st_ino)
+    link = tmp_path / "proc" / "4242" / "ns" / "net"
+    link.unlink()
+    link.symlink_to(child_net.replace("INODE", ino))
+    me = tmp_path / "proc" / "self" / "ns" / "net"
+    me.unlink()
+    me.symlink_to(own_net.replace("INODE", ino))
+    return f, {**env, "HUNTER_GUARD_TEST_NSFS_TYPE": fstype}
+
+
+def test_detached_namespace_is_the_target_not_the_childs_host_namespace(env, tmp_path):
+    f, env = _detached(env, tmp_path)
+    r = guard(env, "plan")
+    assert r.returncode == 0, r.stderr
+    assert f"net:[{f.stat().st_ino}]" in r.stdout and "detached layout" in r.stdout
+    assert HOST_NET in r.stdout                        # named as "this process / the host"
+
+
+def test_detached_namespace_equal_to_the_host_is_refused(env, tmp_path):
+    f, env = _detached(env, tmp_path, own_net="net:[INODE]", child_net="net:[INODE]")
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "is the HOST network namespace" in r.stderr
+
+
+def test_a_child_in_the_host_namespace_without_a_detached_one_is_refused(env, tmp_path):
+    link = tmp_path / "proc" / "4242" / "ns" / "net"
+    link.unlink()
+    link.symlink_to(HOST_NET)
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "no detached daemon namespace" in r.stderr
+    assert "cannot be identified" in r.stderr
+
+
+def test_a_plain_file_is_not_a_namespace(env, tmp_path):
+    f, env = _detached(env, tmp_path)
+    env = {k: v for k, v in env.items() if k != "HUNTER_GUARD_TEST_NSFS_TYPE"}
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "not a namespace file" in r.stderr
+
+
+def test_a_symlink_instead_of_the_bind_mounted_file_is_refused(env, tmp_path):
+    f, env = _detached(env, tmp_path)
+    target = tmp_path / "elsewhere"
+    target.write_text("")
+    f.unlink()
+    f.symlink_to(target)
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "symbolic link" in r.stderr
+
+
+def test_a_child_in_a_third_namespace_is_ambiguous(env, tmp_path):
+    f, env = _detached(env, tmp_path, child_net="net:[4026539999]")
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "ambiguous layout" in r.stderr
+
+
+def test_the_filesystem_type_override_is_refused_outside_test_mode(env, tmp_path):
+    f, env = _detached(env, tmp_path)
+    env = {k: v for k, v in env.items() if k != "HUNTER_GUARD_TEST_MODE"}
+    env.pop("HUNTER_GUARD_PROC")
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "HUNTER_GUARD_TEST_NSFS_TYPE is only honoured" in r.stderr
+
+
+def test_an_unreadable_start_time_is_refused(env, tmp_path):
+    (tmp_path / "proc" / "4242" / "stat").unlink()
+    r = guard(env, "plan")
+    assert r.returncode == 1 and "start time" in r.stderr
+
+
+def test_every_firewall_command_goes_through_the_verified_namespace_gate():
+    code = "\n".join(ln for ln in GUARD.read_text().splitlines() if not ln.lstrip().startswith("#"))
+    assert code.count("NS=(nsenter") == 1                      # one entry point, defined once
+    others = [ln for ln in code.splitlines()
+              if "nsenter" in ln and not ln.startswith("NS=(nsenter") and "PATH=" not in ln]
+    assert not others
+    assert "exit 97" in code and "/proc/self/ns/net" in code and "/proc/self/ns/user" in code
+    assert "--net=$NETNS_FILE" in code and "--preserve-credentials" in code
+    assert "-U -n" not in code                      # the pre-detach form that fails in production
+    # no path that quietly picks the child's namespace when the detached one is missing or unusable
+    assert code.count("TARGET_NET=") == 2

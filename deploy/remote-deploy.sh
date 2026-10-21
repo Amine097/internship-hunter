@@ -51,7 +51,7 @@ else
   export PATH
 fi
 # guard / schema overrides are test hooks of other scripts: never inherited from the caller
-unset HUNTER_GUARD_PROC HUNTER_GUARD_TEST_MODE HUNTER_ACCEPT_SCHEMA_REVISION ACCEPT_SCHEMA_REVISION
+unset HUNTER_GUARD_PROC HUNTER_GUARD_TEST_MODE HUNTER_GUARD_TEST_NSFS_TYPE HUNTER_ACCEPT_SCHEMA_REVISION ACCEPT_SCHEMA_REVISION
 # Trusted, root-owned copies; they are NOT taken from the (signed, but newer) release bundle, so a
 # bundle can never weaken the gate that is about to judge it.
 GUARD="$BASE/deploy/host-egress-guard.sh"

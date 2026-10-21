@@ -111,7 +111,7 @@ jobs:
             {
               echo "## BLOCKED: packet-level host-egress-guard tests cannot run on this runner"
               echo
-              echo "tests/test_host_egress_guard_netns.py is a required security check and was NOT executed."
+              echo "tests/test_host_egress_guard_netns.py and tests/test_host_egress_guard_detached_netns.py are required security checks and were NOT executed."
               echo "Compatible runner: ubuntu-22.04 (unrestricted user namespaces) - or ubuntu-24.04 with a"
               echo "per-binary AppArmor profile for /usr/bin/unshare (needs elevated privileges: a policy decision)."
             } >> "$GITHUB_STEP_SUMMARY"
@@ -123,9 +123,9 @@ jobs:
           GUARD_NETNS_REQUIRED: "1"
         run: |
           set -euo pipefail
-          python -m pytest -q -rs -p no:cacheprovider tests/test_host_egress_guard_netns.py | tee netns.log
+          python -m pytest -q -rs -p no:cacheprovider tests/test_host_egress_guard_netns.py tests/test_host_egress_guard_detached_netns.py | tee netns.log
           if grep -qE '[0-9]+ (skipped|deselected)' netns.log; then
-            echo "::error title=Security tests skipped::tests/test_host_egress_guard_netns.py skipped tests"
+            echo "::error title=Security tests skipped::the host-egress-guard namespace tests skipped tests"
             exit 1
           fi
 
