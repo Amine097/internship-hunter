@@ -255,3 +255,32 @@ def test_services_with_a_route_out_cannot_reconfigure_the_network():
         assert not svc.get("sysctls"), name
         assert svc.get("cap_drop") == ["ALL"], name
         assert not svc.get("devices"), name
+
+
+# ---- DNS (docs/deployment.md, "DNS"; proven on a real rootless daemon: test_dns_rootless_lab.py)
+def _has_route_out(svc):
+    return any(not COMPOSE["networks"][n].get("internal", False) for n in svc.get("networks", []))
+
+
+def test_every_service_with_a_route_out_names_its_resolver_and_no_other_service_does():
+    """Docker's embedded resolver forwards from the DAEMON's namespace - outside the host guard -
+    unless `dns:` is explicit. Only services with a route out may carry one (internal-only
+    services get no external forwarding at all, and must not look like they are meant to)."""
+    out = {n for n, s in SERVICES.items() if _has_route_out(s)}
+    assert out == {"api", "discovery", "telegram", "egress-claude-1", "egress-claude-2",
+                   "egress-codex"}
+    with_dns = {n for n, s in SERVICES.items() if "dns" in s}
+    assert with_dns == out
+    for n in out:
+        assert SERVICES[n]["dns"] == ["${HUNTER_DNS:-10.0.2.3}"], n    # one resolver, one variable
+
+
+def test_the_default_resolver_is_the_slirp4netns_one_the_guard_conf_documents():
+    deployment = (ROOT / "docs" / "deployment.md").read_text()
+    assert "DNS=10.0.2.3" in deployment and "HUNTER_DNS" in deployment
+    assert "HUNTER_DNS" in (ROOT / ".env.example").read_text()
+
+
+def test_nothing_rewrites_the_search_path_or_resolver_options():
+    for name, svc in SERVICES.items():
+        assert not {"dns_search", "dns_opt", "extra_hosts", "domainname"} & set(svc), name

@@ -252,3 +252,60 @@ def test_ci_packet_level_guard_job_is_a_required_failing_job_not_a_skip():
     assert "if" not in PACKET_STEP and "if" not in PROBE_STEP     # always runs, never conditional
     pin = NETNS_JOB["steps"][0]["uses"].split("@")[1].split(" ")[0]
     assert pin == "11bd71901bbe5b1630ceea73d27597364c9af683"
+
+
+# ---- the rootless DNS lab job and the DNS check in the docker job ---------------------------
+LAB_JOB = yaml.safe_load((WF / "ci.yaml").read_text())["jobs"]["rootless-dns-lab"]
+LAB_STEP = next(s for s in LAB_JOB["steps"] if "Real rootless Docker" in s.get("name", ""))
+LAB_PROBE = next(s for s in LAB_JOB["steps"] if "must be available" in s.get("name", ""))
+
+
+def test_dns_lab_is_a_required_failing_job_without_privileges_and_without_a_skip_path():
+    assert "sudo" not in yaml.safe_dump(LAB_JOB) and LAB_JOB["runs-on"] == "ubuntu-22.04"
+    assert LAB_STEP["env"]["HUNTER_ROOTLESS_LAB"] == "1"
+    assert LAB_STEP["env"]["HUNTER_ROOTLESS_LAB_REQUIRED"] == "1"
+    for step in (LAB_STEP, LAB_PROBE):
+        assert step["shell"] == "bash" and "set -euo pipefail" in step["run"]
+    assert "tests/test_dns_rootless_lab.py" in LAB_STEP["run"]
+    assert LAB_JOB["env"]["CI_REQUIRE_SERVICES"] == ""
+
+
+def test_dns_lab_a_failing_or_skipping_pytest_fails_the_step(tmp_path):
+    r = run_step(LAB_STEP, tmp_path, {"python": fake_python("1 failed, 10 passed in 3s", 1)},
+                 env={"HUNTER_ROOTLESS_LAB": "1"})
+    assert r.returncode != 0
+    skip_dir = tmp_path / "skip"
+    skip_dir.mkdir()
+    r = run_step(LAB_STEP, skip_dir, {"python": fake_python("10 passed, 1 skipped in 3s", 0)})
+    assert r.returncode != 0 and "skipped tests" in r.stdout
+    ok_dir = tmp_path / "ok"
+    ok_dir.mkdir()
+    assert run_step(LAB_STEP, ok_dir, {"python": fake_python("11 passed in 3s", 0)}).returncode == 0
+
+
+def test_dns_lab_unavailable_prerequisites_fail_instead_of_reporting_success(tmp_path):
+    tools = {t: "exit 0\n" for t in ("iptables", "ip6tables", "nsenter", "curl", "tar",
+                                      "sha256sum")}
+    r = run_step(LAB_PROBE, tmp_path, {**tools, "unshare": "exit 1\n"})
+    assert r.returncode == 1 and "::error" in r.stdout and "CI blocker" in r.stdout
+    ok_dir = tmp_path / "ok"
+    ok_dir.mkdir()
+    assert run_step(LAB_PROBE, ok_dir, {**tools, "unshare": "exit 0\n"}).returncode == 0
+
+
+def test_docker_job_gives_compose_a_resolver_that_exists_on_a_rootful_runner_and_checks_dns():
+    ci = yaml.safe_load((WF / "ci.yaml").read_text())
+    job = ci["jobs"]["docker"]
+    assert job["env"]["HUNTER_DNS"] == "1.1.1.1"
+    step = next(s for s in job["steps"] if "DNS check runs in the real images" in s.get("name", ""))
+    assert step["env"]["SMOKE_HOST_ISOLATION"] == "report" and step["shell"] == "bash"
+    assert "set -euo pipefail" in step["run"] and "deploy/check-dns.sh" in step["run"]
+    smoke = (WF.parents[1] / "deploy" / "smoke-test.sh").read_text()
+    assert 'check-dns.sh" "$@"' in smoke                  # the smoke test cannot skip it
+    assert "/mnt/check-dns.sh" in (WF / "ci.yaml").read_text()          # and shellcheck sees it
+
+
+def test_all_original_ci_jobs_are_still_there():
+    jobs = set(yaml.safe_load((WF / "ci.yaml").read_text())["jobs"])
+    assert {"lint-test", "rsm-systemd", "host-guard-netns", "shellcheck", "dependency-audit",
+            "secret-scan", "docker"} <= jobs

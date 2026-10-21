@@ -187,9 +187,10 @@ START_TIME="$(start_time)"
 NS_GATE='if [ "$(readlink /proc/self/ns/net)" != "$1" ] || [ "$(readlink /proc/self/ns/user)" != "$2" ]; then
   echo "host-egress-guard: refusing: not in the verified daemon namespaces (daemon restarted?)" >&2; exit 97; fi
 shift 2; exec "$@"'
-NS=(nsenter --preserve-credentials -t "$PID" --user --mount)
-if [[ "$MODE" == detached ]]; then NS+=("--net=$NETNS_FILE"); else NS+=(--net); fi
-NS+=(-- /bin/sh -c "$NS_GATE" guard-ns-gate "$TARGET_NET" "$PID_USER")
+NS_PREFIX=(nsenter --preserve-credentials -t "$PID" --user --mount)
+if [[ "$MODE" == detached ]]; then NS_PREFIX+=("--net=$NETNS_FILE"); else NS_PREFIX+=(--net); fi
+NS_PREFIX+=(-- /bin/sh -c)
+NS=("${NS_PREFIX[@]}" "$NS_GATE" guard-ns-gate "$TARGET_NET" "$PID_USER")
 ipt() { "${NS[@]}" iptables -w 5 "$@"; }
 ipt6() { "${NS[@]}" ip6tables -w 5 "$@"; }
 
@@ -285,7 +286,7 @@ do_plan() {
 # target: rootless daemon namespace $TARGET_NET ($MODE layout, rootlesskit pid $PID); this process / the host is in $OWN_NET
 # DNS exceptions (port 53 only): ${DNS[*]}
 # host addresses protected: ${HOSTS[*]:-none found} ${EXTRA[*]:-}
-# commands (run via: ${NS[*]}):
+# commands (each run via: ${NS_PREFIX[*]} '<namespace gate, NS_GATE in this script>' guard-ns-gate $TARGET_NET $PID_USER):
 #   iptables-restore --noflush      <  the ruleset below
 #   iptables -I DOCKER-USER 1 -i <${BRIDGES[*]}> -j $CHAIN
 #   iptables -I INPUT 1       -i <${BRIDGES[*]}> -j $CHAIN_IN

@@ -107,6 +107,15 @@ CHECK_STUB = textwrap.dedent("""\
     [[ " ${STUB_FAIL_ISOLATION_SHA:-} " == *" $running "* ]] && exit 1
     exit 0
 """)
+DNS_STUB = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    running="$(cat "$STUB_DIR/running" 2>/dev/null)"
+    echo "dns running=$running args=$* SMOKE_HOST_ISOLATION=${SMOKE_HOST_ISOLATION:-}" \
+         "SMOKE_DNS_EXPECT=${SMOKE_DNS_EXPECT:-}" >> "$STUB_DIR/dns.log"
+    [[ -n "${STUB_FAIL_DNS_ALL:-}" ]] && exit 1
+    [[ " ${STUB_FAIL_DNS_SHA:-} " == *" $running "* ]] && exit 1
+    exit 0
+""")
 SS_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
     [[ -n "${STUB_PORT_BUSY:-}" ]] && echo "LISTEN 0 4096 127.0.0.1:18000 0.0.0.0:*"
@@ -136,9 +145,13 @@ class Env:
         self.conf.write_text("ROOTFUL_TARGETS=172.17.0.2:9\n")
         self.conf.chmod(0o644)
         for name, body in (("host-egress-guard.sh", GUARD_STUB),
-                           ("check-host-isolation.sh", CHECK_STUB)):
+                           ("check-host-isolation.sh", CHECK_STUB),
+                           ("check-dns.sh", DNS_STUB)):
             (self.base / "deploy" / name).write_text(body)
             (self.base / "deploy" / name).chmod(0o755)
+        self.guard_conf = self.base / "deploy" / "host-egress-guard.conf"
+        self.guard_conf.write_text("PROTECT=100.107.22.84/32\nDNS=10.0.2.3\n")
+        self.guard_conf.chmod(0o644)
         (self.bin / "docker").write_text(DOCKER_STUB)
         (self.bin / "curl").write_text(CURL_STUB)
         (self.bin / "ss").write_text(SS_STUB)
@@ -220,6 +233,11 @@ class Env:
     @property
     def log(self):
         p = self.stub / "log"
+        return p.read_text() if p.exists() else ""
+
+    @property
+    def dns_log(self):
+        p = self.stub / "dns.log"
         return p.read_text() if p.exists() else ""
 
     @property
@@ -595,7 +613,8 @@ def test_deploy_is_refused_when_the_check_script_is_missing(env):
     assert r.returncode == 11 and untouched(env)
 
 
-@pytest.mark.parametrize("name", ["host-egress-guard.sh", "check-host-isolation.sh"])
+@pytest.mark.parametrize("name", ["host-egress-guard.sh", "check-host-isolation.sh",
+                                  "check-dns.sh"])
 def test_deploy_is_refused_when_a_gate_script_is_writable_by_others(env, name):
     (env.base / "deploy" / name).chmod(0o775)
     r = env.deploy(SHA_A)
@@ -903,3 +922,69 @@ def test_no_deploy_script_ever_names_the_rootful_docker_socket():
         code = "\n".join(ln for ln in (SCRIPT.parent / name).read_text().splitlines()
                          if not ln.lstrip().startswith("#"))
         assert "/var/run/docker.sock" not in code and "/run/docker.sock" not in code, name
+
+
+# ---- DNS: the stack must use the resolver the guard allows, from inside the container ------------
+def test_deploy_is_refused_when_the_dns_check_is_missing_or_untrusted(env):
+    (env.base / "deploy" / "check-dns.sh").unlink()
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    assert "DNS check missing or untrusted" in r.stderr.decode()
+
+
+@pytest.mark.parametrize("content", ["PROTECT=100.107.22.84/32\n", "DNS=\n", "DNS=resolver.lan\n",
+                                     "DNS=10.0.2.3,not-an-ip\n", "DNS=10.0.2\n"])
+def test_deploy_is_refused_without_an_explicit_valid_guard_resolver(env, content):
+    env.guard_conf.write_text(content)
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    assert "host-egress-guard.conf" in r.stderr.decode() and "DNS=" in r.stderr.decode()
+
+
+def test_deploy_is_refused_when_the_guard_conf_is_missing_writable_or_a_symlink(env):
+    env.guard_conf.chmod(0o666)
+    assert env.deploy(SHA_A).returncode == 11
+    env.guard_conf.chmod(0o644)
+    real = env.base / "elsewhere.conf"
+    real.write_text("DNS=10.0.2.3\n")
+    real.chmod(0o644)
+    env.guard_conf.unlink()
+    env.guard_conf.symlink_to(real)
+    assert env.deploy(SHA_A).returncode == 11
+    env.guard_conf.unlink()
+    assert env.deploy(SHA_A).returncode == 11
+
+
+def test_dns_check_runs_in_enforce_mode_with_the_guards_resolver_after_the_isolation_check(env):
+    env.guard_conf.write_text("# policy\nDNS=10.0.2.3\nPROTECT=100.107.22.84/32\n")
+    r = env.deploy(SHA_A)
+    assert r.returncode == 0, r.stderr.decode()
+    log = env.dns_log
+    assert f"dns running={SHA_A} args=-p internship-hunter -f compose.yaml" in log
+    assert "SMOKE_HOST_ISOLATION=enforce SMOKE_DNS_EXPECT=10.0.2.3" in log
+    assert "--env-file" in log and f"release-{SHA_A}.env" in log
+
+
+def test_failed_dns_check_restores_the_previous_release(env):
+    assert env.deploy(SHA_A).returncode == 0
+    r = env.deploy(SHA_B, STUB_FAIL_DNS_SHA=SHA_B)
+    assert r.returncode == 1 and "DNS check FAILED" in r.stderr.decode()
+    assert env.current_link == SHA_A
+    assert (env.stub / "running").read_text().strip() == SHA_A
+    assert f"dns running={SHA_A}" in env.dns_log           # the restored release was gated too
+
+
+def test_first_deploy_with_a_failed_dns_check_is_torn_down(env):
+    r = env.deploy(SHA_A, STUB_FAIL_DNS_SHA=SHA_A)
+    assert r.returncode == 1 and env.current_link is None
+    assert "DOWN" in env.log and not (env.stub / "running").exists()
+
+
+def test_rollback_runs_the_dns_check_on_the_target_and_needs_its_prerequisites(env):
+    env.deploy(SHA_A)
+    env.deploy(SHA_B)
+    (env.stub / "dns.log").write_text("")
+    assert env.run("rollback").returncode == 0
+    assert f"dns running={SHA_A}" in env.dns_log
+    env.guard_conf.write_text("PROTECT=1.2.3.4/32\n")
+    assert env.run("rollback").returncode == 11

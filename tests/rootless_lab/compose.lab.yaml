@@ -1,0 +1,162 @@
+# Test-only override: the REAL compose.yaml topology (networks, dns, internal flags, service names)
+# with every image replaced by the lab's Alpine rootfs and every application process by `sleep`,
+# so that only the NETWORK behaviour of the real file is exercised against a real rootless Docker.
+# Used by tests/test_dns_rootless_lab.py (needs a Compose that understands `!reset`, >= 2.24).
+# (Written out per service: the tags are not honoured through YAML aliases.)
+services:
+  postgres:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  migrate:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  api:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  discovery:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  scheduler:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  session-controller:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  telegram:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  agent-claude-1:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  agent-claude-2:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  agent-codex:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  egress-claude-1:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  egress-claude-2:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"
+  egress-codex:
+    image: alpine-local:3.20
+    build: !reset null
+    entrypoint: !reset []
+    command: [sleep, "3000"]
+    healthcheck: {disable: true}
+    depends_on: !reset {}
+    mem_limit: !reset null
+    cpus: !reset null
+    pids_limit: !reset null
+    volumes: !reset []
+    restart: "no"

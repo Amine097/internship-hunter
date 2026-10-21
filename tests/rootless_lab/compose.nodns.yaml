@@ -1,0 +1,15 @@
+# Test-only override: the services with a route out WITHOUT an explicit resolver, i.e. what compose.yaml
+# looked like before this check existed (tests/test_dns_rootless_lab.py).
+services:
+  api:
+    dns: !reset []
+  discovery:
+    dns: !reset []
+  telegram:
+    dns: !reset []
+  egress-claude-1:
+    dns: !reset []
+  egress-claude-2:
+    dns: !reset []
+  egress-codex:
+    dns: !reset []

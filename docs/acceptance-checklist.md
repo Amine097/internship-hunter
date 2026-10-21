@@ -100,6 +100,13 @@ Derived checks (also run in CI against the Docker runner, in report mode, withou
       chains refused before anything is changed; stale pid file, swapped namespace and killed daemon fail closed
 - [ ] **S** on the production host, read-only: `readlink /proc/self/ns/net /proc/$PID/ns/net` equal, the
       detached file is `nsfs` with a different inode, `"$GUARD" plan` names that inode (docs/deployment.md)
+- [x] **L** DNS on a real rootless daemon with the project's real compose networks
+      (`tests/test_dns_rootless_lab.py`, CI job `rootless-dns-lab`): embedded DNS without `dns:` bypasses the
+      guard; the explicit resolver is guard-policed, a LAN resolver is rejected; internal-only services
+      resolve nothing outside and only their neighbours' names; `deploy/check-dns.sh` (also stubbed:
+      `tests/test_check_dns.py`) catches each misconfiguration; the deploy gate requires `DNS=` in the guard conf
+- [ ] **S** on the production host: V10-V13 (docs/deployment.md, "DNS") after the guard is applied
+- [ ] **S** CLI mode DNS (separate, NOT part of the demo go-live): pinned CLIs hand the hostname to the proxy
 - [x] **L** deploy script gate (stubbed docker): missing/untrusted/inactive guard, unset targets,
       failed enforce check, first-deploy teardown, rollback prerequisites, rootful daemon never used
 - [x] **L** real `egress-proxy.sh` CONNECT to an allow-listed public name keeps working with the guard;

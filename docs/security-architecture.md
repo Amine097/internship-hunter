@@ -116,8 +116,14 @@ Layers, each answering a different question (`docs/deployment.md`, "Host isolati
    (chain contents, jump position, Docker's own jump) and proves the target process is this user's
    rootless daemon; any missing, extra, reordered or edited rule fails it.
 2. **Refuse** - `remote-deploy.sh` will not deploy or roll back unless the root-owned guard reports
-   the full policy active and `EGRESS_FORBIDDEN_TARGETS` is set, and runs the enforce-mode check
-   after `up --wait` (failed first deploy: torn down; failed restore: stack stopped).
+   the full policy active and `EGRESS_FORBIDDEN_TARGETS` is set, and runs the enforce-mode checks
+   after `up --wait`: host reachability and DNS (failed first deploy: torn down; failed restore: stack
+   stopped).
+   *DNS is part of the boundary.* Docker's embedded resolver forwards names from the **daemon's**
+   namespace - outside the guard - unless `dns:` is explicit, so every service with a route out names
+   the one resolver the guard allows (`10.0.2.3`) and `deploy/check-dns.sh` verifies it, together with
+   the facts that internal-only services (the agents) resolve nothing outside the project and that
+   service names resolve only between services sharing a network (docs/deployment.md, "DNS").
 3. **Start gate** - after a daemon restart the restart policy can start containers before the
    guard is re-applied; `api`, `discovery`, `telegram` and the proxies therefore exit at start while
    a forbidden target answers, before any application code runs.
@@ -131,6 +137,9 @@ Layers, each answering a different question (`docs/deployment.md`, "Host isolati
    random port. It counts an open port *and a refusal* as reaching the host, and fails closed unless
    each container first passes its own positive controls. In `report` mode (rootful CI runners) only
    reachability becomes a warning; broken tools, missing output and incomplete coverage stay fatal.
+   `deploy/check-dns.sh` does the same for DNS: services with a route out use the guard-allowed resolver
+   from inside the container, internal-only services resolve nothing outside, names resolve only across
+   shared networks (a leak or a wrong resolver is a breach in every mode).
    The proxy's start check and healthcheck use the same rule: only "unreachable", "prohibited" or
    "timed out" count as isolation, after a self-test proves `nc` works here.
 
