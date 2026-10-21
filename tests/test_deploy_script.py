@@ -68,9 +68,49 @@ DOCKER_STUB = textwrap.dedent("""\
               [[ -f "$STUB_DIR/db_rev" ]] && cat "$STUB_DIR/db_rev"; exit 0
             fi
             [[ -n "${STUB_FAIL_DUMP:-}" ]] && exit 1; echo "-- sql dump" ;;
+          port) if [[ -n "${STUB_WRONG_API_PORT:-}" ]]; then echo "0.0.0.0:8000"
+                else echo "127.0.0.1:18000"; fi ;;
+          down) rm -f "$STUB_DIR/running"; echo "DOWN" >> "$STUB_DIR/log" ;;
           *) exit 0 ;;
         esac ;;
     esac
+""")
+GUARD_STUB = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    echo "guard $*" >> "$STUB_DIR/guard.log"
+    [[ "$1" == status ]] || exit 0
+    [[ -n "${STUB_GUARD_STATUS_FAIL:-}" ]] && { echo "NOT active: stub says so"; exit 1; }
+    echo "active"
+""")
+CHECK_STUB = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    if [[ "${1:-}" == --verify-targets ]]; then
+      {
+        echo "verify EGRESS_FORBIDDEN_TARGETS=${EGRESS_FORBIDDEN_TARGETS:-}" \
+             "SMOKE_ROOTFUL_TARGETS=${SMOKE_ROOTFUL_TARGETS:-}" \
+             "SMOKE_EXPECT_ROOTLESS=${SMOKE_EXPECT_ROOTLESS:-}"
+      } >> "$STUB_DIR/verify.log"
+      [[ -n "${STUB_VERIFY_FAIL:-}" ]] && { echo "FAIL target is not live (stub)"; exit 1; }
+      exit 0
+    fi
+    running="$(cat "$STUB_DIR/running" 2>/dev/null)"
+    {
+      echo "check running=$running args=$*"
+      echo "env SMOKE_HOST_ISOLATION=${SMOKE_HOST_ISOLATION:-}" \
+           "SMOKE_EXPECT_ROOTLESS=${SMOKE_EXPECT_ROOTLESS:-}" \
+           "SMOKE_PROTECTED_IPS=${SMOKE_PROTECTED_IPS:-}" \
+           "SMOKE_ROOTFUL_TARGETS=${SMOKE_ROOTFUL_TARGETS:-}" \
+           "SMOKE_AUTODETECT_HOST_IPS=${SMOKE_AUTODETECT_HOST_IPS:-}" \
+           "SMOKE_PROTECTED_PORTS=${SMOKE_PROTECTED_PORTS:-unset}"
+    } >> "$STUB_DIR/isolation.log"
+    [[ -n "${STUB_FAIL_ISOLATION_ALL:-}" ]] && exit 1
+    [[ " ${STUB_FAIL_ISOLATION_SHA:-} " == *" $running "* ]] && exit 1
+    exit 0
+""")
+SS_STUB = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    [[ -n "${STUB_PORT_BUSY:-}" ]] && echo "LISTEN 0 4096 127.0.0.1:18000 0.0.0.0:*"
+    exit 0
 """)
 CURL_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
@@ -89,9 +129,19 @@ class Env:
         self.bin = tmp / "bin"
         for d in (self.base / "shared", self.stub, self.bin):
             d.mkdir(parents=True)
-        (self.base / "shared" / ".env").write_text("X=1\n")
+        self.env_file = self.base / "shared" / ".env"
+        self.env_file.write_text("X=1\nEGRESS_FORBIDDEN_TARGETS=100.107.22.84:22,100.107.22.84:8000\n")
+        (self.base / "deploy").mkdir()
+        self.conf = self.base / "deploy" / "host-isolation.conf"
+        self.conf.write_text("ROOTFUL_TARGETS=172.17.0.2:9\n")
+        self.conf.chmod(0o644)
+        for name, body in (("host-egress-guard.sh", GUARD_STUB),
+                           ("check-host-isolation.sh", CHECK_STUB)):
+            (self.base / "deploy" / name).write_text(body)
+            (self.base / "deploy" / name).chmod(0o755)
         (self.bin / "docker").write_text(DOCKER_STUB)
         (self.bin / "curl").write_text(CURL_STUB)
+        (self.bin / "ss").write_text(SS_STUB)
         for f in self.bin.iterdir():
             f.chmod(0o755)
         self.key = tmp / "release_key"
@@ -157,7 +207,7 @@ class Env:
     def run(self, command, stdin=b"", **extra):
         env = {
             "PATH": f"{self.bin}:{os.environ['PATH']}", "HOME": str(self.tmp),
-            "HUNTER_BASE": str(self.base), "STUB_DIR": str(self.stub),
+            "HUNTER_BASE": str(self.base), "STUB_DIR": str(self.stub), "HUNTER_TEST_MODE": "1",
             "SSH_ORIGINAL_COMMAND": command, **extra,
         }
         return subprocess.run(["bash", str(SCRIPT)], input=stdin, env=env,
@@ -170,6 +220,11 @@ class Env:
     @property
     def log(self):
         p = self.stub / "log"
+        return p.read_text() if p.exists() else ""
+
+    @property
+    def isolation_log(self):
+        p = self.stub / "isolation.log"
         return p.read_text() if p.exists() else ""
 
     def state(self, name):
@@ -242,6 +297,10 @@ def test_failed_health_check_restores_previous_release(env):
 def test_first_deploy_failure_leaves_nothing_current(env):
     r = env.deploy(SHA_A, STUB_FAIL_UP_SHA=SHA_A)
     assert r.returncode == 1 and env.state("current_sha") is None
+    # R1: a failed FIRST deploy must not leave a half-started release, nor a 'current' symlink
+    assert "DOWN" in env.log and env.current_link is None
+    assert not (env.stub / "running").exists()
+    assert "first deploy" in r.stderr.decode() and "stack stopped" in r.stderr.decode()
 
 
 @pytest.mark.parametrize("kw,code", [
@@ -514,3 +573,333 @@ def test_rsm_override_is_used_only_when_the_operator_enabled_it(env):
     (env.base / "shared" / "rsm.enabled").write_text("")
     assert env.deploy(SHA_B).returncode == 0
     assert "-f compose.yaml -f compose.rsm.yaml" in env.log
+
+
+# ---- R1: the host-isolation gate -------------------------------------------------------------
+def untouched(env):
+    """Nothing was loaded, started, switched or recorded."""
+    return ("docker load" not in env.log and "up -d" not in env.log
+            and env.current_link is None and env.state("current_sha") is None)
+
+
+def test_deploy_is_refused_when_the_guard_script_is_missing(env):
+    (env.base / "deploy" / "host-egress-guard.sh").unlink()
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    assert "host egress guard missing or untrusted" in r.stderr.decode()
+
+
+def test_deploy_is_refused_when_the_check_script_is_missing(env):
+    (env.base / "deploy" / "check-host-isolation.sh").unlink()
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+
+
+@pytest.mark.parametrize("name", ["host-egress-guard.sh", "check-host-isolation.sh"])
+def test_deploy_is_refused_when_a_gate_script_is_writable_by_others(env, name):
+    (env.base / "deploy" / name).chmod(0o775)
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+
+
+def test_deploy_is_refused_when_the_gate_directory_is_writable_by_others(env):
+    (env.base / "deploy").chmod(0o777)
+    assert env.deploy(SHA_A).returncode == 11
+
+
+def test_a_symlinked_gate_script_is_not_trusted(env):
+    real = env.base / "elsewhere.sh"
+    real.write_text(GUARD_STUB)
+    real.chmod(0o755)
+    g = env.base / "deploy" / "host-egress-guard.sh"
+    g.unlink()
+    g.symlink_to(real)
+    assert env.deploy(SHA_A).returncode == 11
+
+
+def test_deploy_is_refused_when_the_guard_reports_inactive(env):
+    r = env.deploy(SHA_A, STUB_GUARD_STATUS_FAIL="1")
+    assert r.returncode == 12 and untouched(env)
+    err = r.stderr.decode()
+    assert "NOT active" in err and "not active with the full expected policy" in err
+    assert "guard status" in (env.stub / "guard.log").read_text()
+
+
+@pytest.mark.parametrize("line", ["", "EGRESS_FORBIDDEN_TARGETS=\n", "EGRESS_FORBIDDEN_TARGETS=x\n",
+                                  "EGRESS_FORBIDDEN_TARGETS=100.107.22.84\n",
+                                  "EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22;id\n",
+                                  "EGRESS_FORBIDDEN_TARGETS=host.example:22\n"])
+def test_deploy_requires_well_formed_forbidden_targets(env, line):
+    env.env_file.write_text("X=1\n" + line)
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    assert "EGRESS_FORBIDDEN_TARGETS" in r.stderr.decode()
+
+
+def test_the_last_forbidden_targets_assignment_wins_as_in_compose(env):
+    env.env_file.write_text("EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22\nEGRESS_FORBIDDEN_TARGETS=\n")
+    assert env.deploy(SHA_A).returncode == 11
+
+
+def test_caller_environment_cannot_supply_the_targets_or_loosen_the_check(env):
+    env.env_file.write_text("X=1\n")
+    r = env.run("deploy", env.bundle(SHA_A), EGRESS_FORBIDDEN_TARGETS="1.2.3.4:22")
+    assert r.returncode == 11
+    env.env_file.write_text("EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22\n")
+    r = env.run("deploy", env.bundle(SHA_A), SMOKE_HOST_ISOLATION="report",
+                SMOKE_AUTODETECT_HOST_IPS="0", SMOKE_PROTECTED_PORTS="1", SMOKE_ROOTFUL_TARGETS="x")
+    assert r.returncode == 0, r.stderr.decode()
+    assert "SMOKE_HOST_ISOLATION=enforce" in env.isolation_log
+    assert "SMOKE_AUTODETECT_HOST_IPS=1" in env.isolation_log
+    assert "SMOKE_PROTECTED_PORTS=unset" in env.isolation_log
+    assert "SMOKE_ROOTFUL_TARGETS=172.17.0.2:9 " in env.isolation_log     # the conf, not "x"
+
+
+def test_isolation_check_runs_in_enforce_mode_after_up_with_the_stacks_compose_args(env):
+    r = env.deploy(SHA_A)
+    assert r.returncode == 0, r.stderr.decode()
+    log = env.isolation_log
+    assert f"check running={SHA_A} args=-p internship-hunter -f compose.yaml" in log
+    assert "--env-file" in log and f"release-{SHA_A}.env" in log
+    assert ("SMOKE_HOST_ISOLATION=enforce SMOKE_EXPECT_ROOTLESS=1 "
+            "SMOKE_PROTECTED_IPS=100.107.22.84 ") in log
+    up = [i for i, ln in enumerate(env.log.splitlines()) if " up -d" in ln][0]
+    assert up < len(env.log.splitlines())            # the check saw the new release running
+
+
+def test_operator_rootful_targets_reach_the_check_from_the_trusted_conf(env):
+    conf = env.base / "deploy" / "host-isolation.conf"
+    conf.write_text("ROOTFUL_TARGETS=172.18.0.5:8080,172.18.0.6:9000\n")
+    conf.chmod(0o644)
+    assert env.deploy(SHA_A).returncode == 0
+    assert "SMOKE_ROOTFUL_TARGETS=172.18.0.5:8080,172.18.0.6:9000" in env.isolation_log
+    conf.chmod(0o666)                      # world-writable: not trusted
+    assert env.deploy(SHA_B).returncode == 11
+
+
+def test_failed_isolation_check_restores_the_previous_release(env):
+    assert env.deploy(SHA_A).returncode == 0
+    r = env.deploy(SHA_B, STUB_FAIL_ISOLATION_SHA=SHA_B)
+    assert r.returncode == 1
+    assert env.current_link == SHA_A and env.state("current_sha") == SHA_A
+    assert "isolation check FAILED" in r.stderr.decode()
+    assert (env.stub / "running").read_text().strip() == SHA_A
+    assert f"check running={SHA_A}" in env.isolation_log     # the restored release was gated too
+
+
+def test_first_deploy_with_failed_isolation_is_torn_down(env):
+    r = env.deploy(SHA_A, STUB_FAIL_ISOLATION_SHA=SHA_A)
+    assert r.returncode == 1
+    assert env.current_link is None and env.state("current_sha") is None
+    assert "DOWN" in env.log and not (env.stub / "running").exists()
+    assert "first deploy" in r.stderr.decode()
+
+
+def test_restore_that_also_fails_isolation_stops_the_stack(env):
+    assert env.deploy(SHA_A).returncode == 0
+    r = env.deploy(SHA_B, STUB_FAIL_ISOLATION_ALL="1")
+    assert r.returncode == 10 and "MANUAL RECOVERY" in r.stderr.decode()
+    assert "DOWN" in env.log and not (env.stub / "running").exists()      # fail closed, not exposed
+
+
+def test_rollback_requires_the_isolation_prerequisites_too(env):
+    assert env.deploy(SHA_A).returncode == 0
+    assert env.deploy(SHA_B).returncode == 0
+    (env.stub / "log").write_text("")
+    r = env.run("rollback", STUB_GUARD_STATUS_FAIL="1")
+    assert r.returncode == 12
+    assert "up -d" not in env.log and env.current_link == SHA_B
+    (env.base / "deploy" / "check-host-isolation.sh").unlink()
+    assert env.run("rollback").returncode == 11
+    env.env_file.write_text("X=1\n")
+    (env.base / "deploy" / "check-host-isolation.sh").write_text(CHECK_STUB)
+    (env.base / "deploy" / "check-host-isolation.sh").chmod(0o755)
+    assert env.run("rollback").returncode == 11
+
+
+def test_rollback_runs_the_enforce_check_on_the_target(env):
+    env.deploy(SHA_A)
+    env.deploy(SHA_B)
+    (env.stub / "isolation.log").write_text("")
+    assert env.run("rollback").returncode == 0
+    assert f"check running={SHA_A}" in env.isolation_log
+    assert "SMOKE_HOST_ISOLATION=enforce" in env.isolation_log
+
+
+def test_rollback_whose_target_fails_isolation_reactivates_the_current_release(env):
+    env.deploy(SHA_A)
+    env.deploy(SHA_B)
+    r = env.run("rollback", STUB_FAIL_ISOLATION_SHA=SHA_A)
+    assert r.returncode == 6
+    assert (env.stub / "running").read_text().strip() == SHA_B and env.current_link != SHA_A
+
+
+def test_rollback_where_nothing_passes_isolation_stops_the_stack(env):
+    env.deploy(SHA_A)
+    env.deploy(SHA_B)
+    r = env.run("rollback", STUB_FAIL_ISOLATION_ALL="1")
+    assert r.returncode == 6 and "DOWN" in env.log
+    assert not (env.stub / "running").exists()
+
+
+# ---- R1: never the rootful daemon ------------------------------------------------------------
+def test_a_rootful_daemon_is_refused_and_the_old_override_no_longer_exists(env):
+    r = env.run("deploy", env.bundle(SHA_A), STUB_ROOTFUL="1", HUNTER_ALLOW_ROOTFUL="1")
+    assert r.returncode == 5 and untouched(env)
+    assert "HUNTER_ALLOW_ROOTFUL" not in SCRIPT.read_text()    # no rootful escape hatch at all
+
+
+def test_production_mode_pins_the_users_own_socket_and_refuses_without_it(env, tmp_path):
+    r = env.run("deploy", b"", HUNTER_TEST_MODE="0", XDG_RUNTIME_DIR=str(tmp_path / "nope"),
+                DOCKER_HOST="unix:///var/run/docker.sock")
+    assert r.returncode == 5 and b"rootless Docker socket" in r.stderr
+    assert env.log == ""                             # no docker command was ever issued
+    script = SCRIPT.read_text()
+    assert 'export DOCKER_HOST="unix://$rd/docker.sock"' in script
+    assert "unset DOCKER_CONTEXT" in script
+
+
+def test_stub_docker_sees_a_pinned_host_in_production_mode(env, tmp_path):
+    sock = tmp_path / "rd" / "docker.sock"
+    sock.parent.mkdir()
+    import socket as _s
+    srv = _s.socket(_s.AF_UNIX)
+    srv.bind(str(sock))
+    try:
+        (env.bin / "docker").write_text("#!/usr/bin/env bash\n"
+                                        "echo \"DOCKER_HOST=$DOCKER_HOST\" >> \"$STUB_DIR/hosts\"\n"
+                                        "case \"$1\" in info) echo '[name=rootless]';; esac\n")
+        r = env.run("rollback", XDG_RUNTIME_DIR=str(sock.parent),
+                    DOCKER_HOST="unix:///var/run/docker.sock")
+        hosts = (env.stub / "hosts").read_text().split()
+        assert hosts and set(hosts) == {f"DOCKER_HOST=unix://{sock}"}, (hosts, r.stderr)
+    finally:
+        srv.close()
+
+
+# ---- R4: the API port ------------------------------------------------------------------------
+def test_health_check_targets_port_18000_and_never_8000(env):
+    assert env.deploy(SHA_A).returncode == 0
+    script = SCRIPT.read_text()
+    assert "http://127.0.0.1:$API_PORT" in script and "API_PORT=18000" in script
+    assert "127.0.0.1:8000" not in script and "localhost:8000" not in script
+
+
+def test_a_listener_that_is_not_our_api_blocks_the_deploy_before_any_change(env):
+    r = env.deploy(SHA_A, STUB_PORT_BUSY="1")
+    assert r.returncode == 3 and untouched(env)
+    assert "port 18000 is already in use" in r.stderr.decode()
+
+
+def test_our_own_running_api_on_18000_is_not_a_conflict(env):
+    assert env.deploy(SHA_A).returncode == 0
+    assert env.deploy(SHA_B, STUB_PORT_BUSY="1").returncode == 0
+
+
+def test_health_check_refuses_an_api_that_publishes_a_different_port(env):
+    """If compose says the api is not on 127.0.0.1:18000, curl must not talk to what is there."""
+    r = env.deploy(SHA_A, STUB_WRONG_API_PORT="1")
+    assert r.returncode == 1 and "expected 127.0.0.1:18000" in r.stderr.decode()
+    assert env.current_link is None
+    curl_calls = (env.stub / "curl.log").read_text() if (env.stub / "curl.log").exists() else ""
+    assert "8000" not in curl_calls
+
+
+def test_port_inspection_failure_fails_closed(env):
+    (env.bin / "ss").write_text("#!/usr/bin/env bash\nexit 1\n")
+    r = env.deploy(SHA_A)
+    assert r.returncode == 3 and untouched(env)
+
+
+# ---- F-6: a rootful container target is REQUIRED ------------------------------------------------
+@pytest.mark.parametrize("content", [None, "", "# nothing\n", "ROOTFUL_TARGETS=\n", "OTHER=1\n"])
+def test_deploy_requires_a_rootful_container_target(env, content):
+    if content is None:
+        env.conf.unlink()
+    else:
+        env.conf.write_text(content)
+        env.conf.chmod(0o644)
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    err = r.stderr.decode()
+    assert "ROOTFUL_TARGETS" in err and "rootful container target" in err
+
+
+def test_rootful_conf_must_be_trusted(env):
+    env.conf.chmod(0o666)
+    assert env.deploy(SHA_A).returncode == 11
+    env.conf.chmod(0o644)
+    real = env.base / "real.conf"
+    real.write_text("ROOTFUL_TARGETS=172.17.0.2:9\n")
+    env.conf.unlink()
+    env.conf.symlink_to(real)
+    assert env.deploy(SHA_A).returncode == 11
+
+
+# ---- F-3: configured targets are verified live from the host before anything changes ------------
+def test_targets_are_verified_with_the_trusted_check_before_any_change(env):
+    r = env.deploy(SHA_A)
+    assert r.returncode == 0, r.stderr.decode()
+    log = (env.stub / "verify.log").read_text()
+    assert "EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22,100.107.22.84:8000" in log
+    assert "SMOKE_ROOTFUL_TARGETS=172.17.0.2:9" in log and "SMOKE_EXPECT_ROOTLESS=1" in log
+
+
+def test_dead_targets_fail_closed_before_anything_changes(env):
+    r = env.deploy(SHA_A, STUB_VERIFY_FAIL="1")
+    assert r.returncode == 11 and untouched(env)
+    assert "not live from the host" in r.stderr.decode()
+    assert "FAIL target is not live" in r.stderr.decode()
+
+
+def test_rollback_also_re_verifies_the_targets(env):
+    env.deploy(SHA_A)
+    env.deploy(SHA_B)
+    (env.stub / "log").write_text("")
+    r = env.run("rollback", STUB_VERIFY_FAIL="1")
+    assert r.returncode == 11 and "up -d" not in env.log and env.current_link == SHA_B
+
+
+def test_host_networking_changes_between_deploys_fail_closed(env):
+    assert env.deploy(SHA_A).returncode == 0
+    assert env.deploy(SHA_B, STUB_VERIFY_FAIL="1").returncode == 11     # e.g. the address moved
+    assert env.current_link == SHA_A and env.state("current_sha") == SHA_A
+
+
+# ---- L-a: the forced-command boundary ------------------------------------------------------------
+def test_production_mode_ignores_every_test_hook_from_the_environment(env):
+    marker = env.tmp / "decoy"
+    r = env.run("deploy", b"", HUNTER_TEST_MODE="0", HUNTER_BASE=str(marker),
+                HUNTER_MAX_BUNDLE_BYTES="1", HUNTER_GUARD_PROC="/tmp/fake",
+                HUNTER_GUARD_TEST_MODE="1", ACCEPT_SCHEMA_REVISION="9999")
+    # the decoy base is never used or even created: production runs against /opt/internship-hunter
+    assert not marker.exists()
+    assert r.returncode in (5, 1)          # no rootless socket / no /opt/internship-hunter here
+
+
+def test_test_mode_is_refused_against_the_production_directory_or_without_a_base(env):
+    for base in ("/opt/internship-hunter", "/opt/internship-hunter/x", ""):
+        extra = {"HUNTER_BASE": base} if base else {}
+        r = subprocess.run(["bash", str(SCRIPT)], input=b"", capture_output=True, timeout=30, env={
+            "PATH": f"{env.bin}:{os.environ['PATH']}", "HOME": str(env.tmp),
+            "STUB_DIR": str(env.stub),
+            "SSH_ORIGINAL_COMMAND": "deploy", "HUNTER_TEST_MODE": "1", **extra})
+        assert r.returncode == 2 and b"HUNTER_TEST_MODE requires HUNTER_BASE" in r.stderr, base
+        assert env.log == ""
+
+
+def test_the_script_cleans_loader_and_interpreter_hooks_in_production_mode():
+    text = SCRIPT.read_text()
+    head = text[:text.index("# Trusted, root-owned copies")]
+    for var in ("BASH_ENV", "LD_PRELOAD", "PYTHONPATH", "HUNTER_GUARD_PROC",
+                "HUNTER_GUARD_TEST_MODE", "ACCEPT_SCHEMA_REVISION"):
+        assert var in head, var
+    assert "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in head
+
+
+def test_no_deploy_script_ever_names_the_rootful_docker_socket():
+    for name in ("remote-deploy.sh", "check-host-isolation.sh", "host-egress-guard.sh",
+                 "smoke-test.sh"):
+        code = "\n".join(ln for ln in (SCRIPT.parent / name).read_text().splitlines()
+                         if not ln.lstrip().startswith("#"))
+        assert "/var/run/docker.sock" not in code and "/run/docker.sock" not in code, name

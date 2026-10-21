@@ -32,10 +32,10 @@ for i in 1 2 3 4 5; do python3 -c 'import secrets; print(secrets.token_urlsafe(4
 docker compose config -q
 docker compose up -d --build
 docker compose ps
-curl -fsS http://127.0.0.1:8000/health
-curl -fsS http://127.0.0.1:8000/ready
+curl -fsS http://127.0.0.1:18000/health
+curl -fsS http://127.0.0.1:18000/ready
 curl -fsS -H "X-Admin-Token: $(grep '^ADMIN_TOKEN=' .env | cut -d= -f2-)" \
-  http://127.0.0.1:8000/profiles
+  http://127.0.0.1:18000/profiles
 ```
 
 If `docker compose config -q` reports an unset password, first update `.env`.
@@ -99,6 +99,9 @@ gitleaks, shellcheck, hadolint, image builds, and a real-daemon compose smoke/is
 (`deploy/smoke-test.sh`). No secrets or
 paid model calls. Deployment is a separate **manual** workflow over Tailscale; see
 `docs/deployment.md` and `docs/acceptance-checklist.md`. Never expose SSH to the Internet.
+On a rootless-Docker host the containers with a route out can dial the host itself unless the
+operator-applied host guard is active (`docs/deployment.md`, "Host isolation"); the smoke test
+must pass in `enforce` mode there before deployment is enabled.
 
 ### Create your private GitHub repository
 
@@ -132,8 +135,8 @@ administrator-approved containers and restores them afterwards.
 
 - `.env`, volumes, account cookies and secrets must never be committed.
 - The queue is a PostgreSQL table with no executable content; agents have no DB access, cannot reach each other, and can only reach their provider through a hostname allow-list proxy (`docs/security-architecture.md`).
-- API is bound to `127.0.0.1:8000`, not exposed to the LAN / public Internet.
-  Use SSH forwarding (`ssh -L 8000:127.0.0.1:8000 host`) or private Tailscale.
+- API is bound to `127.0.0.1:18000` (container port 8000), not exposed to the LAN / public Internet.
+  Use SSH forwarding (`ssh -L 18000:127.0.0.1:18000 host`) or private Tailscale.
 - API requires `X-Admin-Token`. Bot accepts only `TELEGRAM_ALLOWED_USER_ID` in a private chat.
 - Agents have their own credentials. They cannot submit applications in V1.
 - Review any source before adding it; only explicit Greenhouse and Lever handles

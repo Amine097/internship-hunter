@@ -82,15 +82,39 @@ revision; **S** = must be done on the real server. Nothing marked S has been don
 - [ ] **S** provider hostname lists confirmed against the pinned CLI versions (UNVERIFIED);
       behaviour under rootless Docker (slirp4netns/pasta)
 
-## Rootless-host isolation (run `SMOKE_EXPECT_ROOTLESS=1 deploy/smoke-test.sh` on the server)
-Derived checks (also run in CI against the Docker runner, without the rootless assertion):
+## Rootless-host isolation (run `SMOKE_EXPECT_ROOTLESS=1 SMOKE_PROTECTED_IPS=<tailscale ip> deploy/smoke-test.sh` on the server)
+Derived checks (also run in CI against the Docker runner, in report mode, without the rootless assertion):
 - [x] **L** no container mounts the Docker socket or runs privileged; daemon is rootless (**S**)
-- [x] **L** (Docker Desktop VM) the egress proxy cannot reach its gateway/host on ssh, the
-      Docker API, postgres or the API port. **GitHub runner (rootful, sshd on 0.0.0.0): it CAN
-      reach `172.19.0.1:22`** — host-dependent, so CI reports it and the server must enforce it
+- [x] **L** `deploy/check-host-isolation.sh` logic (stubbed containers): every service with a route
+      out (computed from compose) probed against every host address (all interfaces, rootful
+      bridges), default gateway, metadata, MagicDNS, operator-listed rootful targets, a canary and
+      each gateway; a **refusal** counts as reaching the host; fails closed on missing/broken
+      `nc`/`python`, failed exec, unknown/duplicated/missing results, missing gateway, IPv6 route
+- [x] **L** host guard against real iptables and real packets in throwaway namespaces
+      (`tests/test_host_egress_guard_netns.py`): tailnet/host/gateway blocked (also closed ports and
+      `docker0`), Internet + DNS + same-bridge + docker-proxy traffic kept, idempotent, `remove`
+      restores exactly; 9 tamperings detected by `status`; start gate stops/starts a service
+- [x] **L** deploy script gate (stubbed docker): missing/untrusted/inactive guard, unset targets,
+      failed enforce check, first-deploy teardown, rollback prerequisites, rootful daemon never used
+- [x] **L** real `egress-proxy.sh` CONNECT to an allow-listed public name keeps working with the guard;
+      Alpine's busybox `nc -vv -z` texts observed and the probes calibrated against them
+- [x] **L** F-2 start check/healthcheck fail closed (missing/broken nc, unsupported option, silent or
+      localised output, reachable/refused/odd target) - the old script FAILS these tests
+- [x] **L** F-5 report mode softens only reachability; 15 kinds of defect fatal in both modes
+- [x] **L** F-3/F-6 `--verify-targets`: typo, dropped packet, unreachable, refused, reachable listener;
+      required rootful target; deploy gate re-verifies on every deploy and rollback
+- [x] **L** F-1 CI step scripts executed with failing/skipping/passing pytest (the old `pytest | tee` stays green
+      under `bash -e`: reproduced); unavailable namespaces fail the job
+- [x] **L** IPv6 with real packets (host IPv6 address, IPv6 Internet, daemon namespace) blocked by the guard
+- [ ] **CI** the `host-guard-netns` job is GREEN on GitHub (it fails, it does not skip, if namespaces are
+      unavailable) - never run on GitHub from here
 - [x] **L** only loopback-published ports; proxy refuses tailnet (100.64/10, 100.100.100.100),
       RFC1918, link-local, loopback literals and `localhost`
-- [ ] **S** the same three, on the rootless production host, plus Tailscale ACL review
+- [ ] **S** host guard installed + applied + persisted; `EGRESS_FORBIDDEN_TARGETS` set; validation V1-V9
+      of `docs/deployment.md` ("Host isolation") including the negative control and the W1/W2 drills
+- [ ] **S** smoke test passes in **enforce** mode on the rootless production host
+- [ ] **S** (GitHub runner, rootful, sshd on 0.0.0.0) the proxies CAN reach the runner's address:
+      CI reports it, the server must not
 
 ## Server (demo mode) — all **S**
 - [ ] `ss -tlnp`: only the API on loopback; Telegram from owner works, others get no reply

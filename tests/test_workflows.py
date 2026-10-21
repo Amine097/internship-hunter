@@ -131,7 +131,124 @@ def test_ci_smoke_reports_but_deploy_gate_enforces_host_isolation():
     ci = (WF / "ci.yaml").read_text()
     assert "SMOKE_HOST_ISOLATION: report" in ci            # explicit, never implicit
     smoke = (WF.parents[1] / "deploy" / "smoke-test.sh").read_text()
-    assert 'SMOKE_HOST_ISOLATION:-enforce' in smoke        # strict unless told otherwise
+    check = (WF.parents[1] / "deploy" / "check-host-isolation.sh").read_text()
+    assert 'SMOKE_HOST_ISOLATION:-enforce' in check        # strict unless told otherwise
+    assert 'check-host-isolation.sh" "$@"' in smoke        # and the smoke test cannot skip it
     assert "SMOKE_HOST_ISOLATION" not in (WF / "deploy.yaml").read_text()
     doc = (WF.parents[1] / "docs" / "deployment.md").read_text()
     assert "enforce" in doc and "SMOKE_EXPECT_ROOTLESS=1" in doc
+
+
+def github_shell(step):
+    """The command GitHub runs for a `run:` step: an unset `shell:` is `bash -e {0}` (NO pipefail),
+    `shell: bash` is `bash --noprofile --norc -eo pipefail {0}`."""
+    if step.get("shell") == "bash":
+        return ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
+    return ["bash", "-e"]
+
+
+def run_step(step, tmp_path, stubs, env=None):
+    import subprocess
+    script = tmp_path / "step.sh"
+    script.write_text(step["run"])
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    for name, body in stubs.items():
+        f = bindir / name
+        f.write_text("#!/bin/bash\n" + body)
+        f.chmod(0o755)
+    e = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path),
+         "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"), **(env or {})}
+    return subprocess.run([*github_shell(step), str(script)], cwd=tmp_path, env=e,
+                          capture_output=True, text=True, timeout=60)
+
+
+NETNS_JOB = yaml.safe_load((WF / "ci.yaml").read_text())["jobs"]["host-guard-netns"]
+PACKET_STEP = next(s for s in NETNS_JOB["steps"] if "Packet-level guard tests" in s.get("name", ""))
+PROBE_STEP = next(s for s in NETNS_JOB["steps"] if "must be available" in s.get("name", ""))
+
+
+def fake_python(output, rc):
+    return f"cat <<'EOF'\n{output}\nEOF\nexit {rc}\n"
+
+
+def test_f1_the_old_construct_really_hid_a_failing_pytest():
+    """Reproduction of the finding: `pytest | tee` under GitHub's default `bash -e` stays green."""
+    import subprocess
+    old = "false | tee netns.log\n! grep -qE '[0-9]+ (skipped|deselected)' netns.log\n"
+    r = subprocess.run(["bash", "-e", "-c", old], capture_output=True)
+    assert r.returncode == 0                                      # <- the bug: green job
+    r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", old],
+                       capture_output=True)
+    assert r.returncode != 0                                      # pipefail is what fixes it
+
+
+def test_f1_a_failing_pytest_fails_the_packet_step(tmp_path):
+    r = run_step(PACKET_STEP, tmp_path, {"python": fake_python("1 failed, 16 passed in 3s", 1)},
+                 env={"GUARD_NETNS_REQUIRED": "1"})
+    assert r.returncode != 0, r.stdout + r.stderr
+
+
+def test_f1_a_skipping_pytest_fails_the_packet_step(tmp_path):
+    r = run_step(PACKET_STEP, tmp_path, {"python": fake_python("16 passed, 1 skipped in 3s", 0)})
+    assert r.returncode != 0 and "skipped tests" in r.stdout
+
+
+def test_f1_a_passing_pytest_passes_the_packet_step(tmp_path):
+    r = run_step(PACKET_STEP, tmp_path, {"python": fake_python("17 passed in 3s", 0)})
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_f1_unavailable_namespaces_fail_the_required_job_instead_of_reporting_success(tmp_path):
+    stubs = {"unshare": "exit 1\n", "iptables": "exit 0\n", "ip6tables": "exit 0\n",
+             "nsenter": "exit 0\n"}
+    r = run_step(PROBE_STEP, tmp_path, stubs)
+    assert r.returncode == 1
+    assert "::error" in r.stdout and "CI blocker" in r.stdout
+    summary = (tmp_path / "summary.md").read_text()
+    assert "BLOCKED" in summary and "ubuntu-22.04" in summary
+    ok_dir = tmp_path / "ok"
+    ok_dir.mkdir()
+    assert run_step(PROBE_STEP, ok_dir, {**stubs, "unshare": "exit 0\n"}).returncode == 0
+    missing = {k: v for k, v in stubs.items() if k != "ip6tables"}
+    missing["unshare"] = "exit 0\n"
+    miss_dir = tmp_path / "miss"
+    miss_dir.mkdir()
+    assert run_step(PROBE_STEP, miss_dir, missing).returncode == 1
+
+
+def test_f1_every_piped_step_of_the_security_jobs_runs_with_pipefail():
+    import re
+    ci = yaml.safe_load((WF / "ci.yaml").read_text())
+    for job_name in ("host-guard-netns", "rsm-systemd"):
+        for step in ci["jobs"][job_name]["steps"]:
+            run = step.get("run", "")
+            if re.search(r"\|\s*tee\b|\|\s*grep\b", run):
+                assert step.get("shell") == "bash", (job_name, step.get("name"))
+                assert "set -euo pipefail" in run, (job_name, step.get("name"))
+
+
+def test_ci_real_images_exercise_the_probe_tools_and_defects_stay_fatal_in_report_mode():
+    ci = yaml.safe_load((WF / "ci.yaml").read_text())
+    steps = ci["jobs"]["docker"]["steps"]
+    step = next(s for s in steps if "Probe tools run in the real images" in s.get("name", ""))
+    assert step["env"]["SMOKE_HOST_ISOLATION"] == "report" and step["shell"] == "bash"
+    assert "probe controls verified in" in step["run"] and "set -euo pipefail" in step["run"]
+    # ... and report mode does not soften defects (tests/test_host_isolation_check.py)
+    check = (WF.parents[1] / "deploy" / "check-host-isolation.sh").read_text()
+    assert "defects are fatal in every mode" in check
+
+
+def test_ci_packet_level_guard_job_is_a_required_failing_job_not_a_skip():
+    text = (WF / "ci.yaml").read_text()
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    # the project rule: never relax the AppArmor userns restriction, and no sudo outside rsm-systemd
+    assert "sysctl -w" not in code and "apparmor_restrict_unprivileged_userns=0" not in code
+    assert "sudo" not in yaml.safe_dump(NETNS_JOB) and NETNS_JOB["runs-on"] == "ubuntu-22.04"
+    assert PACKET_STEP["env"]["GUARD_NETNS_REQUIRED"] == "1"
+    names = [s.get("name", "") for s in NETNS_JOB["steps"]]
+    assert not any("EXPLICIT SKIP" in n for n in names)           # no success-on-skip path any more
+    assert "continue-on-error" not in yaml.safe_dump(NETNS_JOB)
+    assert "if" not in PACKET_STEP and "if" not in PROBE_STEP     # always runs, never conditional
+    pin = NETNS_JOB["steps"][0]["uses"].split("@")[1].split(" ")[0]
+    assert pin == "11bd71901bbe5b1630ceea73d27597364c9af683"
