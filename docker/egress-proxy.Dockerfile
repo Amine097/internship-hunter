@@ -1,4 +1,4 @@
-FROM alpine:3.20
+FROM alpine:3.24
 # base image is pinned to an Alpine release; its package set is the pin
 # hadolint ignore=DL3018
 RUN apk add --no-cache tinyproxy \
