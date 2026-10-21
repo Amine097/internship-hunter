@@ -240,7 +240,8 @@ def lab(tmp_path_factory):
         for name in ("dockerd.log", "runc.args"):
             if (path / name).exists():
                 shutil.copy(path / name, Path(keep) / name)
-        shutil.copy(path / "home" / ".config" / "docker" / "daemon.json", Path(keep) / "daemon.json")
+        conf = path / "home" / ".config" / "docker" / "daemon.json"
+        shutil.copy(conf, Path(keep) / "daemon.json")
     lab.run([LAB_SH, "down"], check=False, timeout=120)
 
 
