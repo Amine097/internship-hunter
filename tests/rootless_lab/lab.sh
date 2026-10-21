@@ -132,7 +132,7 @@ start() {
   (
     export XDG_RUNTIME_DIR="$XDG" HOME="$LAB/home" PATH="$LAB/bin:$PATH" DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns
     export DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS="--subid-source=dynamic"
-    exec setsid "$LAB/bin/dockerd-rootless.sh" --group root --data-root "$LAB/data" --host "unix://$XDG/docker.sock" \
+    exec setsid "$LAB/bin/dockerd-rootless.sh" --group root --config-file "$LAB/home/.config/docker/daemon.json" --data-root "$LAB/data" --host "unix://$XDG/docker.sock" \
       >"$LAB/dockerd.log" 2>&1
   ) &
   for _ in $(seq 1 60); do
