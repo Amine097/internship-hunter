@@ -21,13 +21,18 @@
 #    isolation"): the root-owned host-egress-guard.sh reports its FULL policy active (exit 12),
 #    EGRESS_FORBIDDEN_TARGETS is set (exit 11), and after `up --wait` the root-owned
 #    check-host-isolation.sh passes in ENFORCE mode from every container with a route out, and the
-#    root-owned check-dns.sh confirms DNS takes the guard-policed path (and, BEFORE anything is
-#    loaded or started, that the RENDERED compose dns equals the conf's DNS=; the caller's HUNTER_DNS
-#    is ignored) (the resolver is the one
-#    host-egress-guard.conf allows) and that internal-only services resolve nothing outside; a
-#    failure is a failed activation (previous release restored; a first deploy is torn down)
+#    root-owned check-dns.sh confirms DNS takes the guard-policed path (the resolver is the one
+#    host-egress-guard.conf allows) and that internal-only services resolve nothing outside; before
+#    anything is loaded or started the RENDERED compose dns must equal that conf's DNS= (the caller's
+#    HUNTER_DNS is ignored); a failure is a failed activation (previous release restored; a first
+#    deploy is torn down)
+#  * runtime containment: refuses to deploy unless the root-owned runtime-containment.sh watchdog is
+#    alive and not latched (exit 13); a release is committed to it only after every gate above passed
+#    (it then supervises the services with a route out and the agents: docs/deployment.md, "Runtime
+#    containment"), and a stack this script tears down is recorded as intentionally stopped
 #  * exit codes: 2 bad input, 3 missing files/ports, 4 locked, 5 not rootless, 7 integrity,
-#    8 backup, 9 schema, 10/6 restore failed (stack stopped), 11 isolation prerequisites, 12 guard
+#    8 backup, 9 schema, 10/6 restore failed (stack stopped), 11 isolation prerequisites, 12 guard,
+#    13 runtime containment inactive or latched
 set -Eeuo pipefail
 
 # ---- the forced-command boundary --------------------------------------------------------------
@@ -63,6 +68,7 @@ ISOLATION_CHECK="$BASE/deploy/check-host-isolation.sh"
 ISOLATION_CONF="$BASE/deploy/host-isolation.conf"      # REQUIRED: ROOTFUL_TARGETS=ip:port,...
 DNS_CHECK="$BASE/deploy/check-dns.sh"
 GUARD_CONF="$BASE/deploy/host-egress-guard.conf"       # REQUIRED here: DNS=<the one resolver the guard allows>
+CONTAINMENT="$BASE/deploy/runtime-containment.sh"      # REQUIRED: keeps the isolation true AFTER this script is done
 API_PORT=18000          # host side; the container side stays 8000 (Gluetun lives on tailnet:8000)
 KEEP_RELEASES=5
 PROJECT=internship-hunter
@@ -185,6 +191,8 @@ require_isolation_prereqs() { # nothing is changed before these hold
     || die "isolation check missing or untrusted: $ISOLATION_CHECK must exist, be executable, root-owned and not writable by others" 11
   trusted_file "$DNS_CHECK" \
     || die "DNS check missing or untrusted: $DNS_CHECK must exist, be executable, root-owned and not writable by others" 11
+  trusted_file "$CONTAINMENT" \
+    || die "runtime containment missing or untrusted: $CONTAINMENT must exist, be executable, root-owned and not writable by others" 11
   guard_dns >/dev/null \
     || die "$GUARD_CONF must exist (root-owned, not writable by others) and set DNS=<ip>: the single resolver the guard lets containers use (slirp4netns: 10.0.2.3; docs/deployment.md, \"DNS\")" 11
   forbidden_targets >/dev/null \
@@ -202,6 +210,11 @@ require_isolation_prereqs() { # nothing is changed before these hold
   if ! out="$("$GUARD" status 2>&1)"; then
     echo "$out" >&2
     die "host egress guard is not active with the full expected policy (run '$GUARD apply'; docs/deployment.md)" 12
+  fi
+  # the watchdog that keeps all of this true after the deploy: alive (fresh heartbeat) and not latched
+  if ! out="$("$CONTAINMENT" status --require-active 2>&1)"; then
+    echo "$out" >&2
+    die "runtime containment is not active (watchdog not running, or latched after an incident): systemctl --user status hunter-containment; docs/deployment.md, \"Runtime containment\"" 13
   fi
 }
 
@@ -257,6 +270,9 @@ port_preflight() { # read-only: 127.0.0.1:$API_PORT must be free, or held by OUR
 stop_stack() { # fail closed: tear the project down (never volumes) rather than leave it exposed
   local sha="$1"
   echo "deploy: stopping the stack (docker compose down; volumes are kept)" >&2
+  # first: the watchdog must not restart what is being torn down
+  "$CONTAINMENT" desired stopped >/dev/null 2>&1 \
+    || echo "deploy: WARNING could not record 'desired: stopped' for the containment watchdog" >&2
   compose "$sha" down --remove-orphans >/dev/null 2>&1 \
     || echo "deploy: WARNING 'compose down' failed; stop the project by hand: docker compose -p $PROJECT down" >&2
 }
@@ -270,6 +286,15 @@ verify_running_images() { # every first-party container must run exactly this re
     echo "deploy: containers are not running release $sha (found: ${bad:-only $n matching})" >&2
     return 1
   fi
+}
+
+containment_commit() { # containment_commit <sha>: put the verified release under runtime containment
+  local sha="$1" targets ips t
+  targets="$(forbidden_targets)" || return 1
+  ips="$(for t in ${targets//,/ }; do echo "${t%:*}"; done | sort -u | tr '\n' ' ')"
+  compose_args "$sha"
+  "$CONTAINMENT" commit --sha "$sha" --release-dir "$BASE/releases/$sha" --forbidden "$targets" \
+    --protected-ips "$ips" --rootful "$(rootful_targets)" -- "${CARGS[@]}"
 }
 
 activate() { # activate <sha>: start (never build) the release, then verify it
@@ -287,6 +312,9 @@ activate() { # activate <sha>: start (never build) the release, then verify it
   verify_running_images "$sha" || return 1
   health_check "$sha" || return 1
   isolation_gate "$sha" || return 1
+  # last: the watchdog takes over only a release that passed everything above (its contract is written
+  # under this script's lock; a refusal, e.g. a supervised service with a restart policy, fails the activation)
+  containment_commit "$sha" || { echo "deploy: runtime containment refused release $sha" >&2; return 1; }
 }
 
 set_current() { ln -sfn "$BASE/releases/$1" "$BASE/current.new" && mv -Tf "$BASE/current.new" "$BASE/current"; }

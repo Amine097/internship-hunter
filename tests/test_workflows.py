@@ -267,6 +267,7 @@ def test_dns_lab_is_a_required_failing_job_without_privileges_and_without_a_skip
     for step in (LAB_STEP, LAB_PROBE):
         assert step["shell"] == "bash" and "set -euo pipefail" in step["run"]
     assert "tests/test_dns_rootless_lab.py" in LAB_STEP["run"]
+    assert "tests/test_runtime_containment_lab.py" in LAB_STEP["run"]   # containment, real daemon
     assert LAB_JOB["env"]["CI_REQUIRE_SERVICES"] == ""
 
 
@@ -309,3 +310,11 @@ def test_all_original_ci_jobs_are_still_there():
     jobs = set(yaml.safe_load((WF / "ci.yaml").read_text())["jobs"])
     assert {"lint-test", "rsm-systemd", "host-guard-netns", "shellcheck", "dependency-audit",
             "secret-scan", "docker"} <= jobs
+
+
+def test_runtime_containment_script_is_linted_and_no_ci_job_was_dropped():
+    ci = (WF / "ci.yaml").read_text()
+    assert "/mnt/runtime-containment.sh" in ci                       # shellcheck sees it
+    jobs = yaml.safe_load(ci)["jobs"]
+    assert "rootless-dns-lab" in jobs and len(jobs) == 8             # none dropped or optional
+    assert "continue-on-error" not in yaml.safe_dump(jobs["rootless-dns-lab"])

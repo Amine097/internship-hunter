@@ -110,6 +110,19 @@ Derived checks (also run in CI against the Docker runner, in report mode, withou
       refuses it in every mode; the raw-UDP probe has a positive control (sabotaged probe = defect, a blocked
       query = a different class); the rendered compose DNS is compared with the guard conf before images are
       loaded / before `up` / before a rollback, and the caller's `HUNTER_DNS` is removed
+- [x] **L** runtime containment (`tests/test_runtime_containment.py`, stateful fake daemon, 70+ cases; and
+      `tests/test_runtime_containment_lab.py`, real rootless Docker + real guard + real `check-dns.sh`): guard
+      rule deleted / guard removed / daemon restarted (stop, repair, start; never start before a verified
+      guard; the daemon starts none of the supervised set), hot `network connect`, foreign container on an
+      agent network, internal flag lost, host-network/privileged/Docker-socket container, daemon-level `dns`,
+      Tailscale late, latch and `reset`, dead-man `quarantine --no-latch`, flapping, deploy lock (pause / hung
+      deploy), false positives (ad hoc containers, replica, exited `migrate`, host resolver change)
+- [x] **L** deploy gate (stubbed docker + stub watchdog): refused without a trusted, alive, un-latched
+      watchdog (exit 11/13), release committed only after every gate and with the isolation parameters,
+      refusal = failed activation (previous release restored and re-committed), `desired: stopped` recorded
+      before a teardown
+- [ ] **S** on the production host: `hunter-containment` user unit installed and active (V14), restart
+      policies (V15), reboot drill with Tailscale coming up late (V16)
 - [ ] **S** on the production host: V10-V13 incl. V10b/V11b (docs/deployment.md, "DNS") after the guard is
       applied; `~hunter-deploy/.config/docker/daemon.json` has no `dns` key
 - [ ] **S** CLI mode DNS (separate, NOT part of the demo go-live): pinned CLIs hand the hostname to the proxy

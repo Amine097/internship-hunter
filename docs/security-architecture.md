@@ -134,8 +134,19 @@ Layers, each answering a different question (`docs/deployment.md`, "Host isolati
 4. **Detect at runtime** - the proxy's healthcheck *reports* unhealthy if it can reach anything listed in
    `EGRESS_FORBIDDEN_TARGETS` (e.g. `100.107.22.84:22,100.107.22.84:8000`). That only prevents agents
    from *starting* behind it and fails `compose up --wait`; an unhealthy container is not stopped or
-   restarted, and nothing at all watches `discovery`/`telegram`/`api` while they run. Removing the
-   guard at runtime is therefore a documented blocker for `AGENT_MODE=cli`.
+   restarted. **What watches the stack while it runs is `deploy/runtime-containment.sh`** (docs/deployment.md,
+   "Runtime containment"): a root-owned watchdog, under a systemd user unit with a dead-man switch, that
+   re-verifies every cycle and on Docker/host events - the full guard policy, the networks every project
+   container is attached to (a hot `docker network connect`, a foreign container on an agent network, an
+   internal network that stopped being internal), how a container was started (host network, privileged, the
+   Docker socket), the runtime resolver state (no agent carries an upstream; no service with a route out
+   escapes the guard-policed resolver), the DNS configuration and the host resolver (warning). The services
+   with a route out and the agents are `restart: "no"`: the daemon starts none of them after a reboot; the
+   watchdog does, once the guard is verified and the protected host addresses (Tailscale) are live. When an
+   invariant is lost it stops them, removes the unauthorised endpoint and keeps the container for forensics;
+   integrity events latch until `reset`, missing prerequisites heal by themselves (three in 15 minutes
+   latch). This removes the "removing the guard at runtime is not noticed" blocker for `AGENT_MODE=cli`; the
+   remaining CLI blockers are listed in docs/deployment.md.
 5. **Verify** - `deploy/check-host-isolation.sh` dials every protected address from every container
    with a route out (computed from `compose config`) with raw TCP, including a canary listener on a
    random port. It counts an open port *and a refusal* as reaching the host, and fails closed unless

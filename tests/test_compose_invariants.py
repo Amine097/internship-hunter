@@ -284,3 +284,17 @@ def test_the_default_resolver_is_the_slirp4netns_one_the_guard_conf_documents():
 def test_nothing_rewrites_the_search_path_or_resolver_options():
     for name, svc in SERVICES.items():
         assert not {"dns_search", "dns_opt", "extra_hosts", "domainname"} & set(svc), name
+
+
+def test_the_services_the_docker_daemon_must_not_start_by_itself_have_no_restart_policy():
+    """Services with a route out and agents are started only by deploy/runtime-containment.sh,
+    after the host guard is verified; the data tier keeps Docker's restart policy."""
+    nets = COMPOSE["networks"]
+    for name, svc in COMPOSE["services"].items():
+        routed = any(not (nets[n] or {}).get("internal") for n in svc.get("networks", []))
+        if routed or name.startswith("agent-"):
+            assert svc.get("restart") == "no", f"{name}: the daemon would start it after a reboot"
+        elif name == "migrate":
+            assert svc.get("restart") == "no"
+        else:
+            assert svc.get("restart") == "unless-stopped", name

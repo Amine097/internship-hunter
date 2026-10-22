@@ -168,6 +168,26 @@ DNS_STUB = textwrap.dedent("""\
     [[ " ${STUB_FAIL_DNS_SHA:-} " == *" $running "* ]] && exit 1
     exit 0
 """)
+CONTAINMENT_STUB = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    running="$(cat "$STUB_DIR/running" 2>/dev/null)"
+    echo "containment $* [running=$running]" >> "$STUB_DIR/containment.log"
+    echo "containment $1" >> "$STUB_DIR/log"          # the same timeline as the docker calls
+    case "$1" in
+      status)
+        if [[ -n "${STUB_CONTAINMENT_STATUS:-}" ]]; then
+          echo "containment status stub: $STUB_CONTAINMENT_STATUS" >&2
+          exit "$STUB_CONTAINMENT_STATUS"
+        fi
+        exit 0 ;;
+      commit)
+        if [[ " ${STUB_FAIL_COMMIT_SHA:-} " == *" $running "* ]]; then
+          echo "commit refused (stub)" >&2; exit 11
+        fi
+        exit 0 ;;
+    esac
+    exit 0
+""")
 SS_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
     [[ -n "${STUB_PORT_BUSY:-}" ]] && echo "LISTEN 0 4096 127.0.0.1:18000 0.0.0.0:*"
@@ -198,7 +218,8 @@ class Env:
         self.conf.chmod(0o644)
         for name, body in (("host-egress-guard.sh", GUARD_STUB),
                            ("check-host-isolation.sh", CHECK_STUB),
-                           ("check-dns.sh", DNS_STUB)):
+                           ("check-dns.sh", DNS_STUB),
+                           ("runtime-containment.sh", CONTAINMENT_STUB)):
             (self.base / "deploy" / name).write_text(body)
             (self.base / "deploy" / name).chmod(0o755)
         self.guard_conf = self.base / "deploy" / "host-egress-guard.conf"
@@ -292,6 +313,11 @@ class Env:
     @property
     def dns_log(self):
         p = self.stub / "dns.log"
+        return p.read_text() if p.exists() else ""
+
+    @property
+    def containment_log(self):
+        p = self.stub / "containment.log"
         return p.read_text() if p.exists() else ""
 
     @property
@@ -1143,3 +1169,78 @@ def test_the_gate_expects_exactly_what_the_guard_conf_says(env):
     assert r.returncode == 0, r.stderr.decode()      # guard and compose agree on a public resolver
     assert "SMOKE_DNS_EXPECT=1.1.1.1" in env.dns_config_log
     assert "SMOKE_DNS_EXPECT=1.1.1.1" in env.dns_log
+
+
+# ---- runtime containment: the watchdog that keeps the isolation true after the deploy -----------
+def test_deploy_is_refused_when_the_containment_watchdog_script_is_missing_or_untrusted(env):
+    (env.base / "deploy" / "runtime-containment.sh").chmod(0o775)
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    assert "runtime containment missing or untrusted" in r.stderr.decode()
+    (env.base / "deploy" / "runtime-containment.sh").unlink()
+    assert env.deploy(SHA_A).returncode == 11
+
+
+@pytest.mark.parametrize("status", ["20", "21"])
+def test_deploy_and_rollback_are_refused_while_the_watchdog_is_dead_or_latched(env, status):
+    r = env.deploy(SHA_A, STUB_CONTAINMENT_STATUS=status)
+    assert r.returncode == 13 and untouched(env)
+    assert "runtime containment is not active" in r.stderr.decode()
+    assert env.deploy(SHA_A).returncode == 0
+    assert env.deploy(SHA_B).returncode == 0
+    r = env.run("rollback", STUB_CONTAINMENT_STATUS=status)
+    assert r.returncode == 13 and env.current_link == SHA_B
+
+
+def test_the_status_check_is_the_require_active_one(env):
+    assert env.deploy(SHA_A).returncode == 0
+    assert "containment status --require-active" in env.containment_log
+
+
+def test_a_release_is_committed_only_after_every_gate_passed_with_the_isolation_parameters(env):
+    r = env.deploy(SHA_A)
+    assert r.returncode == 0, r.stderr.decode()
+    commits = [ln for ln in env.containment_log.splitlines() if ln.startswith("containment commit")]
+    assert len(commits) == 1
+    c = commits[0]
+    assert f"--sha {SHA_A}" in c and f"--release-dir {env.base}/releases/{SHA_A}" in c
+    assert "--forbidden 100.107.22.84:22,100.107.22.84:8000" in c
+    assert "--protected-ips 100.107.22.84" in c and "--rootful 172.17.0.2:9" in c
+    assert "-- -p internship-hunter -f compose.yaml --env-file" in c
+    # ... and by then the stack is up and both isolation checks ran for this release
+    assert f"[running={SHA_A}]" in c
+    assert f"dns running={SHA_A}" in env.dns_log and f"check running={SHA_A}" in env.isolation_log
+
+
+def test_a_release_the_watchdog_refuses_is_not_kept_and_the_previous_one_is_restored(env):
+    assert env.deploy(SHA_A).returncode == 0
+    r = env.deploy(SHA_B, STUB_FAIL_COMMIT_SHA=SHA_B)
+    assert r.returncode == 1 and "runtime containment refused release" in r.stderr.decode()
+    assert env.current_link == SHA_A and (env.stub / "running").read_text().strip() == SHA_A
+    commits = [ln for ln in env.containment_log.splitlines() if ln.startswith("containment commit")]
+    assert f"--sha {SHA_A}" in commits[-1]            # the restored release is committed again
+
+
+def test_a_first_deploy_the_watchdog_refuses_is_torn_down_and_recorded_as_stopped(env):
+    r = env.deploy(SHA_A, STUB_FAIL_COMMIT_SHA=SHA_A)
+    assert r.returncode == 1 and env.current_link is None
+    timeline = env.log.splitlines()
+    assert "DOWN" in timeline and "containment desired" in timeline
+    # the watchdog is told BEFORE the stack is torn down, so it cannot restart what is being removed
+    assert timeline.index("containment desired") < timeline.index("DOWN")
+    assert "containment desired stopped" in env.containment_log
+
+
+def test_a_failed_gate_never_reaches_the_commit(env):
+    env.deploy(SHA_A, STUB_FAIL_DNS_SHA=SHA_A)
+    assert "containment commit" not in env.containment_log
+    env.deploy(SHA_B, STUB_FAIL_ISOLATION_SHA=SHA_B)
+    assert f"--sha {SHA_B}" not in env.containment_log
+
+
+def test_rollback_commits_the_release_it_restored(env):
+    env.deploy(SHA_A)
+    env.deploy(SHA_B)
+    assert env.run("rollback").returncode == 0
+    commits = [ln for ln in env.containment_log.splitlines() if ln.startswith("containment commit")]
+    assert f"--sha {SHA_A}" in commits[-1]

@@ -255,7 +255,7 @@ through `10.0.2.3`, so a compromised *proxy* still has DNS as a covert channel t
 | F-2 | no positive control for the direct UDP probe | **fixed here**: see "The raw-UDP probe has a positive control" |
 | F-3 | DNS mismatch only detected after startup | **fixed here**: see "The rendered DNS is judged before anything starts" |
 | F-4 | open in the review; **not part of this patch** (no change made or implied by it) | open |
-| F-5 | CLI runtime containment (what a pinned Claude/Codex CLI may do inside `AGENT_MODE=cli`, and the blockers listed above) | open; **not part of this patch**; CLI mode stays disabled |
+| F-5 | runtime containment after the deploy (topology/guard/DNS drift, Tailscale late, a failed prerequisite must not leave agents running) | **addressed by "Runtime containment" (this change)**; CLI mode itself stays disabled (the other blockers above remain) |
 
 ### The deploy gate (what `remote-deploy.sh` now enforces)
 
@@ -270,12 +270,15 @@ For `deploy`, `deploy-irreversible` **and** `rollback`, before anything is read,
 | `deploy/host-egress-guard.conf` (regular file, not a symlink, root-owned, not group/world-writable) sets `DNS=<ipv4>[,...]`: the resolver the guard lets containers use, which `check-dns.sh` then requires the stack to use | exit 11 |
 | the **rendered** compose DNS (effective `shared/.env` values; the caller's `HUNTER_DNS` is removed) equals `DNS=` of that conf for every service with a route out and is absent for internal-only ones - checked after unpacking the release, before images are loaded or anything starts, before a rollback changes anything, and again before every `compose up` | exit 11 |
 | `host-egress-guard.sh status` exits 0: the **full** policy is installed and unmodified | exit 12 |
+| `deploy/runtime-containment.sh` is a root-owned executable, its watchdog has a fresh heartbeat and is **not latched** (`status --require-active`) | exit 11 / **13** |
 | `127.0.0.1:18000` is free, or held by this application's own running `api` (read-only `ss`) | exit 3 |
 
 After `compose up --wait` and the health checks, `check-host-isolation.sh` runs in **enforce**
 mode with `SMOKE_PROTECTED_IPS` taken from the targets and `SMOKE_ROOTFUL_TARGETS` from the conf
 (ambient `SMOKE_*` variables are removed first), followed by `check-dns.sh` in enforce mode with
-`SMOKE_DNS_EXPECT` = the guard conf's `DNS=` (see "DNS"); either failing is a failed activation.
+`SMOKE_DNS_EXPECT` = the guard conf's `DNS=` (see "DNS"); either failing is a failed activation. Only then
+is the release **committed** to the runtime-containment watchdog (see "Runtime containment"); a refusal
+there is a failed activation too, and a stack the script tears down is first recorded as `desired: stopped`.
 
 **The forced-command boundary.** Whatever environment the SSH session arrives with, production runs
 only against `/opt/internship-hunter`, with `PATH` fixed and `BASH_ENV`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
@@ -297,7 +300,7 @@ D=/opt/internship-hunter/deploy; GUARD=$D/host-egress-guard.sh
 ```
 
 0. **Install** (root; the deploy user must not be able to edit a security control or its directory):
-   `sudo install -o root -g root -m 0755 deploy/host-egress-guard.sh deploy/check-host-isolation.sh deploy/check-dns.sh "$D"/`
+   `sudo install -o root -g root -m 0755 deploy/host-egress-guard.sh deploy/check-host-isolation.sh deploy/check-dns.sh deploy/runtime-containment.sh "$D"/`
    Also `host-egress-guard.conf` and `host-isolation.conf` (step 2 and 7). Needs `iptables`, `ip6tables`, `nsenter`, `ss`, `python3` on the host (`iptables --version` should
    say `nf_tables`; Docker's `DOCKER-USER` chain must exist - the iptables backend; `apply` refuses
    otherwise, and also refuses without `ip6tables`).
@@ -333,6 +336,8 @@ D=/opt/internship-hunter/deploy; GUARD=$D/host-egress-guard.sh
    ```
    `systemctl --user daemon-reload && systemctl --user restart docker` (this user's daemon only),
    then `"$GUARD" status`. `loginctl enable-linger hunter-deploy` must already be set.
+   **Also install the runtime-containment watchdog** (see "Runtime containment"): without it the deploy gate
+   refuses (exit 13), and with `restart: "no"` nothing would restart the supervised services after a reboot.
 7. **Tell the stack what must stay unreachable.** Two lists, both validated as *real* before every
    deploy and rollback (see "The deploy gate"):
    - `shared/.env` (mode 600): `EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22,100.107.22.84:8000` - addresses
@@ -380,18 +385,16 @@ stopped before `apply`, running after, stopped again after `remove`) and with th
 | a proxy serves a request unguarded | **no longer possible** (start check) |
 | agents | not affected: internal networks, no route to the host |
 
-**What the gate does not do** (accepted for `AGENT_MODE=demo`, documented): it only knows the
-targets it was given - the guard is the complete policy; it checks at *start* only. **Removing the
-guard while the stack runs is not stopped by anything**: the proxies' healthcheck then only *reports*
-`unhealthy` (an unhealthy container is neither stopped nor restarted; `depends_on` consults health
-only when something starts), and `discovery`/`telegram`/`api` have no runtime check at all - the next
-deploy's gate catches it. This is a documented **blocker for `AGENT_MODE=cli`**, accepted for demo; a host that silently drops (rather than answers)
-packets from the daemon would make an unguarded start look guarded for those targets.
-
-**Stronger design (not implemented; needs a change on the production host; required before
-`AGENT_MODE=cli` holds real provider credentials):** `restart: "no"` on every outbound-capable
-service plus a user unit `hunter-stack.service` (`After=docker.service`, `ExecStartPre=` the guard's
-`status`, `ExecStart=` `compose up -d --wait`), so that *nothing* can start until the guard is verified.
+**What the gate does not do** (and what now does): the in-container gate only knows the targets it
+was given - the guard is the complete policy - and it checks at *start* only, from the container's point
+of view: a host that silently drops (rather than answers) packets, or a Tailscale address that does not
+exist *yet*, makes an unguarded start look guarded. Before "Runtime containment" below, removing the guard
+while the stack ran was stopped by nothing (the proxies' healthcheck only *reports* `unhealthy`; an
+unhealthy container is neither stopped nor restarted). **That is closed by the "stronger design" this
+section used to describe as not implemented:** every service with a route out and every agent is
+`restart: "no"`, and `deploy/runtime-containment.sh` starts them - only after the guard is verified and the
+protected host addresses are live - and stops them when an invariant is lost. The in-container gates remain
+as a second line.
 
 **Validation (W1, stack stopped first so nothing is exposed while the guard is off):**
 `docker compose -p internship-hunter stop` → `"$GUARD" remove` → `docker compose -p internship-hunter start discovery egress-codex api`
@@ -400,6 +403,103 @@ start` in `docker logs` and **no** worker/uvicorn/tinyproxy log lines → `"$GUA
 within about a minute, `docker compose -p internship-hunter start` the rest, then the smoke test.
 **W2:** `systemctl --user restart docker`; `docker logs --since 2m` may show a few gate refusals
 (that is the window being closed); after two minutes `docker ps` is healthy and `"$GUARD" status` is active.
+
+### Runtime containment (F-5: the isolation stays true after the deploy)
+
+**Threat model.** Assets: the host (its Tailscale/LAN/public addresses, sshd, the rootful containers),
+the provider credentials the agents will hold in CLI mode, the other networks of the stack. Adversaries
+and accidents this layer is for: a compromised agent or proxy container; an operator command that
+changes the topology (`docker network connect`, `docker run --network`, a daemon-level `dns`); a guard
+that is removed, flushed or goes stale (a daemon restart, a host address that appears after boot);
+Tailscale that is up *after* the stack; a host resolver that changes. Not defended: a compromised
+`hunter-deploy` user or root (they own the daemon and this script's state), kernel/container escapes,
+and the Internet itself (a compromised proxy still reaches public hosts and has DNS as a covert channel).
+
+**Mechanism** (one root-owned script, one systemd *user* unit, no new infrastructure):
+`deploy/runtime-containment.sh watch` runs next to the rootless daemon (`deploy/systemd/hunter-containment.service`,
+`Type=notify`, `WatchdogSec`, `Restart=always`). It wakes every 10 s **and** immediately on `docker events`
+(network/container) and `ip monitor address route` (a host address appearing), and per cycle:
+
+| # | invariant | on violation |
+|---|---|---|
+| G | `host-egress-guard.sh status` = the **full** policy, host addresses included | stop the supervised set, re-apply the guard (the daemon's own `ExecStartPost` call), verify, restart; the *self-healing* class |
+| T | the protected host addresses (`EGRESS_FORBIDDEN_TARGETS`) are live, checked by `check-host-isolation.sh --verify-targets` | **before starting only** (Tailscale late): the set stays stopped, state `waiting`; a Tailscale that goes away while running is not a loss of isolation and stops nothing |
+| N | every container of the project is attached to exactly the networks its service declares (stopped ones too: `docker network connect` works on a stopped container); no foreign container is attached to a project network; every network that must be `internal` is | stop the set, **disconnect** the unauthorised endpoint (the container is kept for forensics, never removed), **latch** |
+| H | no project container with host network/pid, `privileged`, or the Docker socket; no container claiming the project that the release does not define | stop, latch |
+| D | the **runtime** `resolv.conf` of every running project container: a service with a route out forwards to exactly the contract's resolver from inside the container (never `host(...)`), an internal-only one carries no upstream at all (the F-1 daemon-level `dns` case) | stop, latch (unreadable file: stop, self-healing) |
+| C | the rendered compose DNS equals `DNS=` of the root-owned guard conf | stop, wait (self-healing) |
+| R | the daemon's upstream resolver list (what the host's resolver change would alter) equals the one recorded at the deploy (D-5) | **warning** only: logged once, shown by `status`, a deploy re-baselines it; every service has an explicit resolver, so the host resolver is not on the policed path |
+| S | root-owned helpers are regular, non-symlink, not writable by others; Docker can be inspected; the daemon is rootless | stop (self-healing) / `unverified` |
+| K | supervised containers run only if the last deploy left the stack wanted (`desired: running`) | stop, latch (somebody ran `compose up` by hand) |
+
+*Latch* = the set stays stopped, whatever the next cycles see, until an operator runs
+`runtime-containment.sh reset` after investigating (a hot attachment can be removed by the attacker
+afterwards; an evidence-free restart would hide it). *Self-healing* = the set comes back by itself when the
+prerequisite holds again, and **three of them in 15 minutes latch** (`FLAPPING`). After the watchdog starts
+the set from cold it runs the deploy gate's enforce-mode isolation and DNS checks once and re-judges
+N/H/D on what really runs; a failure stops the set again and latches (`POST-START`).
+
+**The supervised set** is every service with a route out (api, discovery, telegram, the three proxies) plus
+the agents: exactly the services `compose.yaml` gives `restart: "no"`, so that after a reboot or a daemon
+restart **the daemon starts none of them** (the restart race of "Startup window" is closed by
+construction, not by a retry loop). The watchdog starts them in two phases (proxies healthy first), with
+`docker compose start` only (it cannot create, pull or build), and restarts a crashed one with a 30 s
+back-off. postgres, scheduler and session-controller keep `unless-stopped`: they have no route to the host.
+The deploy script commits a release to the watchdog only **after** every gate passed (`runtime-containment.sh
+commit`, under its own lock, refused if a supervised service renders any restart policy but `no`), records
+`desired: stopped` before it tears a stack down, and refuses to deploy or roll back (exit 13) unless the
+watchdog has a fresh heartbeat and is not latched. While a deploy holds `state/deploy.lock` the watchdog
+pauses its decisions (the deploy is replacing containers on purpose; it still heartbeats); a lock older than
+30 minutes is treated as a hung deploy and does **not** disable containment.
+
+**Dead man.** If the watchdog is killed, hangs (systemd's `WatchdogSec`), or is stopped
+(`systemctl --user stop`, shutdown), `ExecStopPost` runs `quarantine --no-latch`: the supervised set stops,
+and the next instance restarts it after verifying everything. A watchdog that is *disabled* leaves the
+stack stopped (nothing else starts it) and the deploy gate refuses (exit 13): the failure is loud and
+safe, never silently permissive.
+
+**Install** (root, once; before the first deploy of a release that has `restart: "no"`):
+```bash
+sudo install -o root -g root -m 0755 deploy/runtime-containment.sh "$D"/       # with the other helpers
+# as hunter-deploy:
+mkdir -p ~/.config/systemd/user && cp /opt/internship-hunter/releases/<sha>/deploy/systemd/hunter-containment.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now hunter-containment
+"$D/runtime-containment.sh" status --require-active        # state: idle (no release committed yet), heartbeat: <10s
+```
+**Operate.** `runtime-containment.sh status` (state, heartbeat, latch, warning), `check` (read-only, names every
+finding, exit 10/11), `journalctl --user -u hunter-containment`, `~/…/state/containment/events.log`.
+After an incident: investigate (`docker inspect`, `events.log`), remove the cause, then
+`runtime-containment.sh reset [--disconnect-foreign]` (refused while any N/H/D finding, a missing guard or an
+unreachable protected address remains) - the watchdog restarts the set within one cycle.
+
+**Failure behaviour** (each is a test in `tests/test_runtime_containment.py` against a stateful fake daemon,
+and, where marked *real*, in `tests/test_runtime_containment_lab.py` on a genuine rootless Docker):
+guard rule deleted / guard removed / daemon restarted (*real*: stop → repair → start, never start before a
+verified guard); hot `network connect`, foreign container on an agent network, internal flag lost, privileged /
+host-network container, daemon-level `dns` after a restart (*real*); Tailscale late (*real*: nothing starts
+while the targets are not live; running stacks are not stopped when they go away); an ad hoc container on
+the default bridge or an unrelated network, a replica, the exited `migrate`, a service missing a network, a
+changed host resolver (false positives: nothing happens, *real* for the first two); docker unreachable or
+hanging (`unverified`, nothing is changed, systemd's watchdog restarts a hung script); a deploy in progress
+(paused) and a hung one (acts anyway); a latched stack that someone starts by hand (stopped again); flapping.
+
+**Rollback of this layer.** The watchdog never edits the host: `systemctl --user disable --now hunter-containment`
+stops the supervised set (dead-man) and the deploy gate then refuses; to go back to the previous behaviour
+deliberately, deploy the previous release (its `compose.yaml` has `restart: unless-stopped`), reinstall the
+previous `remote-deploy.sh` (it does not know exit 13) and delete the unit. Nothing else changed on the host.
+
+**Residual risks.** (1) Detection latency: up to 10 s for a poll-only change, but a Docker network/container
+event or a host address/route change runs a cycle within about a second; a hot attachment is therefore
+exploitable only inside that window. (2) The watchdog runs as `hunter-deploy`, as the daemon does: it
+defends against compromised *containers* and mistakes, not against that user. (3) A stop is `docker stop`
+(5 s grace): in-flight agent work is lost by design. (4) The data tier is not supervised: a compromised
+data-tier container is outside this layer's model (it has no route to the host or the Internet). (5)
+The runtime DNS check reads Docker's `ResolvConfPath` files (readable by the daemon's owner); a Docker that
+stops writing the `ExtServers` annotation makes the OUT services `UNVERIFIED` (stop, self-healing) rather
+than passing. (6) Not verified on the production host: the unit under the real user manager, `ip monitor`
+and `docker events` there, the first Tailscale-late boot. (7) `AGENT_MODE=cli` stays disabled: this layer is
+the runtime-containment prerequisite for it, not the whole of it (see "CLI mode" above: the pinned CLIs must
+still hand hostnames to the proxy, the allow-lists are still defaults, RSM stays off).
 
 ### Validation plan (all on the production host, in this order)
 
@@ -418,6 +518,9 @@ within about a minute, `docker compose -p internship-hunter start` the rest, the
 | V10b | per **internal-only** service (agents, postgres, ...): the same `grep` | `127.0.0.11` and `ExtServers: [host(...)]` or no annotation - **never** an explicit address such as `[10.0.2.3]`; and `python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/docker/daemon.json'))).get('dns'))"` prints `None` (or the file does not exist) |
 | V11 | `deploy/check-dns.sh` (enforce) | `ok   DNS: 6 service(s) with a route out use 10.0.2.3 ...` |
 | V11b | `SMOKE_DNS_CONFIG_ONLY=1 SMOKE_DNS_EXPECT=10.0.2.3 deploy/check-dns.sh -p internship-hunter -f compose.yaml --env-file shared/.env ...` (what the deploy gate runs BEFORE `compose up`; starts nothing) | `ok   DNS configuration: 13 services render dns exactly as the guard allows ...` |
+| V14 | `runtime-containment.sh status --require-active` as `hunter-deploy`; `systemctl --user is-active hunter-containment` | `state: ok N/9 ...`, heartbeat < 15 s; `active` |
+| V15 | `docker compose ps` shows the six services with a route out and the agents with restart policy `no` (`docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' <container>` = `no`); postgres/scheduler/session-controller `unless-stopped` | as stated |
+| V16 | reboot drill (maintenance window): after boot, before the watchdog, `docker ps` shows no supervised container; within ~1 min of tailscaled being up they are all running and `status` says `ok` | as stated |
 | V12 | `agent-codex`: resolves `egress-codex.`; `example.com.` and `example.com. 10.0.2.3` get no answer | as stated |
 | V13 | counters of `HUNTER-EGRESS-GUARD` `-d 10.0.2.3 ... dpt:53` grow while a proxy resolves | packets > 0 |
 
