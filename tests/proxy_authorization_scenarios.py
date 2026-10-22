@@ -158,14 +158,14 @@ class Upstream:
                 if not chunk:
                     break
                 buf += chunk
-                if parse_client_hello(buf) is not None or not buf.startswith(b"\x16"):
+                with self.lock:  # visible at once: a slow machine must not change the verdict
+                    rec["bytes"] = len(buf)
+                    rec["hello"] = parse_client_hello(buf)
+                    rec["first"] = buf[:40].decode("latin-1")
+                if rec["hello"] is not None or not buf.startswith(b"\x16"):
                     break
         except OSError:
             pass
-        with self.lock:
-            rec["bytes"] = len(buf)
-            rec["hello"] = parse_client_hello(buf)
-            rec["first"] = buf[:40].decode("latin-1")
         c.close()
 
 
@@ -312,7 +312,14 @@ def connect(authority, version="HTTP/1.1"):
 def run_case(up, name, request, then=None):
     up.reset()
     status, reply = exchange(request, then)
-    time.sleep(0.2)
+    # settled = two identical snapshots 0.4 s apart (fixed sleeps flipped verdicts under load)
+    deadline, prev = time.monotonic() + 8, None
+    while True:
+        cur = json.dumps(up.snapshot(), sort_keys=True)
+        if cur == prev or time.monotonic() > deadline:
+            break
+        prev = cur
+        time.sleep(0.4)
     return {
         "case": name,
         "allowed": ALLOWED,

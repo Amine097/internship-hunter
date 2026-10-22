@@ -41,7 +41,12 @@ import pytest
 HERE = Path(__file__).resolve().parent
 RUNNER = HERE / "proxy_authorization_scenarios.py"
 REQUIRED = os.environ.get("PROXY_AUTHZ_REQUIRED") == "1"
-UNDER_TEST = os.environ.get("PROXY_UNDER_TEST", "tinyproxy")
+# the proxy the repo ships decides the default: once docker/egress_proxy.py exists, tinyproxy is
+# gone (docker/egress-proxy.sh would exec a binary that is no longer installed): nothing is xfail
+UNDER_TEST = os.environ.get(
+    "PROXY_UNDER_TEST",
+    "egress_proxy" if (HERE.parent / "docker" / "egress_proxy.py").exists() else "tinyproxy",
+)
 M5 = "M-5: the proxy tunnels a ClientHello whose SNI/ECH is not the CONNECT host (domain fronting)"
 HARDENING = "request-line parser leniency: an extra token after the HTTP version is ignored"
 
