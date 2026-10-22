@@ -408,7 +408,8 @@ def test_a_fragmented_client_hello_sends_nothing_upstream_until_it_is_judged(h, 
     """The server_name sits in the FIRST record, the end of the message in the second. An L4
     front end that routes on the first record must never see it (found by the QA review: the
     first fragment used to be relayed before the SNI was judged)."""
-    body = hs(1, client_hello_body(sni="evil.test"))
+    # a padding extension (21) after server_name: the whole name lands in the first record
+    body = hs(1, client_hello_body(exts=[sni_ext("evil.test"), ext(21, bytes(8))]))
     first, second = rec(22, body[:-6]), rec(22, body[-6:])
     assert b"evil.test" in first
     s, up = tunnel(h)

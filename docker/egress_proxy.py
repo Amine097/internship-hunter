@@ -329,11 +329,11 @@ class Tunnel:
                 continue
             ctype, record, payload = rec
             done_sh = self.server_hello.is_set()
-            if self.client_hellos == 0 and ctype != CT_HANDSHAKE:
-                raise TLSViolation("tls-not-handshake", f"first record type {ctype}")
             if ctype != CT_HANDSHAKE and stream.hs:
                 # RFC 8446 5.1: handshake messages must not be interleaved with other record types
                 raise TLSViolation("tls-interleaved", f"record type {ctype} inside a handshake")
+            if self.client_hellos == 0 and ctype != CT_HANDSHAKE:
+                raise TLSViolation("tls-not-handshake", f"first record type {ctype}")
             if ctype == CT_HANDSHAKE:
                 for mtype, body in stream.handshake_messages(payload):
                     if mtype == HS_CLIENT_HELLO:
