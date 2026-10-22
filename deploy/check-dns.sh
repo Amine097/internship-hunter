@@ -22,8 +22,13 @@
 # Checks, per service (the topology is computed from `compose config`, never hard-coded):
 #   config   OUT services (any non-internal network) have `dns` == HUNTER_DNS; IN services have none
 #   runtime  OUT: resolv.conf says `ExtServers: [<HUNTER_DNS>]`, never `host(...)`
+#            IN:  nameserver only 127.0.0.11 and no EXPLICIT ExtServers (a daemon-level `dns` in daemon.json
+#                 gives every container one; compose never shows it); `host(...)` is the daemon's own list
 #   control  every service resolves ITS OWN service name (the embedded resolver works)
 #   names    a service name resolves iff the two services share a network (both directions)
+#   control  every OUT service sends the SAME raw UDP query to the approved resolver and must get an answer;
+#            each probe flavour needs one such answer, or the IN services' "no answer" is UNVERIFIED
+#            (a probe defect is fatal in every mode; a network that blocks the query is BROKEN)
 #   OUT      resolves the public probe name (SMOKE_DNS_NAME)           [broken DNS]
 #            cannot get an answer from the host's default gateway(s) on port 53   [guard hole]
 #   IN       must NOT resolve the public probe name                    [DNS leak]
@@ -41,11 +46,15 @@
 #                               gate passes DNS= from host-egress-guard.conf (what the guard allows);
 #                               otherwise HUNTER_DNS, then 10.0.2.3 (compose.yaml's default)
 #   SMOKE_DNS_NAME=example.com  public name for the positive/negative controls
+#   SMOKE_DNS_CONFIG_ONLY=1     judge ONLY the rendered compose configuration (no container needs to run):
+#                               the deploy gate runs this BEFORE `compose up`, so a release whose effective
+#                               `dns:` disagrees with the guard's DNS= is refused before anything starts
 set -Eeuo pipefail
 
 MODE="${SMOKE_HOST_ISOLATION:-enforce}"
 EXPECT_DNS="${SMOKE_DNS_EXPECT:-${HUNTER_DNS:-10.0.2.3}}"
 EXT_NAME="${SMOKE_DNS_NAME:-example.com}"
+CONFIG_ONLY="${SMOKE_DNS_CONFIG_ONLY:-0}"
 PUBLIC_RESOLVER=1.1.1.1
 # one-shot services that legitimately are not running once the stack is up (their name does not resolve)
 ONESHOT=(migrate)
@@ -57,6 +66,7 @@ warn() { echo "WARN $*" >&2; }
 fail() { echo "FAIL $*" >&2; exit 1; }
 
 [[ "$MODE" == enforce || "$MODE" == report ]] || fail "SMOKE_HOST_ISOLATION must be enforce or report"
+[[ "$CONFIG_ONLY" == 0 || "$CONFIG_ONLY" == 1 ]] || fail "SMOKE_DNS_CONFIG_ONLY must be 0 or 1"
 [[ "$EXT_NAME" =~ ^[A-Za-z0-9.-]+$ ]] || fail "invalid SMOKE_DNS_NAME: '$EXT_NAME'"
 for d in ${EXPECT_DNS//,/ }; do
   [[ "$d" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "invalid resolver in SMOKE_DNS_EXPECT / HUNTER_DNS: '$d' (IPv4 addresses only)"
@@ -83,22 +93,26 @@ for name, svc in sorted((cfg.get("services") or {}).items()):
 json.dump(out, sys.stdout)
 ')" || TOPO=""
 [[ -n "$TOPO" ]] || fail "cannot read the compose configuration (docker compose config failed)"
-mapfile -t RUNNING < <("${COMPOSE[@]}" ps --services --status running 2>/dev/null || true)
-[[ ${#RUNNING[@]} -gt 0 ]] || fail "no running service found (docker compose ps): is the stack up?"
+role_of() { python3 -c 'import json,sys; print("OUT" if json.loads(sys.argv[1])["services"][sys.argv[2]]["out"] else "IN")' "$TOPO" "$1"; }
 mapfile -t CONFIGURED < <(python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1])["services"]))' "$TOPO")
 SERVICES=()
-for s in "${CONFIGURED[@]}"; do
-  if printf '%s\n' "${RUNNING[@]}" | grep -qx -- "$s"; then SERVICES+=("$s")
-  elif [[ " ${ONESHOT[*]} " != *" $s "* ]]; then fail "service '$s' is not running: refusing to certify DNS for a stack that is not up"
-  fi
-done
-# the stopped one-shot services leave the picture: Docker's DNS does not resolve a container that is not running
-TOPO="$(python3 -c '
+if [[ "$CONFIG_ONLY" == 1 ]]; then
+  SERVICES=("${CONFIGURED[@]}")
+else
+  mapfile -t RUNNING < <("${COMPOSE[@]}" ps --services --status running 2>/dev/null || true)
+  [[ ${#RUNNING[@]} -gt 0 ]] || fail "no running service found (docker compose ps): is the stack up?"
+  for s in "${CONFIGURED[@]}"; do
+    if printf '%s\n' "${RUNNING[@]}" | grep -qx -- "$s"; then SERVICES+=("$s")
+    elif [[ " ${ONESHOT[*]} " != *" $s "* ]]; then fail "service '$s' is not running: refusing to certify DNS for a stack that is not up"
+    fi
+  done
+  # the stopped one-shot services leave the picture: Docker's DNS does not resolve a container that is not running
+  TOPO="$(python3 -c '
 import json, sys
 t = json.loads(sys.argv[1]); keep = set(sys.argv[2:])
 t["services"] = {k: v for k, v in t["services"].items() if k in keep}
 json.dump(t, sys.stdout)' "$TOPO" "${SERVICES[@]}")"
-role_of() { python3 -c 'import json,sys; print("OUT" if json.loads(sys.argv[1])["services"][sys.argv[2]]["out"] else "IN")' "$TOPO" "$1"; }
+fi
 for need in "${REQUIRED_OUT[@]}"; do
   [[ "$(role_of "$need" 2>/dev/null || true)" == OUT ]] \
     || fail "service '$need' is expected to have a route out but compose says otherwise: the topology changed; review this check"
@@ -107,6 +121,26 @@ for need in "${REQUIRED_IN[@]}"; do
   [[ "$(role_of "$need" 2>/dev/null || true)" == IN ]] \
     || fail "service '$need' is expected to be internal-only but compose says otherwise: the topology changed; review this check"
 done
+
+# ---- the rendered configuration alone (the deploy gate, BEFORE anything starts) ------------------------
+if [[ "$CONFIG_ONLY" == 1 ]]; then
+  VERDICT="$(python3 -c '
+import json, sys
+topo, expect = json.loads(sys.argv[1]), set(sys.argv[2].split(","))
+for name, svc in sorted(topo["services"].items()):
+    if svc["out"] and set(svc["dns"]) != expect:
+        print("%s has a route out but its rendered dns is %s, expected %s" % (name, svc["dns"] or "EMPTY", sorted(expect)))
+    if not svc["out"] and svc["dns"]:
+        print("%s is internal-only but its rendered dns is %s" % (name, svc["dns"]))
+' "$TOPO" "$EXPECT_DNS")" || fail "cannot evaluate the rendered compose configuration"
+  if [[ -n "$VERDICT" ]]; then
+    { echo "FAIL the rendered compose DNS disagrees with the resolver the guard allows (${EXPECT_DNS}); nothing was started:"
+      while IFS= read -r line; do printf '       breach: %s\n' "$line"; done <<<"$VERDICT"; } >&2
+    exit 1
+  fi
+  ok "DNS configuration: ${#SERVICES[@]} services render dns exactly as the guard allows (${EXPECT_DNS} on every service with a route out, none elsewhere)"
+  exit 0
+fi
 
 # ---- probes (run inside each container; they print facts only) --------------------------------------
 # python flavour (the app and agent images). getaddrinfo goes through /etc/resolv.conf, i.e. through
@@ -200,7 +234,9 @@ if tool is None:
     if not out: add("DEFECT", f"{svc}: probe did not run (no output); DNS UNVERIFIED")
 else:
     want_peers = sorted(S)
-    want_direct = list(dict.fromkeys([expect_dns.split(",")[0], "1.1.1.1"] if role == "IN" else gateways))
+    approved = expect_dns.split(",")
+    # OUT: the approved resolver(s) are the POSITIVE CONTROL of the raw UDP probe, the gateways its negative check
+    want_direct = list(dict.fromkeys([approved[0], "1.1.1.1"] if role == "IN" else [*approved, *[g for g in gateways if g not in approved]]))
     if selfr != "ok": add("DEFECT", f"{svc}: cannot resolve its own service name ({selfr}): the embedded resolver does not work; DNS UNVERIFIED")
     if extr is None: add("DEFECT", f"{svc}: no verdict for the public name")
     missing = [p for p in want_peers if p not in peers]
@@ -225,6 +261,22 @@ else:
                 add("BREACH", f"{svc}: Docker forwards its DNS to {ann[0][len('# ExtServers: '):]}, expected [{' '.join(sorted(exp_set))}] queried from the container (host(...) = from the daemon, outside the guard)")
     else:
         if me["dns"]: add("BREACH", f"{svc} is internal-only but has dns {me['dns']} configured")
+        # The RUNTIME view (what Docker really wrote), not only what compose declares: a daemon-level
+        # `dns` in daemon.json gives every container, internal-only ones included, an explicit upstream
+        # that compose never mentions. Docker 29.9.1 does not forward from an internal-only container
+        # either way (measured), but an agent must not carry an upstream resolver at all: it would be
+        # exactly the guard-approved address the day a route appears. `host(...)` is the daemon's own
+        # resolv.conf, shown for every container and never used by an internal-only one.
+        ann = [r for r in resolv if r.startswith("# ExtServers:")]
+        ns = [r.split()[1] for r in resolv if r.startswith("nameserver")]
+        if ns != ["127.0.0.11"]: add("BREACH", f"{svc}: resolv.conf nameservers are {ns}, expected only Docker's embedded 127.0.0.11")
+        if len(ann) > 1: add("DEFECT", f"{svc}: resolv.conf has {len(ann)} ExtServers annotations; DNS UNVERIFIED")
+        elif ann:
+            got = re.fullmatch(r"# ExtServers: \[(.*)\]", ann[0])
+            toks = re.findall(r"host\([^)]*\)|[^\s,]+", got.group(1)) if got else ["?"]
+            explicit = [t for t in toks if not (t.startswith("host(") and t.endswith(")"))]
+            if explicit:
+                add("BREACH", f"{svc} is internal-only but Docker gave it explicit upstream resolver(s) {explicit} ({ann[0]}): daemon-level dns (daemon.json) or a dns: entry; an agent must carry no upstream resolver (docs/deployment.md, \"DNS\")")
     # --- names: a service name resolves iff a network is shared ---
     mine = set(me["networks"])
     for p, r in sorted(peers.items()):
@@ -236,26 +288,39 @@ else:
         if extr == "ok": add("BREACH", f"{svc} is internal-only but resolves {ext}: DNS is a way out")
         for d in want_direct:
             if direct.get(d) == "ok": add("BREACH", f"{svc} is internal-only but gets DNS answers from {d} directly")
+        add("NEED", f"{tool}")
     else:
         if extr == "fail": add("BROKEN", f"{svc} cannot resolve {ext} through {expect_dns}: the guard has no DNS exception for it, or the resolver is down")
         for d in gateways:
-            if direct.get(d) == "ok": add("LEAK", f"{svc} gets DNS answers from the host gateway {d} directly: a LAN resolver is reachable outside the guard exception")
+            if d not in approved and direct.get(d) == "ok": add("LEAK", f"{svc} gets DNS answers from the host gateway {d} directly: a LAN resolver is reachable outside the guard exception")
+        # --- positive control: can THIS probe flavour receive an answer from the approved resolver? ---
+        # Every "no answer" the internal-only services produce is only worth something if the same raw
+        # query demonstrably gets an answer where the network allows it. A service whose DNS goes through
+        # the container (the annotation is right) and resolves, yet gets no raw answer, proves a broken probe.
+        explicit = not any(o.startswith("BREACH") for o in out)
+        if any(direct.get(d) == "ok" for d in approved): add("CTRL", f"{tool} ok")
+        elif extr == "ok" and explicit: add("DEFECT", f"{svc}: PROBE DEFECT - the raw {tool} DNS query to {', '.join(approved)} got no answer although {svc} resolves {ext} through it; the negative direct-query checks of this probe are UNVERIFIED")
+        else: add("CTRL", f"{tool} blocked")
 for o in out: print(o)
 PY
 )"
 
 DEFECTS=(); BREACHES=(); BROKEN=(); LEAKS=()
+declare -A CTRL_OK=() CTRL_BLOCKED=() NEED=()     # per probe flavour: positive control seen / needed by whom
 tmp="$(mktemp -d)"
 # shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap
 cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 
 probe_service() { # probe_service <service>: writes $tmp/<service>.out and .err
-  local svc="$1" role peers direct
+  local svc="$1" role peers direct approved gws
   role="$(role_of "$svc")"
   peers="${SERVICES[*]}"
   if [[ "$role" == IN ]]; then direct="$(printf '%s\n' "${EXPECT_DNS%%,*}" "$PUBLIC_RESOLVER" | awk '!seen[$0]++' | tr '\n' ' ')"
-  else direct="$GATEWAYS"; fi
+  else   # the approved resolver(s) are the positive control of the raw query, the gateways its negative check
+    read -ra approved <<<"${EXPECT_DNS//,/ }"; read -ra gws <<<"$GATEWAYS"
+    direct="$(printf '%s\n' "${approved[@]}" "${gws[@]}" | awk '!seen[$0]++' | tr '\n' ' ')"
+  fi
   # the python flavour where the image has python (app, agent), busybox nslookup otherwise (egress)
   if ! exec_in "$svc" sh -c 'command -v python >/dev/null 2>&1' </dev/null >/dev/null 2>&1; then
     printf '%s\n' "$SH_PROBE" | exec_in "$svc" sh -s -- "$svc" "$EXT_NAME" "$peers" "$direct" >"$tmp/$svc.out" 2>"$tmp/$svc.err" || true
@@ -278,11 +343,26 @@ for svc in "${SERVICES[@]}"; do
       "BROKEN "*) BROKEN+=("${line#BROKEN }") ;;
       "LEAK "*)   LEAKS+=("${line#LEAK }") ;;
       "DEFECT "*) DEFECTS+=("${line#DEFECT }") ;;
+      "CTRL python ok"|"CTRL nslookup ok") t="${line#CTRL }"; CTRL_OK["${t% ok}"]=1 ;;
+      "CTRL python blocked"|"CTRL nslookup blocked") t="${line#CTRL }"; CTRL_BLOCKED["${t% blocked}"]=1 ;;
+      "NEED python"|"NEED nslookup") NEED["${line#NEED }"]+="$svc " ;;
       '') ;;
       *) DEFECTS+=("$svc: assessor produced an unexpected line: ${line:0:80}") ;;
     esac
   done < <(printf '%s\n' "$out" | python3 -c "$ASSESS" "$svc" "$TOPO" "$MODE" "$EXPECT_DNS" "$EXT_NAME" "$GATEWAYS" 2>&1 \
            || echo "DEFECT $svc: the assessor itself failed")
+done
+
+# Every internal-only service's "no direct answer" is only evidence if the SAME probe flavour got an answer
+# from the approved resolver somewhere the network allows it. A probe that cannot receive an answer would
+# otherwise make all of these negative checks pass silently.
+for tool in "${!NEED[@]}"; do
+  [[ -z "${CTRL_OK[$tool]:-}" ]] || continue
+  if [[ -n "${CTRL_BLOCKED[$tool]:-}" ]]; then
+    BROKEN+=("no ${tool} probe got an answer from the approved resolver (${EXPECT_DNS}) - the network blocks it, so a blocked query cannot be told from a broken probe: the direct-query checks of ${NEED[$tool]}are UNVERIFIED")
+  elif ! printf '%s\n' "${DEFECTS[@]:-}" | grep -q "PROBE DEFECT - the raw ${tool} "; then
+    DEFECTS+=("no service with a route out ran the ${tool} probe: its positive control is missing and the direct-query checks of ${NEED[$tool]}are UNVERIFIED")
+  fi
 done
 
 # DEFECTS and BREACHES are fatal in every mode; BROKEN/LEAK (the outside world, the guard) are

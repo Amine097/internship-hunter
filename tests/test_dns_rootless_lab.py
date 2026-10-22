@@ -14,12 +14,17 @@ What it establishes (docs/deployment.md, "DNS"):
     resolver the guard was told about gets through (a private LAN resolver does not).
   * internal-only services get no external forwarding and no direct path; service names resolve
     only between services that share a network.
+  * daemon-level `dns` (daemon.json) hands EVERY container, agents included, an explicit upstream
+    that compose never mentions: check-dns.sh sees it in the runtime resolv.conf and refuses it.
+  * the raw-UDP probe has a positive control: it must get an answer from the approved resolver
+    from a service with a route out, or its "no answer" from the agents proves nothing.
 
 Opt-in (it downloads ~100 MB of pinned, checksummed tools once): HUNTER_ROOTLESS_LAB=1.
 HUNTER_ROOTLESS_LAB_REQUIRED=1 (CI) turns "cannot run" into a failure. iptables must be on PATH
 (or GUARD_IPTABLES_DIR, as in test_host_egress_guard_netns.py).
 """
 
+import json
 import os
 import re
 import shutil
@@ -234,7 +239,7 @@ def lab(tmp_path_factory):
     lab.env()
     yield lab
     lab.down()
-    keep = os.environ.get("HUNTER_LAB_LOG_DIR")        # CI: the daemon's logs outlive the lab
+    keep = os.environ.get("HUNTER_LAB_LOG_DIR")  # CI: the daemon's logs outlive the lab
     if keep:
         Path(keep).mkdir(parents=True, exist_ok=True)
         for name in ("dockerd.log", "runc.args"):
@@ -303,6 +308,10 @@ def test_explicit_resolver_works_through_the_guard_and_check_dns_passes(stack):
         assert "ExtServers: [10.0.2.3]" in stack.exec(svc, "cat", "/etc/resolv.conf").stdout, svc
         assert stack.nslookup(svc, "example.com"), svc
     assert stack.guard_dns_hits() > 0  # they crossed the guard's DNS exception
+    # the positive control of the raw-UDP probe, with real packets: a service with a route out DOES
+    # get a direct answer from the approved resolver, which gives the agents' silence its meaning
+    for svc in OUT:
+        assert stack.nslookup(svc, "example.com", server=SLIRP_DNS), svc
     r = stack.check_dns()
     assert r.returncode == 0, r.stdout + r.stderr
     assert "internal-only service(s) resolve nothing outside the project" in r.stdout
@@ -325,6 +334,11 @@ def test_internal_only_services_have_no_dns_way_out_and_see_only_their_neighbour
     stack.up()
     stack.guard("apply")
     for svc in IN:
+        resolv = stack.exec(svc, "cat", "/etc/resolv.conf").stdout
+        assert "nameserver 127.0.0.11" in resolv and "nameserver 10." not in resolv, svc
+        # measured: Docker lists the daemon's own resolver as host(...) for every container, never
+        # forwards from an internal-only one; what must never appear here is an EXPLICIT upstream
+        assert not re.search(r"ExtServers: \[(?!host\()", resolv), f"{svc}: {resolv}"
         assert not stack.nslookup(svc, "example.com"), f"{svc} resolved a public name"
         assert not stack.nslookup(svc, "example.com", server=SLIRP_DNS), (
             f"{svc} reached the resolver"
@@ -385,19 +399,106 @@ def test_check_dns_rejects_a_resolver_other_than_the_one_it_was_told_to_expect(s
     assert r.returncode == 1 and "Docker forwards its DNS to [1.1.1.1]" in r.stderr
 
 
-# ---- daemon-level dns: ad hoc containers -----------------------------------------------------
-def test_daemon_level_dns_makes_ad_hoc_containers_resolve_through_the_guard(lab):
-    run = ["docker", "run", "--rm", "alpine-local:3.20", "nslookup", "-timeout=3", "example.com."]
+# ---- daemon-level dns: do NOT configure it -----------------------------------------------------
+def test_daemon_level_dns_gives_agents_an_explicit_upstream_and_check_dns_refuses_it(lab):
+    """Claude 2's F-1, measured. daemon.json {"dns": [...]} changes every container's resolver
+    state without a line of compose changing; the declaration-only check could not see it."""
     try:
         lab.restart_daemon(dns=SLIRP_DNS)
         lab.guard("apply")
-        r = lab.run(run, check=False)
+        lab.up()
+        lab.zero_counters()
+        cfg = lab.compose("config", "--format", "json").stdout
+        declared = json.loads(cfg)["services"]
+        for svc in IN:
+            assert not declared[svc].get("dns"), f"compose declares no dns for {svc}"
+            # ... but the RUNTIME resolver state of the agents now names an explicit upstream
+            resolv = lab.exec(svc, "cat", "/etc/resolv.conf").stdout
+            assert "ExtServers: [10.0.2.3]" in resolv and "Overrides: [nameservers]" in resolv, (
+                svc,
+                resolv,
+            )
+        # what Docker 29.9.1 still does NOT do: forward from an internal-only container. No name
+        # outside the project resolves, no packet reached the guard's DNS exception, no direct path.
+        for svc in IN:
+            assert not lab.nslookup(svc, "example.com"), svc
+            assert not lab.nslookup(svc, "example.com", server=SLIRP_DNS), svc
+        assert lab.guard_dns_hits() == 0
+        assert lab.nslookup("agent-codex", "egress-codex")  # local discovery is untouched
+        # the check reads the runtime state and refuses, in every mode
+        for mode in ("enforce", "report"):
+            r = lab.check_dns(mode=mode)
+            assert r.returncode == 1, r.stdout + r.stderr
+            for svc in IN:
+                assert f"{svc} is internal-only but Docker gave it explicit upstream" in r.stderr
+            assert "daemon-level dns (daemon.json)" in r.stderr
+        # the second reason not to: every ad hoc container now holds the guard's DNS exception too
+        r = lab.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "alpine-local:3.20",
+                "nslookup",
+                "-timeout=3",
+                "example.com.",
+            ],
+            check=False,
+        )
         assert r.returncode == 0 and "Address: " in r.stdout, r.stdout + r.stderr
         assert lab.guard_dns_hits() > 0
-        if lab.upstream_is_private():
-            lab.restart_daemon(dns="")  # the host's resolver, a private address
-            lab.guard("apply")
+    finally:
+        lab.down()
+        lab.restart_daemon(dns="")
+
+
+def test_without_daemon_level_dns_ad_hoc_containers_get_no_dns_and_per_container_dns_works(lab):
+    """The documented state: nothing configured at daemon level; `--dns 10.0.2.3` per container."""
+    lab.guard("remove", check=False)
+    lab.guard("apply")
+    run = ["docker", "run", "--rm", "alpine-local:3.20", "nslookup", "-timeout=3", "example.com."]
+    try:
+        if lab.upstream_is_private():  # a public upstream (some CI runners) would not be rejected
             r = lab.run(run, check=False)
             assert r.returncode != 0, "an ad hoc container reached the host's LAN resolver"
+        explicit = [*run[:3], "--dns", SLIRP_DNS, *run[3:]]
+        r = lab.run(explicit, check=False)
+        assert r.returncode == 0 and "Address: " in r.stdout, r.stdout + r.stderr
     finally:
-        lab.restart_daemon(dns="")
+        lab.guard("remove", check=False)
+
+
+# ---- the raw-UDP probe has a positive control (Claude 2's F-2) ---------------------------------
+def test_a_probe_that_cannot_receive_direct_answers_is_a_defect_not_a_pass(stack, tmp_path):
+    """Every 'no direct answer' the agents produce is only evidence if the SAME probe gets an
+    answer from the approved resolver where the network allows it. Sabotage the probe tool in every
+    container (a nslookup that never answers when a server is named) and the agents' silence must
+    not certify anything: DEFECT in every mode, distinct from the network blocking a query."""
+    wrapper = tmp_path / "nslookup"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "for last; do :; done\n"
+        'case "$last" in *[!0-9.]*) exec /bin/busybox nslookup "$@" ;; esac\n'
+        "exit 1\n"
+    )
+    wrapper.chmod(0o755)
+    override = tmp_path / "broken-probe.yaml"
+    override.write_text(
+        "services:\n"
+        + "".join(
+            f"  {svc}:\n    volumes: ['{wrapper}:/usr/local/bin/nslookup:ro']\n" for svc in OUT + IN
+        )
+    )
+    stack.up(extra_files=[override])
+    stack.guard("apply")
+    assert stack.nslookup("egress-codex", "example.com")  # names still resolve ...
+    # ... but the probe can no longer receive a direct answer
+    assert not stack.nslookup("egress-codex", "example.com", server=SLIRP_DNS)
+    for mode in ("enforce", "report"):
+        r = stack.check_dns(mode=mode)
+        assert r.returncode == 1 and "PROBE DEFECT" in r.stderr, (mode, r.stdout + r.stderr)
+        assert "UNVERIFIED" in r.stderr
+    # and the same stack with a working probe passes: the defect was the probe, not the network
+    stack.down()
+    stack.up()
+    assert stack.check_dns().returncode == 0

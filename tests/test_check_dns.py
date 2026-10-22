@@ -9,6 +9,9 @@ direct DNS queries and /etc/resolv.conf answered by a model that can be damaged 
   STUB_EXT_BROKEN   svc ...         services that cannot resolve public names (no guard exception)
   STUB_IN_RESOLVES  svc ...         internal-only services that DO resolve public names (a leak)
   STUB_DIRECT_OK    svc@ip ...      direct DNS query to ip is answered
+  STUB_PROBE_DEAD   python|nslookup the raw-query probe of that flavour never receives any answer
+  STUB_CTRL_BLOCKED svc ...         the network blocks that service's raw query to the resolver
+  STUB_APPROVED     ip              the resolver the model answers (default 10.0.2.3)
   STUB_LEAK_PEER    svc=peer ...    the name resolves although no network is shared
   STUB_LOSE_PEER    svc=peer ...    the name does not resolve although a network is shared
   STUB_SELF_BROKEN  svc ...         not even the service's own name resolves
@@ -34,6 +37,15 @@ pytestmark = pytest.mark.skipif(os.name != "posix", reason="shell scripts")
 
 COMPOSE = yaml.safe_load((ROOT / "compose.yaml").read_text())
 OUT = ["api", "discovery", "telegram", "egress-claude-1", "egress-claude-2", "egress-codex"]
+IN = [
+    "agent-claude-1",
+    "agent-claude-2",
+    "agent-codex",
+    "postgres",
+    "migrate",
+    "scheduler",
+    "session-controller",
+]
 
 
 def topology(mutate=None):
@@ -124,8 +136,18 @@ MODEL = textwrap.dedent("""\
         if is_out(svc):
             return svc not in _words("STUB_EXT_BROKEN")
         return svc in _words("STUB_IN_RESOLVES")
-    def answered(svc, ip):
-        return f"{svc}@{ip}" in _words("STUB_DIRECT_OK")
+    def answered(svc, ip, tool):
+        if f"{svc}@{ip}" in _words("STUB_DIRECT_OK"):
+            return True
+        if tool in _words("STUB_PROBE_DEAD"):          # a probe that can never receive an answer
+            return False
+        # the approved resolver answers the services whose network lets the query out
+        return (
+            is_out(svc)
+            and ip == os.environ.get("STUB_APPROVED", "10.0.2.3")
+            and svc not in _words("STUB_EXT_BROKEN")
+            and svc not in _words("STUB_CTRL_BLOCKED")
+        )
 """)
 SITECUSTOMIZE = textwrap.dedent("""\
     import os, socket
@@ -142,7 +164,7 @@ SITECUSTOMIZE = textwrap.dedent("""\
         def sendto(self, data, addr): self.q = (data, addr[0])
         def recvfrom(self, n):
             data, ip = self.q
-            if answered(svc, ip):
+            if answered(svc, ip, "python"):
                 return data[:2] + b"\\x81\\x80", (ip, 53)
             raise OSError("timed out")
         def close(self): pass
@@ -157,7 +179,7 @@ NSLOOKUP = textwrap.dedent("""\
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     name, server = args[0], (args[1] if len(args) > 1 else None)
     svc = os.environ["STUB_SVC"]
-    ok = answered(svc, server) if server else resolves(svc, name)
+    ok = answered(svc, server, "nslookup") if server else resolves(svc, name)
     if ok:
         print("Server:\\t\\t127.0.0.11\\nAddress:\\t127.0.0.11:53\\n")
         print("Name:\\texample\\nAddress: 192.0.2.1")
@@ -405,16 +427,19 @@ def test_any_other_stopped_service_refuses_to_certify(env, svc):
 
 def test_a_public_resolver_as_the_expected_one_is_not_probed_twice(env):
     """CI gives compose HUNTER_DNS=1.1.1.1 - the same address the leak probe uses."""
+
     def public(cfg):
         for n in OUT:
             cfg["services"][n]["dns"] = ["1.1.1.1"]
+
     import tempfile
+
     with tempfile.TemporaryDirectory() as d:
         e = Env(Path(d), public)
         for n in OUT:
             p = e.stub / "resolv" / n
             p.write_text(p.read_text().replace("[10.0.2.3]", "[1.1.1.1]"))
-        r = e.run(SMOKE_DNS_EXPECT="1.1.1.1")
+        r = e.run(SMOKE_DNS_EXPECT="1.1.1.1", STUB_APPROVED="1.1.1.1")
         assert r.returncode == 0, r.stdout + r.stderr
 
 
@@ -452,6 +477,194 @@ def test_an_unreadable_compose_configuration_fails(env):
 )
 def test_bad_settings_are_refused(env, var, val):
     assert env.run(**{var: val}).returncode == 1
+
+
+# ---- F-1: internal-only services are judged on the RUNTIME resolver state -----------------------
+@pytest.mark.parametrize("svc", ["agent-claude-1", "agent-codex", "postgres", "scheduler"])
+def test_an_internal_only_service_with_an_explicit_upstream_is_a_breach_in_every_mode(env, svc):
+    """What a daemon-level `dns` (daemon.json) does: compose says nothing, the runtime has it."""
+    for mode in ("enforce", "report"):
+        r = env.run(STUB_ANNOTATION=f"{svc}=10.0.2.3", SMOKE_HOST_ISOLATION=mode)
+        assert r.returncode == 1, mode
+        assert (
+            f"{svc} is internal-only but Docker gave it explicit upstream resolver(s)" in r.stderr
+        )
+        assert "daemon-level dns (daemon.json)" in r.stderr
+
+
+def test_every_internal_only_service_is_named_when_the_daemon_level_dns_is_set(env):
+    annotations = ";".join(f"{s}=10.0.2.3" for s in IN)
+    r = env.run(STUB_ANNOTATION=annotations)
+    assert r.returncode == 1
+    for s in IN:
+        assert f"{s} is internal-only but Docker gave it explicit upstream" in r.stderr, s
+
+
+@pytest.mark.parametrize(
+    "annotation", ["host(192.168.1.1) 10.0.2.3", "1.1.1.1", "10.0.2.3 host(10.0.0.1)"]
+)
+def test_any_explicit_entry_next_to_the_daemons_own_resolver_is_still_refused(env, annotation):
+    r = env.run(STUB_ANNOTATION=f"agent-codex={annotation}")
+    assert (
+        r.returncode == 1 and "agent-codex is internal-only but Docker gave it explicit" in r.stderr
+    )
+
+
+def test_the_daemons_own_resolver_and_no_annotation_are_what_an_internal_only_service_may_carry(
+    env,
+):
+    """host(...) is listed for every container and never used by an internal-only one (measured)."""
+    assert (
+        env.run(STUB_ANNOTATION="agent-codex=host(192.168.1.1) host(10.255.255.254)").returncode
+        == 0
+    )
+    assert env.run(STUB_NO_ANNOTATION="agent-codex postgres").returncode == 0
+
+
+def test_an_internal_only_service_whose_nameserver_is_not_the_embedded_resolver_is_a_breach(env):
+    r = env.run(STUB_NAMESERVER="agent-claude-2=10.0.2.3")
+    assert (
+        r.returncode == 1 and "agent-claude-2: resolv.conf nameservers are ['10.0.2.3']" in r.stderr
+    )
+
+
+def test_local_service_discovery_is_still_required_while_the_upstream_is_judged(env):
+    """The refusal is about the upstream; discovery between neighbours must keep working."""
+    r = env.run(STUB_ANNOTATION="agent-codex=10.0.2.3", STUB_LOSE_PEER="agent-codex=egress-codex")
+    assert "agent-codex cannot resolve egress-codex" in r.stderr
+    assert "explicit upstream" in r.stderr
+
+
+# ---- F-2: the raw-UDP probe has a positive control -------------------------------------------
+@pytest.mark.parametrize(
+    "tool,victims",
+    [
+        ("python", "api discovery telegram"),
+        ("nslookup", "egress-claude-1 egress-claude-2 egress-codex"),
+    ],
+)
+def test_a_probe_that_can_never_receive_an_answer_is_a_defect_in_every_mode(env, tool, victims):
+    """Before, the agents' silence passed whatever the probe did; now it certifies nothing."""
+    for mode in ("enforce", "report"):
+        r = env.run(STUB_PROBE_DEAD=tool, SMOKE_HOST_ISOLATION=mode)
+        assert r.returncode == 1, (mode, r.stderr)
+        assert f"PROBE DEFECT - the raw {tool} DNS query to 10.0.2.3 got no answer" in r.stderr
+        assert "UNVERIFIED" in r.stderr
+        for v in victims.split():
+            assert f"{v}: PROBE DEFECT" in r.stderr
+
+
+def test_a_dead_probe_is_not_reported_as_the_network_blocking_something(env):
+    r = env.run(STUB_PROBE_DEAD="python")
+    assert "cannot resolve" not in r.stderr and "BROKEN" not in r.stderr
+
+
+def test_a_blocked_query_is_told_apart_from_a_broken_probe(env):
+    """No guard exception: names do not resolve AND the raw query is blocked. That is the network,
+    not a probe defect: enforce fails (as before), report warns, agents' checks are unverified."""
+    blocked = "egress-claude-1 egress-claude-2 egress-codex"
+    r = env.run(STUB_EXT_BROKEN=blocked)
+    assert r.returncode == 1 and "PROBE DEFECT" not in r.stderr
+    r = env.run(STUB_EXT_BROKEN=blocked, SMOKE_HOST_ISOLATION="report")
+    assert r.returncode == 0 and "PROBE DEFECT" not in r.stderr and "WARN" in r.stderr
+    assert (
+        "no nslookup probe got an answer" not in r.stderr
+    )  # python agents still have a python control
+
+
+def test_the_flavour_without_any_control_leaves_the_agents_checks_unverified_and_says_so(env):
+    everything = "api discovery telegram egress-claude-1 egress-claude-2 egress-codex"
+    r = env.run(STUB_EXT_BROKEN=everything, SMOKE_HOST_ISOLATION="report")
+    assert r.returncode == 0  # report mode: a warning ...
+    assert "cannot be told from a broken probe" in r.stderr  # ... that names the consequence
+    assert "agent-codex" in r.stderr and "are UNVERIFIED" in r.stderr
+    assert env.run(STUB_EXT_BROKEN=everything).returncode == 1  # enforce: fatal
+
+
+def test_no_service_with_a_route_out_to_serve_as_control_for_a_flavour_is_a_defect(env):
+    """The agents run python; if no service with a route out does, that probe has no control."""
+    r = env.run(STUB_NO_PYTHON="api discovery telegram", SMOKE_HOST_ISOLATION="report")
+    assert r.returncode == 1
+    assert "no service with a route out ran the python probe" in r.stderr
+    assert "agent-claude-1" in r.stderr and "UNVERIFIED" in r.stderr
+
+
+def test_one_service_whose_raw_query_fails_while_it_resolves_is_a_probe_defect(env):
+    r = env.run(STUB_CTRL_BLOCKED="api")
+    assert r.returncode == 1 and "api: PROBE DEFECT" in r.stderr
+
+
+def test_the_negative_checks_still_bite_when_the_control_succeeds(env):
+    """The control must not blunt leak detection: a real answer for an agent is still a breach."""
+    r = env.run(STUB_DIRECT_OK="agent-codex@10.0.2.3")
+    assert (
+        r.returncode == 1
+        and "agent-codex is internal-only but gets DNS answers from 10.0.2.3" in r.stderr
+    )
+
+
+def test_the_approved_resolver_is_not_mistaken_for_a_leaking_gateway(env):
+    assert env.run(STUB_HOST_GATEWAY="10.0.2.3").returncode == 0
+
+
+def test_the_positive_control_queries_every_service_with_a_route_out(env):
+    assert env.run().returncode == 0
+    probed = {
+        ln.split()[1]
+        for ln in (env.stub / "log").read_text().splitlines()
+        if ln.split()[2] in ("python", "sh")
+    }
+    assert set(OUT) <= probed
+
+
+# ---- F-3 (the config-only mode the deploy gate runs BEFORE `compose up`) ---------------------
+def test_config_only_mode_judges_the_rendered_dns_without_touching_any_container(env):
+    r = env.run(
+        SMOKE_DNS_CONFIG_ONLY="1",
+        SMOKE_DNS_EXPECT="10.0.2.3",
+        STUB_NOT_RUNNING=" ".join(env.cfg["services"]),
+    )
+    assert r.returncode == 0, r.stderr
+    assert "13 services render dns exactly as the guard allows" in r.stdout
+    assert not (env.stub / "log").exists()  # not a single `docker compose exec`
+
+
+@pytest.mark.parametrize("expect", ["1.1.1.1", "10.0.2.3,1.1.1.1", "192.168.1.1"])
+def test_config_only_mode_refuses_a_resolver_the_guard_does_not_allow(env, expect):
+    r = env.run(SMOKE_DNS_CONFIG_ONLY="1", SMOKE_DNS_EXPECT=expect)
+    assert r.returncode == 1 and "nothing was started" in r.stderr
+    assert "api has a route out but its rendered dns is ['10.0.2.3']" in r.stderr
+    assert not (env.stub / "log").exists()
+
+
+def test_config_only_mode_refuses_a_missing_or_surplus_dns_entry(env):
+    def drop(cfg):
+        cfg["services"]["egress-codex"].pop("dns")
+        cfg["services"]["postgres"]["dns"] = ["10.0.2.3"]
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        r = Env(Path(d), drop).run(SMOKE_DNS_CONFIG_ONLY="1", SMOKE_DNS_EXPECT="10.0.2.3")
+        assert r.returncode == 1
+        assert "egress-codex has a route out but its rendered dns is EMPTY" in r.stderr
+        assert "postgres is internal-only but its rendered dns is ['10.0.2.3']" in r.stderr
+
+
+def test_config_only_mode_still_refuses_a_changed_topology(env):
+    def internalise(cfg):
+        cfg["services"]["telegram"]["networks"] = {"data": None}
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        r = Env(Path(d), internalise).run(SMOKE_DNS_CONFIG_ONLY="1", SMOKE_DNS_EXPECT="10.0.2.3")
+        assert r.returncode == 1 and "'telegram' is expected to have a route out" in r.stderr
+
+
+def test_config_only_mode_is_a_strict_switch(env):
+    assert env.run(SMOKE_DNS_CONFIG_ONLY="yes").returncode == 1
+    assert env.run(SMOKE_DNS_CONFIG_ONLY="1", STUB_CONFIG_FAIL="1").returncode == 1
 
 
 def test_the_script_has_no_way_to_change_the_stack():

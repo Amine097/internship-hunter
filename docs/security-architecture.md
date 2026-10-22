@@ -123,7 +123,11 @@ Layers, each answering a different question (`docs/deployment.md`, "Host isolati
    namespace - outside the guard - unless `dns:` is explicit, so every service with a route out names
    the one resolver the guard allows (`10.0.2.3`) and `deploy/check-dns.sh` verifies it, together with
    the facts that internal-only services (the agents) resolve nothing outside the project and that
-   service names resolve only between services sharing a network (docs/deployment.md, "DNS").
+   service names resolve only between services sharing a network (docs/deployment.md, "DNS"). The
+   rendered compose DNS is compared with the guard's `DNS=` before anything starts (and the caller's
+   `HUNTER_DNS` is ignored); the runtime `resolv.conf` of the internal-only services must carry no explicit
+   upstream (so daemon-level `dns` in `daemon.json` is refused, and must not be configured); and the raw
+   UDP probe has a positive control, so "no answer" from an agent is never the product of a broken probe.
 3. **Start gate** - after a daemon restart the restart policy can start containers before the
    guard is re-applied; `api`, `discovery`, `telegram` and the proxies therefore exit at start while
    a forbidden target answers, before any application code runs.
@@ -138,8 +142,9 @@ Layers, each answering a different question (`docs/deployment.md`, "Host isolati
    each container first passes its own positive controls. In `report` mode (rootful CI runners) only
    reachability becomes a warning; broken tools, missing output and incomplete coverage stay fatal.
    `deploy/check-dns.sh` does the same for DNS: services with a route out use the guard-allowed resolver
-   from inside the container, internal-only services resolve nothing outside, names resolve only across
-   shared networks (a leak or a wrong resolver is a breach in every mode).
+   from inside the container, internal-only services resolve nothing outside and carry no explicit upstream
+   resolver, names resolve only across shared networks (a leak or a wrong resolver is a breach in every
+   mode); a probe that cannot receive an answer from the approved resolver is a defect in every mode.
    The proxy's start check and healthcheck use the same rule: only "unreachable", "prohibited" or
    "timed out" count as isolation, after a self-test proves `nc` works here.
 
