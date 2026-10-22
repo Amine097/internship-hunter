@@ -7,6 +7,13 @@
 #
 #   lab.sh up      [dns]   start the daemon (optional daemon-level `dns`), write $LAB/env.sh
 #   lab.sh restart [dns]   stop and start it again (new network namespace, no guard)
+#
+# HUNTER_LAB_RESOLV_CONF=<file> is handed to the daemon as DOCKER_TEST_RESOLV_CONF_PATH (Docker's own
+# hook for tests; daemon.json has no such directive): the upstream resolvers that containers without
+# their own `dns` inherit. Without it Docker picks the host's /etc/resolv.conf, or
+# /run/systemd/resolve/resolv.conf when that names only the 127.0.0.53 stub (decided once, at daemon
+# start: every GitHub runner is the second case, WSL the first), so a test that needs a KNOWN upstream
+# must not depend on the machine it runs on. Docker logs "Using OriginResolvConfPath from env".
 #   lab.sh down
 #
 # Environment: HUNTER_LAB_DIR (state; default: a new mktemp dir, printed), HUNTER_LAB_CACHE
@@ -152,6 +159,7 @@ start() {
   (
     export XDG_RUNTIME_DIR="$XDG" HOME="$LAB/home" PATH="$LAB/bin:$PATH" DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns
     export DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS="--subid-source=dynamic"
+    [[ -z "${HUNTER_LAB_RESOLV_CONF:-}" ]] || export DOCKER_TEST_RESOLV_CONF_PATH="$HUNTER_LAB_RESOLV_CONF"
     exec setsid "$LAB/bin/dockerd-rootless.sh" --group root --config-file "$LAB/home/.config/docker/daemon.json" --data-root "$LAB/data" --host "unix://$XDG/docker.sock" \
       >"$LAB/dockerd.log" 2>&1
   ) &

@@ -108,8 +108,11 @@ class Lab:
         return r
 
     # ---- daemon -------------------------------------------------------------------------------
-    def restart_daemon(self, dns=""):
-        self.run([LAB_SH, "restart", dns], timeout=180)
+    def restart_daemon(self, dns="", resolv_conf=None):
+        """A new daemon process in a new network namespace (so: no guard, no DNAT). `resolv_conf`
+        is the daemon's own upstream list, set explicitly instead of inherited from the machine."""
+        extra = {"HUNTER_LAB_RESOLV_CONF": str(resolv_conf)} if resolv_conf else {}
+        self.run([LAB_SH, "restart", dns], timeout=180, **extra)
 
     # ---- the stack ------------------------------------------------------------------------------
     def compose(self, *args, files=None, check=True, **env):
@@ -200,25 +203,26 @@ class Lab:
             **{**getattr(self, "current_env", {}), **env},
         )
 
+    def container_resolv_conf(self):
+        """The /etc/resolv.conf an ad hoc container on the default bridge actually receives."""
+        return self.run(
+            ["docker", "run", "--rm", "alpine-local:3.20", "cat", "/etc/resolv.conf"]
+        ).stdout
+
     @contextlib.contextmanager
-    def daemon_resolv_conf(self, content):
-        """Make the DAEMON's own /etc/resolv.conf say `content` for a while (bind mount inside the
-        rootlesskit mount namespace only; the host's file is untouched and the mount is removed on
-        exit). Whatever the runner's real upstream is (127.0.0.53, a LAN address, ...), the test
-        decides it instead of branching on it."""
-        pid = (Path(self.xdg) / "dockerd-rootless" / "child_pid").read_text().strip()
-        fake = self.path / "daemon-resolv.conf"
-        fake.write_text(content)
-        mounted = False
+    def lan_resolver_at(self, resolver):
+        """Route LAN_RESOLVER:53 to the live `resolver` with a DNAT in the daemon's CURRENT network
+        namespace (the guard's filter chains run after it). A restarted daemon has a new namespace,
+        so this goes after any restart."""
+        rule = [
+            "PREROUTING", "-d", LAN_RESOLVER, "-p", "udp", "--dport", "53",
+            "-j", "DNAT", "--to-destination", f"{resolver.bind_ip}:{resolver.port}",
+        ]  # fmt: skip
+        self.netns("iptables", "-t", "nat", "-I", *rule)
         try:
-            self.netns("mount", "--bind", str(fake), "/etc/resolv.conf")
-            mounted = True
-            seen = self.netns("cat", "/etc/resolv.conf").stdout
-            assert seen == content, f"the daemon (pid {pid}) does not see the forced resolv.conf"
             yield
         finally:
-            if mounted:
-                self.netns("umount", "/etc/resolv.conf", check=False)
+            self.netns("iptables", "-t", "nat", "-D", *rule, check=False)
 
 
 NODNS = ROOT / "tests" / "rootless_lab" / "compose.nodns.yaml"
@@ -295,8 +299,8 @@ def _host_address():
 
 
 @pytest.fixture
-def lan_resolver(lab):
-    """A live resolver at LAN_RESOLVER:53 as seen from the containers (see LanResolver)."""
+def lan_host_resolver(lab):
+    """A live resolver on the host (see LanResolver); not routed anywhere yet."""
     host = _host_address()
     if not host or host.startswith("127."):
         msg = f"no non-loopback host address for the LAN resolver stand-in ({host})"
@@ -304,16 +308,17 @@ def lan_resolver(lab):
             pytest.fail(msg)
         pytest.skip(msg)
     resolver = LanResolver(host)
-    rule = [
-        "PREROUTING", "-d", LAN_RESOLVER, "-p", "udp", "--dport", "53",
-        "-j", "DNAT", "--to-destination", f"{host}:{resolver.port}",
-    ]  # fmt: skip
     try:
-        lab.netns("iptables", "-t", "nat", "-I", *rule)
         yield resolver
     finally:
-        lab.netns("iptables", "-t", "nat", "-D", *rule, check=False)
         resolver.close()
+
+
+@pytest.fixture
+def lan_resolver(lab, lan_host_resolver):
+    """A live resolver at LAN_RESOLVER:53 as seen from the containers of the CURRENT daemon."""
+    with lab.lan_resolver_at(lan_host_resolver):
+        yield lan_host_resolver
 
 
 @pytest.fixture(scope="module")
@@ -584,33 +589,43 @@ def test_daemon_level_dns_gives_agents_an_explicit_upstream_and_check_dns_refuse
 
 
 def test_without_daemon_level_dns_ad_hoc_containers_get_no_dns_and_per_container_dns_works(
-    lab, lan_resolver
+    lab, lan_host_resolver
 ):
     """The documented state: nothing configured at daemon level; `--dns 10.0.2.3` per container.
 
     F-4(b): this used to test the private-upstream half only `if upstream_is_private()`, i.e. never
-    on a runner whose upstream is 127.0.0.53, and nobody noticed. The daemon's upstream is now
-    SET by the test (a private one, with a live resolver behind it), so there is no branch to
-    skip: an ad hoc container inherits it and is refused by the guard, and answered without it."""
+    on a runner whose upstream is 127.0.0.53 (all of GitHub's), and nobody noticed. The daemon's
+    upstream is now SET by the test (`resolv-conf`: a private address with a live resolver behind
+    it), so the same thing happens on every machine and there is no branch to skip: an ad hoc
+    container inherits it and is refused by the guard, and answered without the guard."""
     run = ["docker", "run", "--rm", "alpine-local:3.20", "nslookup", "-timeout=3", "example.com."]
     explicit = [*run[:3], "--dns", SLIRP_DNS, *run[3:]]
-    lab.guard("remove", check=False)
+    upstream = lab.path / "lan-upstream-resolv.conf"
+    upstream.write_text(f"nameserver {LAN_RESOLVER}\n")
     try:
-        with lab.daemon_resolv_conf(f"nameserver {LAN_RESOLVER}\n"):
-            lab.assert_leaves_by_the_uplink(lan_resolver.bind_ip)
+        lab.restart_daemon(resolv_conf=upstream)
+        with lab.lan_resolver_at(lan_host_resolver):
+            lab.assert_leaves_by_the_uplink(lan_host_resolver.bind_ip)
+            # the premise, from the container's side: it inherited the LAN upstream
+            inherited = lab.container_resolv_conf()
+            assert f"nameserver {LAN_RESOLVER}" in inherited, inherited
+            assert "Using OriginResolvConfPath from env" in (lab.path / "dockerd.log").read_text()
             # CONTROL, no guard: the inherited LAN upstream answers, so a refusal below is the guard
             r = lab.run(run, check=False)
             assert r.returncode == 0 and "Address: " in r.stdout, r.stdout + r.stderr
-            assert lan_resolver.received >= 1
+            assert lan_host_resolver.received >= 1, "the answer did not come from the LAN resolver"
             lab.guard("apply")
-            before = lan_resolver.received
+            before = lan_host_resolver.received
             r = lab.run(run, check=False)
             assert r.returncode != 0, "an ad hoc container reached the host's LAN resolver"
-            assert lan_resolver.received == before, "the guard let the query reach the resolver"
-        r = lab.run(explicit, check=False)
-        assert r.returncode == 0 and "Address: " in r.stdout, r.stdout + r.stderr
+            assert lan_host_resolver.received == before, (
+                "the guard let the query reach the resolver"
+            )
+            r = lab.run(explicit, check=False)
+            assert r.returncode == 0 and "Address: " in r.stdout, r.stdout + r.stderr
     finally:
         lab.guard("remove", check=False)
+        lab.restart_daemon()  # the next test starts from the machine's own daemon configuration
 
 
 # ---- the raw-UDP probe has a positive control (Claude 2's F-2) ---------------------------------
