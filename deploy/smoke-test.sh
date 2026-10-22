@@ -189,56 +189,98 @@ ctl_mounts="$(docker inspect --format '{{range .Mounts}}{{.Source}} {{end}}' \
 ok "demo stack: session-controller has no broker socket and RSM is disabled"
 
 # 4. egress policy ----------------------------------------------------------------------------
-connect() { # connect <agent> <proxy> <host> <port> -> HTTP status of CONNECT, or "error"
-  exec_in "$1" python - <<PY | tr -d '\r'
-import socket
+# Every agent reaches the outside only through ITS proxy (docker/egress_proxy.py). A refusal counts
+# only as the proxy's POLICY answer - exactly `403` with an X-Egress-Reason - never as "anything but
+# 200": a dead, crashed or misrouted proxy (connection error, 502, 503) must FAIL this test.
+PAIRS=("agent-claude-1 egress-claude-1 api.anthropic.com" "agent-claude-2 egress-claude-2 api.anthropic.com"
+       "agent-codex egress-codex api.openai.com")
+ask() { # ask <agent> <proxy> <request line> -> "<status> <X-Egress-Reason or ->", or "error <why>"
+  exec_in "$1" python - "$2" "$3" <<'PY' | tr -d '\r'
+import socket, sys
 try:
-    s = socket.create_connection(("$2", 3128), timeout=8)
-    s.sendall(b"CONNECT $3:$4 HTTP/1.1\r\nHost: $3:$4\r\n\r\n")
-    print(s.recv(256).split(b" ")[1].decode())
-except Exception:
-    print("error")
+    s = socket.create_connection((sys.argv[1], 3128), timeout=8)
+    host = sys.argv[2].split(" ")[1].split("/")[2] if "://" in sys.argv[2] else sys.argv[2].split(" ")[1]
+    s.sendall(f"{sys.argv[2]} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(1024)
+        if not chunk:
+            break
+        head += chunk
+    lines = head.split(b"\r\n\r\n")[0].decode("latin-1").split("\r\n")
+    reason = next((ln.split(": ", 1)[1] for ln in lines[1:] if ln.lower().startswith("x-egress-reason: ")), "-")
+    print(lines[0].split(" ")[1], reason)
+except Exception as e:
+    print("error", type(e).__name__)
 PY
 }
-denied() { [[ "$1" != 200 ]] && return 0 || return 1; }
-# the proxy must also refuse CONNECT to the real host addresses (hostname filtering; the
-# network-level proof that the host is unreachable is deploy/check-host-isolation.sh below)
-host_targets=()
-for ip in "${PROTECTED_IPS[@]}"; do host_targets+=("$ip 22" "$ip 8000" "$ip 443"); done
-for t in "${host_targets[@]}"; do
-  read -r host port <<<"$t"
-  denied "$(connect agent-claude-1 egress-claude-1 "$host" "$port")" || fail "claude-1 proxy allowed CONNECT to host $host:$port"
-  denied "$(connect agent-codex egress-codex "$host" "$port")" || fail "codex proxy allowed CONNECT to host $host:$port"
+refused() { [[ "$1" =~ ^403\ (host|port|method)$ ]]; }   # the proxy said no, for a policy reason
+# the proxies must refuse CONNECT to the real host addresses (hostname policy; the network-level
+# proof that the host is unreachable is deploy/check-host-isolation.sh below)
+targets=()
+for ip in "${PROTECTED_IPS[@]}"; do targets+=("$ip:22" "$ip:8000" "$ip:443"); done
+targets+=(example.com:443 1.1.1.1:443 169.254.169.254:443 10.0.0.1:443 host.docker.internal:443
+          100.64.0.1:443 100.100.100.100:443 192.168.0.1:443 172.16.0.1:443 127.0.0.1:443
+          localhost:443 "[::1]:443" api.anthropic.com:22 api.anthropic.com.evil.example:443
+          api.openai.com:80 github.com:443 claude.ai:443 statsig.anthropic.com:443)
+for pair in "${PAIRS[@]}"; do
+  read -r agent proxy _ <<<"$pair"
+  for t in "${targets[@]}"; do
+    r="$(ask "$agent" "$proxy" "CONNECT $t")"
+    refused "$r" || fail "$proxy did not refuse CONNECT $t with a policy 403 (got: $r)"
+  done
 done
-for t in "example.com 443" "1.1.1.1 443" "169.254.169.254 443" "10.0.0.1 443" "host.docker.internal 443" \
-         "100.64.0.1 443" "100.100.100.100 443" "192.168.0.1 443" "172.16.0.1 443" \
-         "127.0.0.1 443" "localhost 443" \
-         "api.anthropic.com 22" "api.anthropic.com.evil.example 443" "api.openai.com 443"; do
-  read -r host port <<<"$t"
-  denied "$(connect agent-claude-1 egress-claude-1 "$host" "$port")" || fail "claude-1 proxy allowed $host:$port"
+for t in agent-claude-1:egress-claude-1:api.openai.com agent-claude-2:egress-claude-2:api.openai.com \
+         agent-codex:egress-codex:api.anthropic.com; do
+  IFS=: read -r agent proxy host <<<"$t"
+  r="$(ask "$agent" "$proxy" "CONNECT $host:443")"
+  refused "$r" || fail "$proxy did not refuse the other provider $host (got: $r)"
 done
-denied "$(connect agent-codex egress-codex api.anthropic.com 443)" || fail "codex proxy allowed anthropic"
-ok "proxy refuses other hosts, IP literals, tailnet/LAN/metadata/loopback addresses, other ports and look-alikes"
-
-plain="$(exec_in agent-codex python - <<'PY' | tr -d '\r'
-import socket
-try:
-    s = socket.create_connection(("egress-codex", 3128), timeout=8)
-    s.sendall(b"GET http://api.openai.com/ HTTP/1.1\r\nHost: api.openai.com\r\nConnection: close\r\n\r\n")
-    print(s.recv(64).split(b" ")[1].decode())
-except Exception:
-    print("error")
-PY
-)"
-[[ "$plain" != 200 && "$plain" != 301 && "$plain" != 404 && "$plain" != 400 ]] \
-  || fail "proxy forwarded a plain-HTTP request to an allowed host (status $plain)"
-ok "proxy is CONNECT-only: plain HTTP forwarding to an allowed host is refused ($plain)"
+ok "all three proxies refuse other hosts, IP literals, tailnet/LAN/metadata/loopback addresses, other ports, look-alikes and the other provider (policy 403)"
+for pair in "${PAIRS[@]}"; do
+  read -r agent proxy host <<<"$pair"
+  r="$(ask "$agent" "$proxy" "GET http://$host/")"
+  [[ "$r" == "403 method" ]] || fail "$proxy did not refuse plain-HTTP forwarding with a policy 403 (got: $r)"
+done
+ok "all three proxies are CONNECT-only: plain HTTP forwarding is refused (403 method)"
 if [[ "$EXTERNAL" == 1 ]]; then
-  [[ "$(connect agent-claude-1 egress-claude-1 api.anthropic.com 443)" == 200 ]] \
-    || fail "claude-1 cannot reach its provider"
-  [[ "$(connect agent-codex egress-codex api.openai.com 443)" == 200 ]] \
-    || fail "codex cannot reach its provider"
-  ok "legitimate provider access still works (CONNECT api.anthropic.com / api.openai.com)"
+  # Real provider, real certificate, through the proxy's TLS gate: the right server name completes a
+  # verified handshake; a swapped server name (a different site on a shared CDN) is cut by the proxy
+  # before the provider sees it - and the proxy's own log says why.
+  tls_via() { # tls_via <agent> <proxy> <connect host> <TLS server name> -> "tls-ok <version>" | "cut <why>" | "error <why>"
+    exec_in "$1" python - "$2" "$3" "$4" <<'PY' | tr -d '\r'
+import socket, ssl, sys
+proxy, host, sni = sys.argv[1:4]
+try:
+    s = socket.create_connection((proxy, 3128), timeout=10)
+    s.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(1024)
+        if not chunk:
+            break
+        head += chunk
+    if head.split(b" ")[1:2] != [b"200"]:
+        print("error connect", head[:40]); sys.exit()
+    try:
+        t = ssl.create_default_context().wrap_socket(s, server_hostname=sni)
+        print("tls-ok", t.version())
+    except (ssl.SSLEOFError, ConnectionResetError, ConnectionAbortedError) as e:
+        print("cut", type(e).__name__)
+except Exception as e:
+    print("error", type(e).__name__, str(e)[:80])
+PY
+  }
+  for pair in "${PAIRS[@]}"; do
+    read -r agent proxy host <<<"$pair"
+    r="$(tls_via "$agent" "$proxy" "$host" "$host")"
+    [[ "$r" == "tls-ok TLSv1."* ]] || fail "$agent cannot complete a verified TLS handshake with $host through $proxy ($r)"
+    r="$(tls_via "$agent" "$proxy" "$host" www.cloudflare.com)"
+    [[ "$r" == cut* ]] || fail "$proxy let a TLS handshake for www.cloudflare.com through a CONNECT to $host ($r)"
+    "${COMPOSE[@]}" logs --no-color "$proxy" 2>/dev/null | grep -q '"reason": "tls-sni-mismatch"' \
+      || fail "$proxy did not log the cut SNI swap as tls-sni-mismatch"
+  done
+  ok "verified TLS to each provider works through its proxy; a swapped TLS server name is cut by every proxy (tls-sni-mismatch)"
 fi
 
 # 4b. host isolation (the checks that matter most on a rootless production host) ----------------

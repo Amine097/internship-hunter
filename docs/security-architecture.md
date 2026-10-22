@@ -28,7 +28,7 @@ The V1 work queue is now one PostgreSQL table (`tasks`). Nothing in it is execut
                       └──────┬──────────┬─────────┬───────────── one internal net per agent
                     HTTP+token│          │         │
                        ┌──────▼──┐ ┌─────▼───┐ ┌───▼─────┐
- provider APIs ◀─CONNECT egress-* proxy (per agent, hostname allow-list, :443 only)
+ provider APIs ◀─CONNECT egress-* proxy (per agent: host allow-list, :443, pinned IP, SNI==host)
                        │ agent   │ │ agent   │ │ agent   │   untrusted runtime:
                        └─────────┘ └─────────┘ └─────────┘   no DB, no admin/Telegram secrets
 ```
@@ -42,13 +42,13 @@ The V1 work queue is now one PostgreSQL table (`tasks`). Nothing in it is execut
 2. **Agent egress is enforced by topology, not by proxy variables.** Agent networks are
    `internal` (no gateway): the only reachable address besides the orchestrator is the agent's
    own egress proxy. `HTTPS_PROXY` is merely how the CLI finds it; ignoring it yields "network
-   unreachable", not a bypass. The proxy (tinyproxy, non-root) is **CONNECT-only**: filtering
-   matches the request target, and the allow patterns are `^<host>:443$`, so plain-HTTP
-   forwarding (even to an allowed host), other ports, IP literals, look-alike domains and
-   other providers' hosts are all refused (checked in `deploy/smoke-test.sh`). The lists are
-   policy, kept in `compose.yaml`/`.env`. **This is an application-level control on what the
-   proxy will *ask for*. It is not a network boundary for the proxy process** - see
-   "Host boundary" below.
+   unreachable", not a bypass. The proxy (`docker/egress_proxy.py`, non-root, Python standard
+   library only) accepts exactly `CONNECT <allow-listed host>:443`, pins the connection to the
+   global IPv4 address it resolved itself, and lets the tunnel carry only a TLS handshake whose
+   server name (SNI) is that same host - see "Egress" below for what that does and does not
+   prove. The lists are policy, kept in `compose.yaml`/`.env`. **This is an application-level
+   control on what the proxy will *ask for*. It is not a network boundary for the proxy
+   process** - see "Host boundary" below.
 3. **Task leases and fencing** (`hunter/taskqueue.py`). A task is claimed in one short
    transaction under `FOR UPDATE SKIP LOCKED` and gets a random `lease_token` and expiry;
    a heartbeat thread renews it. Every write a worker makes to a scan's results happens in a
@@ -73,9 +73,72 @@ The V1 work queue is now one PostgreSQL table (`tasks`). Nothing in it is execut
 | Read its own `AGENT_TOKEN` (via `/proc`) | Reach the API, admin routes, Telegram token |
 | Consume its CPU/memory share until limits | Reach another provider's API through its proxy |
 
-That table assumes the proxy itself is not compromised. A memory-safety bug in the proxy's
-request parser (tinyproxy has had such CVEs) is reachable by the agent over HTTP; the
-following section is about what such a proxy can then do.
+That table assumes the proxy itself is not compromised. A bug in the proxy's request or TLS
+parser is reachable by the agent; the proxy is small, memory-safe Python with strict bounds
+(see "Egress"), and the following section is about what a compromised proxy could then do.
+
+## Egress: what the agent's proxy enforces, and what it cannot see
+
+**Threat.** In `AGENT_MODE=cli` an agent runs a real CLI with real provider credentials and
+untrusted input (job postings, profiles). Assume it is prompt-injected or otherwise hostile and
+tries to move data anywhere other than its provider, or to reach the host, the LAN or the tailnet.
+Its only way out is `CONNECT` through its own proxy (the agent network is `internal`; it has no
+route and no resolver for public names - `deploy/check-dns.sh`).
+
+**What the pinned CLIs actually do** (measured, not assumed: `tests/cli_probe`, CI job
+`cli-egress-probe`, run through `hunter.agents.run_plan` with the pinned Claude Code and Codex in a
+namespace that has nothing but loopback): they send **no DNS query of their own**, only
+`CONNECT <hostname>:443`, with a TLS **SNI equal to that hostname** and **no Encrypted Client
+Hello**. Hosts needed: Claude Code - `api.anthropic.com`, and `platform.claude.com` to refresh
+its OAuth token; Codex - `api.openai.com` (API-key login) or `chatgpt.com` + `auth.openai.com`
+(ChatGPT login). Those are the defaults; the old defaults (`console.anthropic.com`, `claude.ai`,
+`statsig.anthropic.com`) were not used and **lacked the token endpoint**. Without hardening Codex
+also reached `github.com`/`api.github.com` (plugin and skill sync - a public write channel) and
+`ab.chatgpt.com` (analytics); `hunter/agents.py` now turns those features off on every invocation.
+
+| Vector | Enforced by | Evidence |
+|---|---|---|
+| `CONNECT` to an unlisted name, an IP or IPv6 literal, another port, a look-alike, the other provider | exact host match, port `443` only: `403 host`/`403 port`, nothing is dialled | `tests/test_egress_proxy.py`; smoke test, all three proxies |
+| plain-HTTP forwarding, other methods | `403 method` | same |
+| DNS rebinding: an allowed name whose answer is private, the host, the tailnet, metadata | the proxy resolves, refuses if **any** A record is not global unicast (`403 resolve-non-global`), then dials **that** literal address (no second lookup) - and the host guard rejects those destinations at the network layer anyway | proxy tests (resolver answers injected); guard: netns packet tests |
+| **SNI swap** on a shared CDN: `CONNECT api.openai.com`, then a ClientHello for another site served by the same edge | the first ClientHello must name exactly the CONNECT host, or the tunnel is cut **before the provider receives it** (`tls-sni-mismatch`); this also stops swapping between two allow-listed names | proxy tests with real OpenSSL clients; smoke test against the real providers (`www.cloudflare.com` via each proxy is cut) |
+| second ClientHello after a TLS 1.3 HelloRetryRequest naming another site | every plaintext ClientHello is checked until the real ServerHello; a third one, or one after the ServerHello, is cut | proxy tests (scripted HRR) |
+| no SNI (default virtual host), Encrypted Client Hello / ESNI (hides the real name) | cut (`tls-no-sni`, `tls-ech`) | proxy tests |
+| non-TLS bytes through the tunnel (another protocol to the provider's address) | the first record must be a TLS handshake | proxy tests |
+| bypassing the proxy | no route: `internal` network | smoke test, `check-host-isolation.sh` |
+| DNS as a channel | agents have no upstream resolver | `check-dns.sh`, `rootless-dns-lab` |
+| QUIC / UDP, CONNECT-UDP | no UDP route; only HTTP/1.x `CONNECT` is parsed | topology; proxy tests |
+| a redirect to another host | invisible inside TLS, but following it needs a new `CONNECT`, judged like any other | - |
+
+**What it cannot see (and does not claim to stop).**
+- **Domain fronting proper.** After the handshake everything is encrypted. If a CDN routes by the
+  HTTP `Host`/`:authority` header rather than by SNI, a request inside a correctly named tunnel could
+  reach another customer of that CDN. No proxy can check this without terminating TLS. Some CDNs
+  reject an SNI/Host mismatch; that is the provider's control, not ours, and nothing here verifies it.
+- **The provider itself.** Whatever the agent's account can do at its provider (store content, use
+  provider-side tools), a hostile agent can do. That is inherent to giving it the login.
+  Mitigation: dedicated accounts with the smallest plan/scope, spend limits, no organisation-admin
+  keys, and the per-connection log below.
+- **`chatgpt.com` is a whole web application**, not an API endpoint. It is allowed only because the
+  ChatGPT login of Codex needs it. With API-key login set `EGRESS_ALLOW_OPENAI=api.openai.com`.
+- Volume and timing inside allowed sessions; TLS 0-RTT early data (opaque, but only after a checked
+  ClientHello, so bound to the right server).
+
+**Why not TLS interception?** Terminating TLS would let the proxy compare `Host` with SNI and
+allow-list paths. But it needs a private CA trusted by both CLIs (Node and Rust/rustls trust
+stores), and it puts every provider credential and every prompt in cleartext in the proxy, which
+would become the most valuable target in the system. The chosen boundary - exact host, global pinned
+address, matching SNI, minimal per-agent lists - is everything that can be enforced *without* reading
+the traffic.
+
+**Who may use a proxy** is decided by topology, not by a password: each proxy sits on exactly one
+agent network plus its own egress network (`tests/test_compose_invariants.py`). The orchestrator
+(`discovery`) shares the agent networks but has its own route out, so a proxy gives it nothing new.
+A per-agent proxy password would be held by the very agent it is meant to constrain.
+
+**Audit trail.** Every connection is one JSON line on the proxy's stdout: host, resolved and dialled
+address, SNI, number of ClientHellos and HelloRetryRequests, verdict and reason, bytes each way,
+duration. No request contents, no credentials.
 
 ## Host boundary (network level, not hostname level)
 
