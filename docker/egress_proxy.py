@@ -306,7 +306,11 @@ class Tunnel:
         self.sni, self.alpn = hello["sni"].lower(), hello["alpn"]
 
     async def _client_to_server(self, early: bytes) -> None:
-        stream, seen, raw = RecordStream(), 0, False
+        # Records are HELD while a handshake message is incomplete and released only once every
+        # message they carry has been judged: a ClientHello split over several records must not
+        # reach the provider piecemeal (an L4 front end routing on the first record would act on a
+        # server name that is about to be refused).
+        stream, seen, raw, held = RecordStream(), 0, False, bytearray()
         if early:
             stream.feed(early)
             seen += len(early)
@@ -316,7 +320,7 @@ class Tunnel:
                 timeout = HELLO_TIMEOUT if self.client_hellos == 0 else HANDSHAKE_TIMEOUT
                 data = await self._read(self.cr, timeout)
                 if not data:
-                    self._eof(self.uw)     # an unfinished record is dropped, never forwarded
+                    self._eof(self.uw)     # held or unfinished records are dropped, never sent
                     return
                 seen += len(data)
                 if seen > INSPECT_BUDGET_C2S:
@@ -327,6 +331,9 @@ class Tunnel:
             done_sh = self.server_hello.is_set()
             if self.client_hellos == 0 and ctype != CT_HANDSHAKE:
                 raise TLSViolation("tls-not-handshake", f"first record type {ctype}")
+            if ctype != CT_HANDSHAKE and stream.hs:
+                # RFC 8446 5.1: handshake messages must not be interleaved with other record types
+                raise TLSViolation("tls-interleaved", f"record type {ctype} inside a handshake")
             if ctype == CT_HANDSHAKE:
                 for mtype, body in stream.handshake_messages(payload):
                     if mtype == HS_CLIENT_HELLO:
@@ -335,6 +342,12 @@ class Tunnel:
                         self._check_client_hello(body)
                     elif not done_sh:
                         raise TLSViolation("tls-unexpected-handshake", f"message {mtype}")
+                held += record
+                if stream.hs:
+                    continue               # a message is still incomplete: keep holding
+                await self._send(self.uw, bytes(held), True)
+                held.clear()
+                continue
             elif ctype in (CT_CCS, CT_APPDATA):
                 # before the ServerHello: TLS 1.3 compatibility CCS or 0-RTT early data (both
                 # opaque, both need a checked ClientHello first); after it: the encrypted part

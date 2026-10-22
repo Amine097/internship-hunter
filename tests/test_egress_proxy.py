@@ -403,22 +403,45 @@ def test_a_client_hello_that_does_not_name_exactly_the_connect_host_never_reache
         assert not up.received or not up.received.endswith(hello)
 
 
-def test_a_fragmented_client_hello_is_judged_as_a_whole(h):
+@pytest.mark.parametrize("pipelined", [False, True])
+def test_a_fragmented_client_hello_sends_nothing_upstream_until_it_is_judged(h, pipelined):
+    """The server_name sits in the FIRST record, the end of the message in the second. An L4
+    front end that routes on the first record must never see it (found by the QA review: the
+    first fragment used to be relayed before the SNI was judged)."""
     body = hs(1, client_hello_body(sni="evil.test"))
+    first, second = rec(22, body[:-6]), rec(22, body[-6:])
+    assert b"evil.test" in first
     s, up = tunnel(h)
-    s.sendall(rec(22, body[:25]))              # fragment 1: harmless on its own, forwarded
-    s.sendall(rec(22, body[25:]))              # fragment 2 completes a bad ClientHello: held back
+    if pipelined:
+        s.sendall(first + second)
+    else:
+        s.sendall(first)
+        time.sleep(0.3)                        # the proxy has the first record, alone
+        assert up.received == b""
+        s.sendall(second)
     assert is_cut(s)
     time.sleep(0.2)
-    assert up.hellos == [] and h.wait_log()["reason"] == "tls-sni-mismatch"
+    assert up.received == b"" and h.wait_log()["reason"] == "tls-sni-mismatch"
 
 
-def test_a_fragmented_good_client_hello_passes(h):
+def test_a_record_interleaved_inside_a_handshake_message_is_cut(h):
     body = hs(1, client_hello_body(sni="allowed.test"))
+    s, up = tunnel(h)
+    s.sendall(rec(22, body[:20]) + CCS + rec(22, body[20:]))
+    assert is_cut(s)
+    time.sleep(0.2)
+    assert up.received == b"" and h.wait_log()["reason"] == "tls-interleaved"
+
+
+@pytest.mark.parametrize("pieces", [2, 7])
+def test_a_fragmented_good_client_hello_is_released_whole(h, pieces):
+    body = hs(1, client_hello_body(sni="allowed.test"))
+    step = -(-len(body) // pieces)
+    records = b"".join(rec(22, body[i:i + step]) for i in range(0, len(body), step))
     s, up = tunnel(h, script=[server_hello()])
-    s.sendall(rec(22, body[:25]) + rec(22, body[25:]))
+    s.sendall(records)
     assert s.recv(65536).startswith(b"\x16\x03")
-    assert up.hellos == ["allowed.test"]
+    assert up.hellos == ["allowed.test"] and bytes(up.received).startswith(records)
 
 
 def test_hello_retry_request_second_client_hello_must_match_too(h):

@@ -243,6 +243,15 @@ for pair in "${PAIRS[@]}"; do
   [[ "$r" == "403 method" ]] || fail "$proxy did not refuse plain-HTTP forwarding with a policy 403 (got: $r)"
 done
 ok "all three proxies are CONNECT-only: plain HTTP forwarding is refused (403 method)"
+# Positive control, also with SMOKE_EXTERNAL=0: the allow-listed provider host must NOT be a policy
+# refusal - otherwise a deny-all proxy (a mistyped EGRESS_ALLOW) would pass every check above.
+# 200 (tunnel opened) or 502/504 (allowed, but no network here) all mean the policy said yes.
+for pair in "${PAIRS[@]}"; do
+  read -r agent proxy host <<<"$pair"
+  r="$(ask "$agent" "$proxy" "CONNECT $host:443")"
+  [[ "$r" =~ ^(200|502|504)\  ]] || fail "$proxy does not allow its own provider $host (got: $r)"
+done
+ok "each proxy allows its own provider host (policy positive control)"
 if [[ "$EXTERNAL" == 1 ]]; then
   # Real provider, real certificate, through the proxy's TLS gate: the right server name completes a
   # verified handshake; a swapped server name (a different site on a shared CDN) is cut by the proxy
