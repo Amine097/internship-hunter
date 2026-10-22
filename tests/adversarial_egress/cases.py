@@ -499,10 +499,11 @@ def register(h):  # noqa: C901 - one flat list of cases is the point
     @case("R07", "server flood before its ServerHello is cut at the budget (256 KiB), client never receives more than that")
     def _():
         def flood(conn, sock):
-            sock.recv(10)
+            conn.chunks.append(sock.recv(65536))         # drain the hello: closing with unread data sends an RST that races the flood
             try:
                 for _ in range(200):
                     sock.sendall(h.record(21, b"\x01\x00") * 400)
+                time.sleep(2)                           # keep the socket open until the proxy has cut
             except OSError:
                 pass
         up().script[h.PROVIDER_A] = flood
