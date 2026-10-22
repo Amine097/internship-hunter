@@ -17,7 +17,7 @@ the real `watch` against the real daemon and ask what an operator would ask:
               gave it is not a project service.
 
 Skipped unless PR #13 (deploy/runtime-containment.sh) is in the tree. Opt-in like the lab
-(HUNTER_ROOTLESS_LAB=1). Open findings are strict xfails, red today and breaking the build when fixed.
+(HUNTER_ROOTLESS_LAB=1). Open findings are strict xfails: red today, breaking the build when fixed.
 """
 
 import os
@@ -101,7 +101,7 @@ def watcher(rig):
 
 
 def test_LATENCY_an_event_wakes_the_cycle_and_the_hostile_endpoint_goes(rig, watcher):
-    """Positive control: the poll is 300 s, so only the docker event can have caused the reaction."""
+    """Positive control: the poll is 300 s, so only the docker event can have caused it."""
     agent = "clab-agent-codex-1"
     assert "clab_egress" not in rig.networks_of(agent)
     t0 = time.monotonic()
@@ -171,8 +171,8 @@ def test_QUIET_healthchecks_do_not_spin_the_watchdog(rig, watcher):
     reason="the assessor compares networks and four flags, not capabilities, mounts or devices",
 )
 def test_CONTRACT_an_imposter_with_agent_labels_but_more_privilege_is_not_accepted(rig):
-    """The operator (or a script) starts a container that claims to be agent-codex: same labels, same
-    network, plus NET_ADMIN, no seccomp and the host's root mounted. Nothing the release declares."""
+    """A container that claims to be agent-codex (same labels, same network) plus NET_ADMIN, no
+    seccomp and the host's root mounted: nothing the release declares."""
     try:
         rig.run(
             ["docker", "run", "-d", "--name", "imposter",
