@@ -1,0 +1,49 @@
+--- a/docker/egress_proxy.py
++++ b/docker/egress_proxy.py
+@@ -311,14 +311,21 @@
+         # reach the provider piecemeal (an L4 front end routing on the first record would act on a
+         # server name that is about to be refused).
+         stream, seen, raw, held = RecordStream(), 0, False, bytearray()
++        deadline = time.monotonic() + HELLO_TIMEOUT        # TOTAL time for the first ClientHello
++        after_first = None                                 # TOTAL time for the rest of the handshake
+         if early:
+             stream.feed(early)
+             seen += len(early)
+         while not raw:
+             rec = stream.next_record()
+             if rec is None:
+-                timeout = HELLO_TIMEOUT if self.client_hellos == 0 else HANDSHAKE_TIMEOUT
+-                data = await self._read(self.cr, timeout)
++                if self.client_hellos == 0:
++                    limit = deadline
++                else:
++                    if after_first is None:
++                        after_first = time.monotonic() + HANDSHAKE_TIMEOUT
++                    limit = after_first
++                data = await self._read(self.cr, max(0.001, limit - time.monotonic()))
+                 if not data:
+                     self._eof(self.uw)     # held or unfinished records are dropped, never sent
+                     return
+@@ -335,6 +342,11 @@
+             if self.client_hellos == 0 and ctype != CT_HANDSHAKE:
+                 raise TLSViolation("tls-not-handshake", f"first record type {ctype}")
+             if ctype == CT_HANDSHAKE:
++                if not payload:
++                    # RFC 8446 5.1 forbids zero-length Handshake fragments. They also carry no message to
++                    # judge, so forwarding them would put attacker-chosen bytes (the record-version minor
++                    # of each header) on the provider's socket before any ClientHello has been judged.
++                    raise TLSViolation("tls-empty-fragment", "zero-length handshake record")
+                 for mtype, body in stream.handshake_messages(payload):
+                     if mtype == HS_CLIENT_HELLO:
+                         if done_sh:
+@@ -343,8 +355,8 @@
+                     elif not done_sh:
+                         raise TLSViolation("tls-unexpected-handshake", f"message {mtype}")
+                 held += record
+-                if stream.hs:
+-                    continue               # a message is still incomplete: keep holding
++                if stream.hs or self.client_hellos == 0:
++                    continue               # a message is still incomplete, or no ClientHello was judged yet: hold
+                 await self._send(self.uw, bytes(held), True)
+                 held.clear()
+                 continue
