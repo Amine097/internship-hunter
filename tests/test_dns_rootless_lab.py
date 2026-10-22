@@ -24,11 +24,14 @@ HUNTER_ROOTLESS_LAB_REQUIRED=1 (CI) turns "cannot run" into a failure. iptables 
 (or GUARD_IPTABLES_DIR, as in test_host_egress_guard_netns.py).
 """
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -168,6 +171,13 @@ class Lab:
             check=check,
         )
 
+    def assert_leaves_by_the_uplink(self, address):
+        """`address` must be routed out of the daemon's uplink (tap0), not into a Docker bridge. A
+        bridge whose subnet covers a host address swallows the packet: the symptom is a control
+        query that is never answered, which would be mistaken for the guard working."""
+        route = self.netns("ip", "route", "get", address).stdout
+        assert " dev tap0 " in f" {route} ", f"{address} does not leave by the uplink: {route}"
+
     def guard_dns_hits(self, resolver=SLIRP_DNS):
         out = self.netns("iptables", "-L", "HUNTER-EGRESS-GUARD", "-n", "-v", "-x").stdout
         for ln in out.splitlines():
@@ -190,24 +200,120 @@ class Lab:
             **{**getattr(self, "current_env", {}), **env},
         )
 
-    def upstream_is_private(self):
-        """Is the daemon's own upstream resolver a non-global address (the guard rejects those)?"""
-        out = self.netns("cat", "/etc/resolv.conf").stdout
-        import ipaddress
-
-        for ln in out.splitlines():
-            if ln.startswith("nameserver"):
-                ip = ipaddress.ip_address(ln.split()[1])
-                if (
-                    ip.version == 4
-                    and not ip.is_loopback
-                    and (ip.is_private or ip in ipaddress.ip_network("100.64.0.0/10"))
-                ):
-                    return True
-        return False
+    @contextlib.contextmanager
+    def daemon_resolv_conf(self, content):
+        """Make the DAEMON's own /etc/resolv.conf say `content` for a while (bind mount inside the
+        rootlesskit mount namespace only; the host's file is untouched and the mount is removed on
+        exit). Whatever the runner's real upstream is (127.0.0.53, a LAN address, ...), the test
+        decides it instead of branching on it."""
+        pid = (Path(self.xdg) / "dockerd-rootless" / "child_pid").read_text().strip()
+        fake = self.path / "daemon-resolv.conf"
+        fake.write_text(content)
+        mounted = False
+        try:
+            self.netns("mount", "--bind", str(fake), "/etc/resolv.conf")
+            mounted = True
+            seen = self.netns("cat", "/etc/resolv.conf").stdout
+            assert seen == content, f"the daemon (pid {pid}) does not see the forced resolv.conf"
+            yield
+        finally:
+            if mounted:
+                self.netns("umount", "/etc/resolv.conf", check=False)
 
 
 NODNS = ROOT / "tests" / "rootless_lab" / "compose.nodns.yaml"
+LAN_RESOLVER = "192.168.1.1"  # the address a home/office router would answer DNS on
+
+
+def _dns_answer(query):
+    """A minimal DNS response: one A record (192.0.2.53) for any A question, none otherwise."""
+    qend = 12
+    while query[qend] != 0:
+        qend += query[qend] + 1
+    qend += 5  # the root label, QTYPE and QCLASS
+    question, qtype = query[12:qend], int.from_bytes(query[qend - 4 : qend - 2], "big")
+    answers = qtype == 1
+    head = query[:2] + b"\x81\x80\x00\x01" + (b"\x00\x01" if answers else b"\x00\x00")
+    head += b"\x00\x00\x00\x00"
+    rr = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xc0\x00\x02\x35" if answers else b""
+    return head + question + rr
+
+
+class LanResolver:
+    """A REAL resolver on the host that counts every datagram that reaches it.
+
+    The lab has no LAN, so "a private LAN resolver is refused" was only ever shown by a query that
+    got no answer from an address (192.168.1.1) that probably does not exist on the runner: the
+    same result with or without the guard. This gives the address a live resolver behind it: a DNAT
+    in the daemon's namespace (which the guard's filter chains run after) sends 192.168.1.1:53 to a
+    socket of this test on the host's own address, reached through the same slirp4netns uplink as
+    any other host-side destination. The test can now (1) prove the resolver answers when no guard
+    is applied (the positive control) and (2) prove with the SERVER'S OWN COUNTER that nothing
+    reached it once the guard is applied."""
+
+    def __init__(self, bind_ip):
+        self.bind_ip = bind_ip
+        self.received = 0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((bind_ip, 0))
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                data, peer = self.sock.recvfrom(512)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self.received += 1
+            try:
+                self.sock.sendto(_dns_answer(data), peer)
+            except (IndexError, OSError):
+                pass
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self.sock.close()
+
+
+def _host_address():
+    """The host's own outbound IPv4 address (a connect() on UDP sends nothing)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+@pytest.fixture
+def lan_resolver(lab):
+    """A live resolver at LAN_RESOLVER:53 as seen from the containers (see LanResolver)."""
+    host = _host_address()
+    if not host or host.startswith("127."):
+        msg = f"no non-loopback host address for the LAN resolver stand-in ({host})"
+        if REQUIRED:
+            pytest.fail(msg)
+        pytest.skip(msg)
+    resolver = LanResolver(host)
+    rule = [
+        "PREROUTING", "-d", LAN_RESOLVER, "-p", "udp", "--dport", "53",
+        "-j", "DNAT", "--to-destination", f"{host}:{resolver.port}",
+    ]  # fmt: skip
+    try:
+        lab.netns("iptables", "-t", "nat", "-I", *rule)
+        yield resolver
+    finally:
+        lab.netns("iptables", "-t", "nat", "-D", *rule, check=False)
+        resolver.close()
 
 
 @pytest.fixture(scope="module")
@@ -317,17 +423,42 @@ def test_explicit_resolver_works_through_the_guard_and_check_dns_passes(stack):
     assert "internal-only service(s) resolve nothing outside the project" in r.stdout
 
 
-def test_a_private_lan_resolver_stays_unreachable_even_when_configured(stack):
-    """Never weaken the guard for LAN DNS: pointing the stack at one fails closed."""
-    lan = "192.168.1.1"
-    stack.up(HUNTER_DNS=lan)
-    stack.guard("apply")
+def test_a_private_lan_resolver_stays_unreachable_even_when_configured(stack, lan_resolver):
+    """Never weaken the guard for LAN DNS: pointing the stack at one fails closed.
+
+    F-4(a): "no answer" only means something if the same query IS answered when the guard is not
+    there. The resolver is live (see LanResolver), so the test runs control -> guard -> control:
+    answered, refused (and the resolver's own counter does not move), answered again."""
+    lan = LAN_RESOLVER
+    stack.up(HUNTER_DNS=lan)  # the `stack` fixture removed the guard: nothing stands in the way
+    stack.assert_leaves_by_the_uplink(lan_resolver.bind_ip)
+    # CONTROL, no guard: every service with a route out resolves through the LAN resolver, with the
+    # configured and with a directly named server, and the resolver counted the packets
     for svc in OUT:
         assert f"ExtServers: [{lan}]" in stack.exec(svc, "cat", "/etc/resolv.conf").stdout, svc
-        assert not stack.nslookup(svc, "example.com"), svc
+        answered = stack.nslookup(svc, "control.example.com")
+        assert answered, (
+            f"{svc}: control query unanswered; the live resolver has seen "
+            f"{lan_resolver.received} datagram(s)\n"
+            + stack.netns("iptables", "-t", "nat", "-L", "PREROUTING", "-n", "-v").stdout
+            + stack.exec(svc, "nslookup", "-timeout=3", "control.example.com.").stdout
+        )
+    assert stack.nslookup("egress-codex", "control-direct.example.com", server=lan)
+    assert lan_resolver.received >= len(OUT) + 1, "the control did not reach the live resolver"
+
+    stack.guard("apply")
+    before = lan_resolver.received
+    for svc in OUT:
+        assert not stack.nslookup(svc, "guarded.example.com"), svc
     assert stack.check_dns(HUNTER_DNS=lan).returncode == 1
     # and querying that resolver directly is refused by the guard as well
-    assert not stack.nslookup("egress-codex", "example.com", server=lan)
+    assert not stack.nslookup("egress-codex", "guarded-direct.example.com", server=lan)
+    # refused, not merely unanswered: not one datagram arrived at the resolver
+    assert lan_resolver.received == before, "the guard let queries through to the LAN resolver"
+
+    stack.guard("remove")  # the guard, and only the guard, is what stopped them
+    assert stack.nslookup("egress-codex", "after-removal.example.com")
+    assert lan_resolver.received > before
 
 
 def test_internal_only_services_have_no_dns_way_out_and_see_only_their_neighbours(stack):
@@ -452,16 +583,30 @@ def test_daemon_level_dns_gives_agents_an_explicit_upstream_and_check_dns_refuse
         lab.restart_daemon(dns="")
 
 
-def test_without_daemon_level_dns_ad_hoc_containers_get_no_dns_and_per_container_dns_works(lab):
-    """The documented state: nothing configured at daemon level; `--dns 10.0.2.3` per container."""
-    lab.guard("remove", check=False)
-    lab.guard("apply")
+def test_without_daemon_level_dns_ad_hoc_containers_get_no_dns_and_per_container_dns_works(
+    lab, lan_resolver
+):
+    """The documented state: nothing configured at daemon level; `--dns 10.0.2.3` per container.
+
+    F-4(b): this used to test the private-upstream half only `if upstream_is_private()`, i.e. never
+    on a runner whose upstream is 127.0.0.53, and nobody noticed. The daemon's upstream is now
+    SET by the test (a private one, with a live resolver behind it), so there is no branch to
+    skip: an ad hoc container inherits it and is refused by the guard, and answered without it."""
     run = ["docker", "run", "--rm", "alpine-local:3.20", "nslookup", "-timeout=3", "example.com."]
+    explicit = [*run[:3], "--dns", SLIRP_DNS, *run[3:]]
+    lab.guard("remove", check=False)
     try:
-        if lab.upstream_is_private():  # a public upstream (some CI runners) would not be rejected
+        with lab.daemon_resolv_conf(f"nameserver {LAN_RESOLVER}\n"):
+            lab.assert_leaves_by_the_uplink(lan_resolver.bind_ip)
+            # CONTROL, no guard: the inherited LAN upstream answers, so a refusal below is the guard
+            r = lab.run(run, check=False)
+            assert r.returncode == 0 and "Address: " in r.stdout, r.stdout + r.stderr
+            assert lan_resolver.received >= 1
+            lab.guard("apply")
+            before = lan_resolver.received
             r = lab.run(run, check=False)
             assert r.returncode != 0, "an ad hoc container reached the host's LAN resolver"
-        explicit = [*run[:3], "--dns", SLIRP_DNS, *run[3:]]
+            assert lan_resolver.received == before, "the guard let the query reach the resolver"
         r = lab.run(explicit, check=False)
         assert r.returncode == 0 and "Address: " in r.stdout, r.stdout + r.stderr
     finally:
