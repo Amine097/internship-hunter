@@ -91,6 +91,7 @@ services:
       <<: *db-env
       ADMIN_TOKEN: ${ADMIN_TOKEN:?set_ADMIN_TOKEN}
       EGRESS_FORBIDDEN_TARGETS: ${EGRESS_FORBIDDEN_TARGETS:-}
+    dns: ["${HUNTER_DNS:-10.0.2.3}"]   # explicit resolver: queries leave the container and cross the guard (docs/deployment.md, "DNS")
     networks: [data, edge]
     # Loopback only; reach it over Tailscale / SSH forward. Host port 18000, container port 8000:
     # the production host already runs a rootful service on <tailscale ip>:8000 (Gluetun), so the
@@ -113,6 +114,7 @@ services:
       AGENT_TOKEN_CLAUDE_1: ${AGENT_TOKEN_CLAUDE_1:?set_AGENT_TOKEN_CLAUDE_1}
       AGENT_TOKEN_CLAUDE_2: ${AGENT_TOKEN_CLAUDE_2:?set_AGENT_TOKEN_CLAUDE_2}
       AGENT_TOKEN_CODEX: ${AGENT_TOKEN_CODEX:?set_AGENT_TOKEN_CODEX}
+    dns: ["${HUNTER_DNS:-10.0.2.3}"]   # explicit resolver: queries leave the container and cross the guard (docs/deployment.md, "DNS")
     networks: [data, egress, agent_claude_1, agent_claude_2, agent_codex]
     depends_on:
       migrate: {condition: service_completed_successfully}
@@ -147,6 +149,7 @@ services:
       EGRESS_FORBIDDEN_TARGETS: ${EGRESS_FORBIDDEN_TARGETS:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID:-}
+    dns: ["${HUNTER_DNS:-10.0.2.3}"]   # explicit resolver: queries leave the container and cross the guard (docs/deployment.md, "DNS")
     networks: [data, egress]
     depends_on:
       migrate: {condition: service_completed_successfully}
@@ -205,6 +208,7 @@ services:
     environment:
       EGRESS_ALLOW: ${EGRESS_ALLOW_ANTHROPIC:-api.anthropic.com,console.anthropic.com,claude.ai,statsig.anthropic.com}
       EGRESS_FORBIDDEN_TARGETS: ${EGRESS_FORBIDDEN_TARGETS:-}
+    dns: ["${HUNTER_DNS:-10.0.2.3}"]   # explicit resolver: queries leave the container and cross the guard (docs/deployment.md, "DNS")
     networks: [egress_claude_1, agent_claude_1]
     mem_limit: 64m
     cpus: 0.25

@@ -100,6 +100,19 @@ Derived checks (also run in CI against the Docker runner, in report mode, withou
       chains refused before anything is changed; stale pid file, swapped namespace and killed daemon fail closed
 - [ ] **S** on the production host, read-only: `readlink /proc/self/ns/net /proc/$PID/ns/net` equal, the
       detached file is `nsfs` with a different inode, `"$GUARD" plan` names that inode (docs/deployment.md)
+- [x] **L** DNS on a real rootless daemon with the project's real compose networks
+      (`tests/test_dns_rootless_lab.py`, CI job `rootless-dns-lab`): embedded DNS without `dns:` bypasses the
+      guard; the explicit resolver is guard-policed, a LAN resolver is rejected; internal-only services
+      resolve nothing outside and only their neighbours' names; `deploy/check-dns.sh` (also stubbed:
+      `tests/test_check_dns.py`) catches each misconfiguration; the deploy gate requires `DNS=` in the guard conf
+- [x] **L** review findings F-1/F-2/F-3 (real rootless daemon + stubbed deploy gate): daemon-level `dns` gives
+      every agent `ExtServers: [10.0.2.3]` (no forwarding observed, guard counters 0) and `check-dns.sh`
+      refuses it in every mode; the raw-UDP probe has a positive control (sabotaged probe = defect, a blocked
+      query = a different class); the rendered compose DNS is compared with the guard conf before images are
+      loaded / before `up` / before a rollback, and the caller's `HUNTER_DNS` is removed
+- [ ] **S** on the production host: V10-V13 incl. V10b/V11b (docs/deployment.md, "DNS") after the guard is
+      applied; `~hunter-deploy/.config/docker/daemon.json` has no `dns` key
+- [ ] **S** CLI mode DNS (separate, NOT part of the demo go-live): pinned CLIs hand the hostname to the proxy
 - [x] **L** deploy script gate (stubbed docker): missing/untrusted/inactive guard, unset targets,
       failed enforce check, first-deploy teardown, rollback prerequisites, rootful daemon never used
 - [x] **L** real `egress-proxy.sh` CONNECT to an allow-listed public name keeps working with the guard;

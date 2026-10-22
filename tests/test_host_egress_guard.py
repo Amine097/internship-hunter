@@ -307,9 +307,9 @@ def test_an_unreadable_start_time_is_refused(env, tmp_path):
 
 def test_every_firewall_command_goes_through_the_verified_namespace_gate():
     code = "\n".join(ln for ln in GUARD.read_text().splitlines() if not ln.lstrip().startswith("#"))
-    assert code.count("NS=(nsenter") == 1                      # one entry point, defined once
+    assert code.count("NS_PREFIX=(nsenter") == 1             # one entry point, defined once
     others = [ln for ln in code.splitlines()
-              if "nsenter" in ln and not ln.startswith("NS=(nsenter") and "PATH=" not in ln]
+              if "nsenter" in ln and not ln.startswith("NS_PREFIX=(nsenter") and "PATH=" not in ln]
     assert not others
     assert "exit 97" in code and "/proc/self/ns/net" in code and "/proc/self/ns/user" in code
     assert "--net=$NETNS_FILE" in code and "--preserve-credentials" in code

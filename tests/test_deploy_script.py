@@ -4,6 +4,7 @@ import fcntl
 import gzip
 import hashlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 SCRIPT = Path(os.environ.get("HUNTER_DEPLOY_SCRIPT") or
               Path(__file__).resolve().parents[1] / "deploy" / "remote-deploy.sh")
@@ -20,6 +22,19 @@ pytestmark = pytest.mark.skipif(
     not (shutil.which("ssh-keygen") and shutil.which("flock")), reason="needs ssh-keygen+flock")
 
 SHA_A, SHA_B, SHA_C = "a" * 40, "b" * 40, "c" * 40
+REAL_CHECK_DNS = Path(__file__).resolve().parents[1] / "deploy" / "check-dns.sh"
+
+
+def compose_template():
+    """The topology of the real compose.yaml (networks, internal flags, dns entries)."""
+    cfg = yaml.safe_load((Path(__file__).resolve().parents[1] / "compose.yaml").read_text())
+    nets = {n: {"internal": bool((v or {}).get("internal"))} for n, v in cfg["networks"].items()}
+    services = {}
+    for name, svc in cfg["services"].items():
+        services[name] = {"networks": {n: None for n in svc.get("networks", [])}}
+        if svc.get("dns"):
+            services[name]["dns"] = list(svc["dns"])
+    return {"networks": nets, "services": services}
 
 DOCKER_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
@@ -32,14 +47,20 @@ DOCKER_STUB = textwrap.dedent("""\
       compose)
         shift
         accept=""
+        envfiles=()
         while [[ "$1" == -p || "$1" == --env-file || "$1" == -f ]]; do
           if [[ "$1" == --env-file ]]; then
+            envfiles+=("$2")
             v="$(sed -n 's/^HUNTER_ACCEPT_SCHEMA_REVISION=//p' "$2" 2>/dev/null)"
             [[ -n "$v" ]] && accept="$v"
           fi
           shift 2
         done
         case "$1" in
+          config)
+            # the effective configuration of the real compose.yaml topology (see RENDER)
+            if [[ "$*" == *--format* ]]; then python3 "$STUB_DIR/render.py" "${envfiles[@]}"; fi
+            exit 0 ;;
           up)
             # --- model of "migrate then start" against a stateful schema -------------------
             head="$(cat "$PWD/STUB_SCHEMA_HEAD" 2>/dev/null || echo 0001)"
@@ -107,6 +128,46 @@ CHECK_STUB = textwrap.dedent("""\
     [[ " ${STUB_FAIL_ISOLATION_SHA:-} " == *" $running "* ]] && exit 1
     exit 0
 """)
+# `docker compose config --format json` for the REAL compose.yaml topology, with the one
+# interpolation that matters, ${HUNTER_DNS:-10.0.2.3}, resolved the way compose does: the process
+# environment beats the env files, a later env file beats an earlier one, the default fills in.
+RENDER = textwrap.dedent("""\
+    import json, os, re, sys
+    vals = {}
+    for f in sys.argv[1:]:
+        for ln in open(f):
+            if "=" in ln and not ln.lstrip().startswith("#"):
+                k, v = ln.rstrip("\\n").split("=", 1)
+                vals[k.strip()] = v.strip().strip("'\\"")
+    if "HUNTER_DNS" in os.environ:
+        vals["HUNTER_DNS"] = os.environ["HUNTER_DNS"]
+    cfg = json.load(open(os.environ["STUB_DIR"] + "/compose-template.json"))
+    for svc in cfg["services"].values():
+        out = []
+        for d in svc.pop("dns", []):
+            m = re.fullmatch(r"\\$\\{HUNTER_DNS:-([^}]*)\\}", d)
+            out.append((vals.get("HUNTER_DNS") or m.group(1)) if m else d)
+        if out:
+            svc["dns"] = out
+    json.dump(cfg, sys.stdout)
+""")
+DNS_STUB = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    if [[ "${SMOKE_DNS_CONFIG_ONLY:-}" == 1 ]]; then
+      echo "dns-config running=$(cat "$STUB_DIR/running" 2>/dev/null) args=$*" \
+           "SMOKE_DNS_EXPECT=${SMOKE_DNS_EXPECT:-} HUNTER_DNS=${HUNTER_DNS:-<unset>}" \
+           >> "$STUB_DIR/dns-config.log"
+      # the real script, judging RENDER's output
+      [[ -n "${STUB_REAL_DNS_CONFIG:-}" ]] && exec "$STUB_REAL_DNS_CONFIG" "$@"
+      exit 0
+    fi
+    running="$(cat "$STUB_DIR/running" 2>/dev/null)"
+    echo "dns running=$running args=$* SMOKE_HOST_ISOLATION=${SMOKE_HOST_ISOLATION:-}" \
+         "SMOKE_DNS_EXPECT=${SMOKE_DNS_EXPECT:-}" >> "$STUB_DIR/dns.log"
+    [[ -n "${STUB_FAIL_DNS_ALL:-}" ]] && exit 1
+    [[ " ${STUB_FAIL_DNS_SHA:-} " == *" $running "* ]] && exit 1
+    exit 0
+""")
 SS_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
     [[ -n "${STUB_PORT_BUSY:-}" ]] && echo "LISTEN 0 4096 127.0.0.1:18000 0.0.0.0:*"
@@ -136,9 +197,15 @@ class Env:
         self.conf.write_text("ROOTFUL_TARGETS=172.17.0.2:9\n")
         self.conf.chmod(0o644)
         for name, body in (("host-egress-guard.sh", GUARD_STUB),
-                           ("check-host-isolation.sh", CHECK_STUB)):
+                           ("check-host-isolation.sh", CHECK_STUB),
+                           ("check-dns.sh", DNS_STUB)):
             (self.base / "deploy" / name).write_text(body)
             (self.base / "deploy" / name).chmod(0o755)
+        self.guard_conf = self.base / "deploy" / "host-egress-guard.conf"
+        self.guard_conf.write_text("PROTECT=100.107.22.84/32\nDNS=10.0.2.3\n")
+        self.guard_conf.chmod(0o644)
+        (self.stub / "render.py").write_text(RENDER)
+        (self.stub / "compose-template.json").write_text(json.dumps(compose_template()))
         (self.bin / "docker").write_text(DOCKER_STUB)
         (self.bin / "curl").write_text(CURL_STUB)
         (self.bin / "ss").write_text(SS_STUB)
@@ -220,6 +287,16 @@ class Env:
     @property
     def log(self):
         p = self.stub / "log"
+        return p.read_text() if p.exists() else ""
+
+    @property
+    def dns_log(self):
+        p = self.stub / "dns.log"
+        return p.read_text() if p.exists() else ""
+
+    @property
+    def dns_config_log(self):
+        p = self.stub / "dns-config.log"
         return p.read_text() if p.exists() else ""
 
     @property
@@ -595,7 +672,8 @@ def test_deploy_is_refused_when_the_check_script_is_missing(env):
     assert r.returncode == 11 and untouched(env)
 
 
-@pytest.mark.parametrize("name", ["host-egress-guard.sh", "check-host-isolation.sh"])
+@pytest.mark.parametrize("name", ["host-egress-guard.sh", "check-host-isolation.sh",
+                                  "check-dns.sh"])
 def test_deploy_is_refused_when_a_gate_script_is_writable_by_others(env, name):
     (env.base / "deploy" / name).chmod(0o775)
     r = env.deploy(SHA_A)
@@ -903,3 +981,165 @@ def test_no_deploy_script_ever_names_the_rootful_docker_socket():
         code = "\n".join(ln for ln in (SCRIPT.parent / name).read_text().splitlines()
                          if not ln.lstrip().startswith("#"))
         assert "/var/run/docker.sock" not in code and "/run/docker.sock" not in code, name
+
+
+# ---- DNS: the stack must use the resolver the guard allows, from inside the container ------------
+def test_deploy_is_refused_when_the_dns_check_is_missing_or_untrusted(env):
+    (env.base / "deploy" / "check-dns.sh").unlink()
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    assert "DNS check missing or untrusted" in r.stderr.decode()
+
+
+@pytest.mark.parametrize("content", ["PROTECT=100.107.22.84/32\n", "DNS=\n", "DNS=resolver.lan\n",
+                                     "DNS=10.0.2.3,not-an-ip\n", "DNS=10.0.2\n"])
+def test_deploy_is_refused_without_an_explicit_valid_guard_resolver(env, content):
+    env.guard_conf.write_text(content)
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    assert "host-egress-guard.conf" in r.stderr.decode() and "DNS=" in r.stderr.decode()
+
+
+def test_deploy_is_refused_when_the_guard_conf_is_missing_writable_or_a_symlink(env):
+    env.guard_conf.chmod(0o666)
+    assert env.deploy(SHA_A).returncode == 11
+    env.guard_conf.chmod(0o644)
+    real = env.base / "elsewhere.conf"
+    real.write_text("DNS=10.0.2.3\n")
+    real.chmod(0o644)
+    env.guard_conf.unlink()
+    env.guard_conf.symlink_to(real)
+    assert env.deploy(SHA_A).returncode == 11
+    env.guard_conf.unlink()
+    assert env.deploy(SHA_A).returncode == 11
+
+
+def test_dns_check_runs_in_enforce_mode_with_the_guards_resolver_after_the_isolation_check(env):
+    env.guard_conf.write_text("# policy\nDNS=10.0.2.3\nPROTECT=100.107.22.84/32\n")
+    r = env.deploy(SHA_A)
+    assert r.returncode == 0, r.stderr.decode()
+    log = env.dns_log
+    assert f"dns running={SHA_A} args=-p internship-hunter -f compose.yaml" in log
+    assert "SMOKE_HOST_ISOLATION=enforce SMOKE_DNS_EXPECT=10.0.2.3" in log
+    assert "--env-file" in log and f"release-{SHA_A}.env" in log
+
+
+def test_failed_dns_check_restores_the_previous_release(env):
+    assert env.deploy(SHA_A).returncode == 0
+    r = env.deploy(SHA_B, STUB_FAIL_DNS_SHA=SHA_B)
+    assert r.returncode == 1 and "DNS check FAILED" in r.stderr.decode()
+    assert env.current_link == SHA_A
+    assert (env.stub / "running").read_text().strip() == SHA_A
+    assert f"dns running={SHA_A}" in env.dns_log           # the restored release was gated too
+
+
+def test_first_deploy_with_a_failed_dns_check_is_torn_down(env):
+    r = env.deploy(SHA_A, STUB_FAIL_DNS_SHA=SHA_A)
+    assert r.returncode == 1 and env.current_link is None
+    assert "DOWN" in env.log and not (env.stub / "running").exists()
+
+
+def test_rollback_runs_the_dns_check_on_the_target_and_needs_its_prerequisites(env):
+    env.deploy(SHA_A)
+    env.deploy(SHA_B)
+    (env.stub / "dns.log").write_text("")
+    assert env.run("rollback").returncode == 0
+    assert f"dns running={SHA_A}" in env.dns_log
+    env.guard_conf.write_text("PROTECT=1.2.3.4/32\n")
+    assert env.run("rollback").returncode == 11
+
+
+# ---- F-3: the RENDERED compose DNS is judged against the guard BEFORE anything starts ---------
+def real_dns_config(env):
+    """Route the gate's config-only calls to the real check-dns.sh (judging the rendering)."""
+    return {"STUB_REAL_DNS_CONFIG": str(REAL_CHECK_DNS)}
+
+
+def test_the_rendered_dns_is_checked_before_images_are_loaded_or_anything_starts(env):
+    r = env.deploy(SHA_A, **real_dns_config(env))
+    assert r.returncode == 0, r.stderr.decode()
+    lines = env.dns_config_log.splitlines()
+    assert lines and all("SMOKE_DNS_EXPECT=10.0.2.3" in ln for ln in lines)
+    # first deploy: nothing runs at any config check; only the post-start check sees the release
+    assert all("running= " in ln for ln in lines), lines
+    assert f"dns running={SHA_A}" in env.dns_log
+    # and the very first of them precedes `docker load`
+    assert env.log.index("docker load") > 0 and len(lines) >= 2          # early gate + activate()
+
+
+def test_a_callers_hunter_dns_cannot_override_the_guard_resolver(env):
+    r = env.deploy(SHA_A, HUNTER_DNS="9.9.9.9", **real_dns_config(env))
+    assert r.returncode == 0, r.stderr.decode()
+    assert "HUNTER_DNS=<unset>" in env.dns_config_log and "9.9.9.9" not in env.dns_config_log
+    assert env.current_link == SHA_A
+
+
+def test_without_the_scrub_the_stubbed_compose_would_have_honoured_the_callers_value(env):
+    """Control for the test above: the model of compose really lets the process environment win."""
+    out = subprocess.run(
+        ["python3", str(env.stub / "render.py"), str(env.env_file)],
+        env={"STUB_DIR": str(env.stub), "HUNTER_DNS": "9.9.9.9", "PATH": os.environ["PATH"]},
+        capture_output=True, text=True, check=True).stdout
+    assert json.loads(out)["services"]["api"]["dns"] == ["9.9.9.9"]
+
+
+@pytest.mark.parametrize("shared_env,guard", [
+    ("HUNTER_DNS=9.9.9.9\n", "DNS=10.0.2.3\n"),                  # operator override vs guard
+    ("HUNTER_DNS=192.168.1.1\n", "DNS=10.0.2.3\n"),              # a LAN resolver the guard refuses
+    ("X=1\n", "DNS=1.1.1.1\n"),                                  # guard changed, compose not
+    ("HUNTER_DNS=10.0.2.3,1.1.1.1\n", "DNS=10.0.2.3,1.1.1.1\n"),  # compose renders ONE string
+])
+def test_a_dns_disagreement_stops_the_deploy_before_anything_is_touched(env, shared_env, guard):
+    env.env_file.write_text(
+        "EGRESS_FORBIDDEN_TARGETS=100.107.22.84:22,100.107.22.84:8000\n" + shared_env)
+    env.guard_conf.write_text(guard)
+    r = env.deploy(SHA_A, **real_dns_config(env))
+    err = r.stderr.decode()
+    assert r.returncode == 11, err
+    assert "rendered DNS configuration disagrees with the guard" in err
+    assert "nothing was started" in err
+    assert untouched(env) and not (env.stub / "running").exists()
+    assert "docker load" not in env.log and "DOWN" not in env.log
+
+
+def test_a_dns_disagreement_leaves_the_running_release_alone(env):
+    assert env.deploy(SHA_A, **real_dns_config(env)).returncode == 0
+    before = env.log
+    env.env_file.write_text(env.env_file.read_text() + "HUNTER_DNS=9.9.9.9\n")
+    r = env.deploy(SHA_B, **real_dns_config(env))
+    assert r.returncode == 11
+    assert env.current_link == SHA_A and env.state("current_sha") == SHA_A
+    assert (env.stub / "running").read_text().strip() == SHA_A
+    after = env.log[len(before):]
+    assert "docker load" not in after and " up " not in after and "DOWN" not in after
+    assert not (env.base / "backups").exists()                     # no dump either
+
+
+def test_a_dns_disagreement_refuses_a_rollback_before_anything_changes(env):
+    env.deploy(SHA_A, **real_dns_config(env))
+    env.deploy(SHA_B, **real_dns_config(env))
+    env.env_file.write_text(env.env_file.read_text() + "HUNTER_DNS=9.9.9.9\n")
+    before = env.log
+    r = env.run("rollback", **real_dns_config(env))
+    assert r.returncode == 11 and b"rollback target" in r.stderr
+    assert env.current_link == SHA_B and (env.stub / "running").read_text().strip() == SHA_B
+    assert " up " not in env.log[len(before):] and "DOWN" not in env.log[len(before):]
+
+
+def test_activate_repeats_the_gate_right_before_up_so_a_restore_is_covered_too(env):
+    """A restore of the previous release goes through activate(): its DNS is judged again."""
+    assert env.deploy(SHA_A, **real_dns_config(env)).returncode == 0
+    env.deploy(SHA_B, STUB_FAIL_UP_SHA=SHA_B, **real_dns_config(env))
+    shas = [ln.split("args=")[0] for ln in env.dns_config_log.splitlines()]
+    # A: early + activate; B: early + activate (up fails); A restored: activate again
+    assert len(shas) == 5, env.dns_config_log
+    assert env.current_link == SHA_A
+
+
+def test_the_gate_expects_exactly_what_the_guard_conf_says(env):
+    env.guard_conf.write_text("DNS=1.1.1.1\n")
+    env.env_file.write_text(env.env_file.read_text() + "HUNTER_DNS=1.1.1.1\n")
+    r = env.deploy(SHA_A, **real_dns_config(env))
+    assert r.returncode == 0, r.stderr.decode()      # guard and compose agree on a public resolver
+    assert "SMOKE_DNS_EXPECT=1.1.1.1" in env.dns_config_log
+    assert "SMOKE_DNS_EXPECT=1.1.1.1" in env.dns_log

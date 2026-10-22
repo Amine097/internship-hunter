@@ -112,22 +112,170 @@ stat -L -c 'net:[%i]' "/proc/$PID/root$XDG_RUNTIME_DIR/dockerd-rootless/netns"  
 The systemd drop-in (step 6) needs no change: it already runs as the daemon's user with
 `XDG_RUNTIME_DIR` set, after rootlesskit has created the state directory.
 
+### DNS (which resolver each service uses, and what the guard does and does not see)
+
+Measured on a real rootless Docker 29.9.1 (rootlesskit `--net=slirp4netns --detach-netns`, the production
+layout) running this repository's real `compose.yaml` topology with the real guard
+(`tests/test_dns_rootless_lab.py`). **Docker's embedded resolver (`127.0.0.11`) has two forwarding
+paths, and only one of them crosses the guard:**
+
+| container's `resolv.conf` says | who sends the upstream query | crosses the guard? |
+|---|---|---|
+| `ExtServers: [host(192.168.1.1)]` - no `dns:` anywhere; servers copied from the daemon's `/etc/resolv.conf` | **dockerd itself**, from its own namespace (the packets never enter the daemon's firewall; the daemon's `tap0` sees nothing) | **no.** The host's LAN resolver is reachable whatever the guard says - including with a guard whose `DNS=` names a different address |
+| `ExtServers: [10.0.2.3]` - explicit `dns:` (compose, `--dns`, `daemon.json`) | the container's own namespace: container -> bridge -> `DOCKER-USER` -> slirp4netns | **yes.** Only `10.0.2.3:53` passes (guard rule `-d 10.0.2.3 ... dpt:53 RETURN`); a private LAN resolver, the bridge gateway, any other private address is rejected |
+| container on `internal` networks only | nobody: SERVFAIL for every name outside the project, no direct path either | n/a |
+| ad hoc container on Docker's default bridge (no `--dns`) | the container itself, straight to the daemon's upstream (`192.168.1.1`) | yes - and **rejected** (not part of this stack; use `--dns 10.0.2.3` on that one container) |
+| *any* container when the **daemon** has `"dns": ["10.0.2.3"]` in `daemon.json` | as the explicit case, for every container, including the internal-only ones | yes - which is the problem: **do not configure it** (below) |
+
+So the stack worked unchanged once the guard was applied - *through the path the guard does not police*.
+That is not the policy the guard documents ("DNS only to the namespace's resolver"), it depends on what
+the host's `/etc/resolv.conf` says at daemon start, and it could not be seen by any existing check. Hence:
+
+**Per service** (computed from `compose config` by `deploy/check-dns.sh`, never a hard-coded list):
+
+| service | networks | DNS |
+|---|---|---|
+| `egress-claude-1`, `egress-claude-2`, `egress-codex` | `egress_<name>` (route out) + `agent_<name>` (internal) | `dns: [${HUNTER_DNS:-10.0.2.3}]`. Resolves the allow-listed provider names for tinyproxy through the guard; resolves its agent and `discovery` by service name |
+| `discovery`, `telegram` | `egress` (route out) + internal ones | same explicit resolver (ATS boards, Telegram API); service names of the networks they share |
+| `api` | `edge` (route out, only to publish `127.0.0.1:18000`) + `data` | same explicit resolver: it needs no public name, but it must not have a second, unpoliced one |
+| `agent-claude-1`, `agent-claude-2`, `agent-codex` | one `agent_<name>`, **internal** | **none, deliberately.** Resolve their own proxy and `discovery`, nothing else; every public name is SERVFAIL; `10.0.2.3` and `1.1.1.1` are unreachable. They reach providers only by `CONNECT` through their proxy, which resolves the name itself. |
+| `postgres`, `migrate`, `scheduler`, `session-controller` | `data`, **internal** | none; same as above |
+
+Service names resolve only between services sharing a network (`agent-claude-1` cannot resolve
+`egress-codex`, `postgres`, `api`, `agent-codex`) - asserted by the check in both directions.
+
+**Exact production configuration**
+
+1. `host-egress-guard.conf` (root-owned, already in the procedure): `DNS=10.0.2.3`. The deploy gate now
+   *requires* this line to be present and a valid IPv4 list, and passes it to `check-dns.sh` as the
+   expectation (`SMOKE_DNS_EXPECT`), so the resolver the guard allows and the resolver compose gives to the
+   services cannot silently diverge.
+2. `shared/.env`: nothing. `compose.yaml` defaults `HUNTER_DNS` to `10.0.2.3` (slirp4netns'
+   resolver). Set `HUNTER_DNS` only if the guard's `DNS=` is changed (e.g. another network driver); both must
+   then change together, or the deploy gate fails: `egress-* cannot resolve ...` / `configured dns is ...`.
+3. Install `deploy/check-dns.sh` root-owned next to the other gate scripts (step 0 below); the gate refuses
+   to deploy without it (exit 11).
+4. **Do NOT configure daemon-level DNS** (`"dns": [...]` in `~hunter-deploy/.config/docker/daemon.json`;
+   an earlier revision of this document recommended it for ad hoc containers - that recommendation is
+   withdrawn). `daemon.json` must not contain a `dns` key. Without it an ad hoc container on the default
+   bridge has no working DNS while the guard is on - by design; give that one container `--dns 10.0.2.3`
+   (step 5 does). Why, measured on the real rootless Docker 29.9.1 (`tests/test_dns_rootless_lab.py`,
+   `test_daemon_level_dns_gives_agents_an_explicit_upstream_and_check_dns_refuses_it`):
+   - it changes the resolver state of **every** container without a line of `compose.yaml` changing. With
+     no daemon-level `dns`, an agent's `resolv.conf` says `ExtServers: [host(<daemon upstream>)]`; with it, the
+     same agent says `ExtServers: [10.0.2.3]` / `Overrides: [nameservers]` - the guard-approved address,
+     configured inside a container whose whole design is that it carries no resolver. Docker 29.9.1 still did
+     **not** forward from the internal-only containers (every public name SERVFAIL, no packet reached the
+     guard's DNS exception, the resolver and `1.1.1.1` unreachable), so this is lost defense in depth, not
+     a hole measured today: the day an agent gains a route (a misconfiguration, a `docker network connect`,
+     different Docker behaviour) the one resolver the guard lets through is already wired in;
+   - it hands the guard's DNS exception to **every** ad hoc container on this daemon, which is the
+     covert-channel budget this deployment gives only the services with a route out;
+   - compose cannot show it, so a declaration-only check passes. `check-dns.sh` therefore reads the
+     **runtime** `resolv.conf` of every service: an internal-only service whose `ExtServers` names anything
+     other than `host(...)` (the daemon's own list, which Docker prints for every container and never uses for
+     an internal-only one), or whose nameserver is not `127.0.0.11`, is a **breach in every mode** -
+     `agent-codex is internal-only but Docker gave it explicit upstream resolver(s) ['10.0.2.3'] ...
+     daemon-level dns (daemon.json)`. Local service discovery (`127.0.0.11` answering the agent's proxy and
+     `discovery`) is still required and still checked.
+
+**Verification** (read-only unless stated; after the guard is applied and the stack is up)
+```bash
+cd /opt/internship-hunter/current   # or the release directory
+# V10  every service with a route out: Docker uses 10.0.2.3 from INSIDE the container, never host(...)
+for s in api discovery telegram egress-claude-1 egress-claude-2 egress-codex; do
+  docker compose exec -T $s grep -E '^(nameserver|# ExtServers)' /etc/resolv.conf; done   # 127.0.0.11 / [10.0.2.3]
+# V11  the full check (also run by deploy/smoke-test.sh and by remote-deploy.sh in enforce mode)
+SMOKE_HOST_ISOLATION=enforce deploy/check-dns.sh      # -> "ok   DNS: 6 service(s) with a route out use 10.0.2.3 ..."
+# V12  negative controls, by hand: an agent resolves its proxy and nothing outside
+docker compose exec -T agent-codex nslookup -timeout=3 egress-codex.        # answers
+docker compose exec -T agent-codex nslookup -timeout=3 example.com.         # SERVFAIL / no answer
+docker compose exec -T agent-codex nslookup -timeout=3 example.com. 10.0.2.3   # unreachable
+# V13  the guard really is in the path: counters on the DNS exception grow while a proxy resolves
+docker compose exec -T egress-codex nslookup example.com. >/dev/null
+nsenter ... iptables -L HUNTER-EGRESS-GUARD -n -v | grep 'dpt:53'   # (namespace entry as the guard does; packets > 0)
+```
+Failure behaviour (each is a test): the guard without the exception (`DNS=` different) -> the stack's
+external names stop resolving (SERVFAIL, `check-dns.sh` fails `cannot resolve example.com through ...`;
+`report` mode only warns); `HUNTER_DNS` pointing at a private LAN resolver -> rejected by the guard, same
+failure; a service with a route out but no `dns:` -> `breach ... host(...)`; an internal-only service that
+resolves a public name, gets a direct answer from a resolver, or resolves a name from a network it is not on
+-> `breach`, **in every mode**; an unreadable `resolv.conf`, a missing resolver tool, a failed `docker exec`,
+a failed own-name control -> `defect` (unverified is never a pass).
+
+**The raw-UDP probe has a positive control (so silence means something).** Several verdicts are "this
+container got *no* answer" (an agent asking `10.0.2.3` or `1.1.1.1` directly). A probe that cannot receive an
+answer at all - a broken `nslookup`, a malformed packet, a missing capability - would make every one of them
+pass. So every service with a route out sends the **same raw query** to the approved resolver, where the
+guard lets it through, and each probe flavour (python in the app/agent images, busybox `nslookup` in the proxy
+image) must get an answer from at least one such service before the agents' silence counts:
+- a service that resolves `example.com` through the approved resolver yet gets no raw answer from it ->
+  `PROBE DEFECT ... the negative direct-query checks of this probe are UNVERIFIED`, **fatal in every mode**;
+- no service with a route out runs a flavour the agents use -> `defect: ... its positive control is missing`;
+- the network blocking the query (no guard exception: names do not resolve either) is a different class: it
+  stays `cannot resolve ... through ...` (fatal in `enforce`, a warning in `report`), plus a note that the
+  agents' direct-query checks are unverified because a blocked query cannot be told from a broken probe.
+Real packets: `test_explicit_resolver_works_through_the_guard...` (a proxy gets the direct answer, an agent
+does not) and `test_a_probe_that_cannot_receive_direct_answers_is_a_defect_not_a_pass` (the probe tool
+sabotaged inside real containers).
+
+**The rendered DNS is judged before anything starts.** `HUNTER_DNS` can come from the SSH session's
+environment, from `shared/.env` or from compose's default, and a disagreement used to be found only after
+`up --wait`, with the new containers already running. Now `remote-deploy.sh`:
+1. removes `HUNTER_DNS` from the caller's environment (as it does `SMOKE_*`, `COMPOSE_*` and
+   `EGRESS_FORBIDDEN_TARGETS`), so an SSH session cannot override what the host decides;
+2. runs `check-dns.sh` in `SMOKE_DNS_CONFIG_ONLY=1` mode against `docker compose config` of the release
+   (with `shared/.env` and the release env file - the effective values) and `SMOKE_DNS_EXPECT` = `DNS=` of the
+   root-owned `host-egress-guard.conf`: every service with a route out must render exactly that resolver and
+   no internal-only service may render any;
+3. does so **right after the release is unpacked**, before images are loaded, the database is dumped or a
+   container is touched (`die`, exit 11, the running release is left alone); **before `rollback` changes
+   anything** (exit 11); and again in `activate()` right before `compose up`, which also covers the
+   restore of a previous release;
+4. so a `shared/.env` with `HUNTER_DNS=9.9.9.9` against `DNS=10.0.2.3`, a guard conf changed to `1.1.1.1` while
+   compose still renders `10.0.2.3`, or a list (`compose.yaml` renders one resolver) are all refused with
+   `the rendered compose DNS of <sha> disagrees with DNS=... in host-egress-guard.conf ... nothing was started`.
+The post-start check (V11) remains: it proves Docker honoured the rendered value.
+
+**CLI mode (`AGENT_MODE=cli`) is a separate requirement; this change does not enable it.** What holds today
+is structural and is already tested in demo mode: agents are internal-only, so DNS gives them neither a
+way out nor a tunnel. Blockers to clear before CLI mode, none solved here: (1) the pinned Claude/Codex CLI
+versions must be run to confirm they hand the *hostname* to the proxy (`CONNECT host:443`) instead of resolving
+it themselves - a CLI that resolves locally gets SERVFAIL and fails, and the fix must not be to give agents a
+resolver; (2) the provider allow-lists (`EGRESS_ALLOW_*`) are still the documented defaults; (3) RSM stays off
+(its DNS independence flag is unrelated to this); (4) the proxies' resolver is shared with `discovery`/`telegram`
+through `10.0.2.3`, so a compromised *proxy* still has DNS as a covert channel to the public Internet (see
+"Limits you accept").
+
+**Status of the independent review's findings on this change (PR #12)**
+
+| | finding | state |
+|---|---|---|
+| F-1 | daemon-level `dns` undermines the agents' defense in depth | **fixed here**: the recommendation is withdrawn and the reasons documented; the check reads the runtime resolver state of internal-only services; real-daemon test |
+| F-2 | no positive control for the direct UDP probe | **fixed here**: see "The raw-UDP probe has a positive control" |
+| F-3 | DNS mismatch only detected after startup | **fixed here**: see "The rendered DNS is judged before anything starts" |
+| F-4 | open in the review; **not part of this patch** (no change made or implied by it) | open |
+| F-5 | CLI runtime containment (what a pinned Claude/Codex CLI may do inside `AGENT_MODE=cli`, and the blockers listed above) | open; **not part of this patch**; CLI mode stays disabled |
+
 ### The deploy gate (what `remote-deploy.sh` now enforces)
 
 For `deploy`, `deploy-irreversible` **and** `rollback`, before anything is read, loaded or changed:
 
 | Check | Failure |
 |---|---|
-| `/opt/internship-hunter/deploy/host-egress-guard.sh` and `check-host-isolation.sh` exist, are executable regular files (not symlinks), root-owned, not group/world-writable, in a directory that is too | exit 11 |
+| `/opt/internship-hunter/deploy/host-egress-guard.sh`, `check-host-isolation.sh` and `check-dns.sh` exist, are executable regular files (not symlinks), root-owned, not group/world-writable, in a directory that is too | exit 11 |
 | `shared/.env` sets `EGRESS_FORBIDDEN_TARGETS` to a non-empty, well-formed `ip:port` list (the last assignment wins, as in compose; the caller's environment is ignored) | exit 11 |
 | `deploy/host-isolation.conf` exists (regular file, not a symlink, root-owned, not group/world-writable) and sets `ROOTFUL_TARGETS=ip:port[,...]` with **at least one** entry | exit 11 |
 | every target is **real**: each `EGRESS_FORBIDDEN_TARGETS` address is an address of this host, and every forbidden and rootful target either connects or is **refused** from the host's own namespace (safe TCP connect, no payload) - a silent timeout, `unreachable`, a typo or a moved address is rejected (`check-host-isolation.sh --verify-targets`) | exit 11 |
+| `deploy/host-egress-guard.conf` (regular file, not a symlink, root-owned, not group/world-writable) sets `DNS=<ipv4>[,...]`: the resolver the guard lets containers use, which `check-dns.sh` then requires the stack to use | exit 11 |
+| the **rendered** compose DNS (effective `shared/.env` values; the caller's `HUNTER_DNS` is removed) equals `DNS=` of that conf for every service with a route out and is absent for internal-only ones - checked after unpacking the release, before images are loaded or anything starts, before a rollback changes anything, and again before every `compose up` | exit 11 |
 | `host-egress-guard.sh status` exits 0: the **full** policy is installed and unmodified | exit 12 |
 | `127.0.0.1:18000` is free, or held by this application's own running `api` (read-only `ss`) | exit 3 |
 
 After `compose up --wait` and the health checks, `check-host-isolation.sh` runs in **enforce**
 mode with `SMOKE_PROTECTED_IPS` taken from the targets and `SMOKE_ROOTFUL_TARGETS` from the conf
-(ambient `SMOKE_*` variables are removed first).
+(ambient `SMOKE_*` variables are removed first), followed by `check-dns.sh` in enforce mode with
+`SMOKE_DNS_EXPECT` = the guard conf's `DNS=` (see "DNS"); either failing is a failed activation.
 
 **The forced-command boundary.** Whatever environment the SSH session arrives with, production runs
 only against `/opt/internship-hunter`, with `PATH` fixed and `BASH_ENV`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
@@ -149,7 +297,7 @@ D=/opt/internship-hunter/deploy; GUARD=$D/host-egress-guard.sh
 ```
 
 0. **Install** (root; the deploy user must not be able to edit a security control or its directory):
-   `sudo install -o root -g root -m 0755 deploy/host-egress-guard.sh deploy/check-host-isolation.sh "$D"/`
+   `sudo install -o root -g root -m 0755 deploy/host-egress-guard.sh deploy/check-host-isolation.sh deploy/check-dns.sh "$D"/`
    Also `host-egress-guard.conf` and `host-isolation.conf` (step 2 and 7). Needs `iptables`, `ip6tables`, `nsenter`, `ss`, `python3` on the host (`iptables --version` should
    say `nf_tables`; Docker's `DOCKER-USER` chain must exist - the iptables backend; `apply` refuses
    otherwise, and also refuses without `ip6tables`).
@@ -173,7 +321,9 @@ D=/opt/internship-hunter/deploy; GUARD=$D/host-egress-guard.sh
 4. **Apply** (new connections only) and verify it verified itself: `"$GUARD" apply && "$GUARD" status`
 5. **Check immediately**: `probe $HOST_TS_IP 22; probe $HOST_TS_IP 8000` must print `blocked`;
    `docker run --rm --network probe-net busybox:1.36 nc -z -w5 1.1.1.1 443` must succeed and
-   `... nslookup api.anthropic.com` must resolve. If DNS fails: step R, then set `DNS=` in the conf.
+   `docker run --rm --network probe-net --dns 10.0.2.3 busybox:1.36 nslookup api.anthropic.com` must resolve
+   (**with `--dns`**: without it Docker's embedded resolver forwards from the daemon and the test would pass
+   even if the guard blocked DNS - see "DNS"). If DNS fails: step R, then set `DNS=` in the conf.
 6. **Persist** (the rules live in the daemon's namespace and vanish when the daemon restarts). A
    failing `ExecStartPost` fails the unit, so the daemon is down rather than unguarded:
    ```ini
@@ -264,6 +414,12 @@ within about a minute, `docker compose -p internship-hunter start` the rest, the
 | V7 | `systemctl --user restart docker`; `"$GUARD" status` | `active` without manual action |
 | V8 | W1 and W2 above | gates refuse while unguarded, services come up after `apply` |
 | V9 | read-only: `docker ps` of the rootful daemon, `ufw status verbose`, `ss -tlnp`, Gluetun reachable from the tailnet as before, `ss -ltn 'sport = :18000'` shows only this application | identical to your pre-change notes |
+| V10 | per service with a route out: `grep -E '^(nameserver\|# ExtServers)' /etc/resolv.conf` | `127.0.0.11` and `ExtServers: [10.0.2.3]`, never `host(...)` ("DNS") |
+| V10b | per **internal-only** service (agents, postgres, ...): the same `grep` | `127.0.0.11` and `ExtServers: [host(...)]` or no annotation - **never** an explicit address such as `[10.0.2.3]`; and `python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/docker/daemon.json'))).get('dns'))"` prints `None` (or the file does not exist) |
+| V11 | `deploy/check-dns.sh` (enforce) | `ok   DNS: 6 service(s) with a route out use 10.0.2.3 ...` |
+| V11b | `SMOKE_DNS_CONFIG_ONLY=1 SMOKE_DNS_EXPECT=10.0.2.3 deploy/check-dns.sh -p internship-hunter -f compose.yaml --env-file shared/.env ...` (what the deploy gate runs BEFORE `compose up`; starts nothing) | `ok   DNS configuration: 13 services render dns exactly as the guard allows ...` |
+| V12 | `agent-codex`: resolves `egress-codex.`; `example.com.` and `example.com. 10.0.2.3` get no answer | as stated |
+| V13 | counters of `HUNTER-EGRESS-GUARD` `-d 10.0.2.3 ... dpt:53` grow while a proxy resolves | packets > 0 |
 
 `SMOKE_PROTECTED_IPS` is added to the host's own addresses; each is probed on `22 8000 2375 2376 5432`
 plus an ephemeral canary listener, from every service that has a route out (computed from
@@ -311,6 +467,22 @@ sandbox layout the previous guard (`main@597cf65`) stops at its host-namespace c
 the same layout was reported to fail with `Operation not permitted` from `nsenter -U -n -t <pid>`. Either way
 entering the child's namespace means entering the host's, which is what the new resolution replaces.
 
+**DNS on a real rootless daemon.** `tests/rootless_lab/lab.sh` starts a genuine rootless Docker 29.9.1 (rootlesskit
+`--detach-netns` + slirp4netns) as an unprivileged user - pinned, checksummed downloads, one mapped uid, an
+Alpine rootfs repacked with root ownership, nothing else different from production - and
+`tests/test_dns_rootless_lab.py` runs the project's real `compose.yaml` topology on it (images replaced by
+Alpine, processes by `sleep`) with the real guard and the real `check-dns.sh`: embedded DNS without `dns:` reaches
+the Internet while a guard that allows *no* resolver is applied (counters on the guard: 0 packets, `host(...)`
+in `resolv.conf`); the same stack with the explicit resolver is blocked by that guard and works with the right
+one (counters grow); a private LAN resolver is rejected even when configured; agents and the data tier
+resolve nothing outside and only their neighbours' names; the check catches an internal service given a
+resolver, a runtime `docker network connect`, a changed topology and a wrong expectation; a daemon-level `dns`
+puts an explicit upstream into every agent (`ExtServers: [10.0.2.3]`) which `check-dns.sh` refuses, and
+gives every ad hoc container the guard's DNS exception (why it must not be configured); a probe sabotaged
+inside real containers is a defect, not a pass. Opt-in locally (`HUNTER_ROOTLESS_LAB=1`, ~100 MB once), a
+required CI job (`rootless-dns-lab`, ubuntu-22.04, no sudo). `tests/test_check_dns.py` covers the script's own
+failure modes against a modelled resolver.
+
 **CI.** The `host-guard-netns` job is a **mandatory security job that fails when it cannot do its
 work**. It runs the packet tests on `ubuntu-22.04` (no sudo, no AppArmor change - this repository never
 relaxes either); every step runs under `shell: bash` with `set -euo pipefail`, because GitHub's default
@@ -331,6 +503,14 @@ incomplete result fails the job.
 
 - Public Internet space stays open at the network level: a compromised proxy can open a socket to
   any public IP and port; only the hostname list narrows the CONNECT path.
+- DNS is a covert channel for anything with a route out: `10.0.2.3` forwards arbitrary names to the host's
+  resolver (and from there to the Internet), so a compromised `egress-*`, `discovery`, `telegram` or `api`
+  container could tunnel data through queries. Internal-only services (the agents) cannot; the proxies'
+  hostname filter does not apply to DNS. Query content is visible to the host's upstream resolver.
+- The DNS behaviour above is Docker 29.9.1's (two forwarding paths, `ExtServers: [host(...)]`). It is
+  tested, not guaranteed: `check-dns.sh` fails closed if the annotation disappears or changes, and
+  `tests/test_dns_rootless_lab.py` must be re-run on a Docker upgrade (CI job `rootless-dns-lab`).
+  Not verified: pasta (a different resolver address; `DNS=`/`HUNTER_DNS` must then change together).
 - The guard is lost when the daemon restarts until `ExecStartPost` re-applies it; the start gates
   (above) keep application code from running in between, for the listed targets only.
 - A host address acquired after `apply` (DHCP) makes `status` fail (`chain ... differs`) and so

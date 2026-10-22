@@ -256,6 +256,8 @@ ok "no container mounts the Docker socket or runs privileged"
 # dial the host: Tailscale IP, other host addresses, canaries, bridge gateway. This is the
 # NETWORK boundary; the CONNECT checks above only test the proxy's hostname filter.
 "$HERE/check-host-isolation.sh" "$@"
+# (2b) DNS takes the guard-policed path and internal-only services resolve nothing outside
+"$HERE/check-dns.sh" "$@"
 # (3) no listening port other than the published loopback API on the host side
 published="$("${COMPOSE[@]}" ps --format '{{.Publishers}}' | grep -v '^\[\]$' | grep -v '^$' || true)"
 if grep -E '0\.0\.0\.0|::' <<<"$published" | grep -vq '^$'; then

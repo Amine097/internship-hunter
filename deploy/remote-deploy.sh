@@ -20,7 +20,11 @@
 #  * refuses to deploy or roll back unless host isolation is in place (docs/deployment.md, "Host
 #    isolation"): the root-owned host-egress-guard.sh reports its FULL policy active (exit 12),
 #    EGRESS_FORBIDDEN_TARGETS is set (exit 11), and after `up --wait` the root-owned
-#    check-host-isolation.sh passes in ENFORCE mode from every container with a route out; a
+#    check-host-isolation.sh passes in ENFORCE mode from every container with a route out, and the
+#    root-owned check-dns.sh confirms DNS takes the guard-policed path (and, BEFORE anything is
+#    loaded or started, that the RENDERED compose dns equals the conf's DNS=; the caller's HUNTER_DNS
+#    is ignored) (the resolver is the one
+#    host-egress-guard.conf allows) and that internal-only services resolve nothing outside; a
 #    failure is a failed activation (previous release restored; a first deploy is torn down)
 #  * exit codes: 2 bad input, 3 missing files/ports, 4 locked, 5 not rootless, 7 integrity,
 #    8 backup, 9 schema, 10/6 restore failed (stack stopped), 11 isolation prerequisites, 12 guard
@@ -57,6 +61,8 @@ unset HUNTER_GUARD_PROC HUNTER_GUARD_TEST_MODE HUNTER_GUARD_TEST_NSFS_TYPE HUNTE
 GUARD="$BASE/deploy/host-egress-guard.sh"
 ISOLATION_CHECK="$BASE/deploy/check-host-isolation.sh"
 ISOLATION_CONF="$BASE/deploy/host-isolation.conf"      # REQUIRED: ROOTFUL_TARGETS=ip:port,...
+DNS_CHECK="$BASE/deploy/check-dns.sh"
+GUARD_CONF="$BASE/deploy/host-egress-guard.conf"       # REQUIRED here: DNS=<the one resolver the guard allows>
 API_PORT=18000          # host side; the container side stays 8000 (Gluetun lives on tailnet:8000)
 KEEP_RELEASES=5
 PROJECT=internship-hunter
@@ -154,6 +160,17 @@ rootful_targets() { # REQUIRED, root-owned: ROOTFUL_TARGETS=ip:port,... (at leas
   [[ -n "$v" ]] || return 1
   printf '%s' "$v"
 }
+guard_dns() { # the resolver(s) the guard lets through (DNS= in its trusted conf); the stack must use exactly these
+  local v d
+  [[ -f "$GUARD_CONF" && ! -L "$GUARD_CONF" ]] || return 1
+  trusted_file_data "$GUARD_CONF" || return 1
+  v="$(sed -n 's/^DNS=//p' "$GUARD_CONF" | tail -1 | tr -d "\"' \r")"
+  [[ -n "$v" ]] || return 1
+  for d in ${v//,/ }; do
+    [[ "$d" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  done
+  printf '%s' "$v"
+}
 trusted_file_data() { # like trusted_file but for non-executable data
   local owner mode want_uid=0; [[ "$TEST_MODE" == 1 ]] && want_uid="$(id -u)"
   read -r owner mode < <(stat -c '%u %a' "$1")
@@ -166,6 +183,10 @@ require_isolation_prereqs() { # nothing is changed before these hold
     || die "host egress guard missing or untrusted: $GUARD must exist, be executable, root-owned and not writable by others (docs/deployment.md, \"Host isolation\")" 11
   trusted_file "$ISOLATION_CHECK" \
     || die "isolation check missing or untrusted: $ISOLATION_CHECK must exist, be executable, root-owned and not writable by others" 11
+  trusted_file "$DNS_CHECK" \
+    || die "DNS check missing or untrusted: $DNS_CHECK must exist, be executable, root-owned and not writable by others" 11
+  guard_dns >/dev/null \
+    || die "$GUARD_CONF must exist (root-owned, not writable by others) and set DNS=<ip>: the single resolver the guard lets containers use (slirp4netns: 10.0.2.3; docs/deployment.md, \"DNS\")" 11
   forbidden_targets >/dev/null \
     || die "EGRESS_FORBIDDEN_TARGETS must be set in $BASE/shared/.env to a comma-separated ip:port list (e.g. <tailscale ip>:22,<tailscale ip>:8000)" 11
   rootful_targets >/dev/null \
@@ -184,6 +205,20 @@ require_isolation_prereqs() { # nothing is changed before these hold
   fi
 }
 
+dns_config_gate() { # dns_config_gate <sha>: the RENDERED compose dns must equal the guard's DNS=, BEFORE anything starts
+  local sha="$1" want
+  want="$(guard_dns)" || return 1
+  compose_args "$sha"
+  # HUNTER_DNS only ever comes from shared/.env (the caller's value was removed in main); whatever the
+  # effective configuration says, it is compared with the root-owned guard conf, not trusted
+  if ! ( cd "$BASE/releases/$sha" && RELEASE_SHA="$sha" SMOKE_DNS_CONFIG_ONLY=1 SMOKE_DNS_EXPECT="$want" \
+         "$DNS_CHECK" "${CARGS[@]}" ); then
+    echo "deploy: the rendered compose DNS of $sha disagrees with DNS=$want in $GUARD_CONF" \
+         "(HUNTER_DNS in $BASE/shared/.env must be unset or equal to it); nothing was started" >&2
+    return 1
+  fi
+}
+
 isolation_gate() { # isolation_gate <sha>: ENFORCE mode, from every container with a route out
   local sha="$1" targets ips t rootful
   targets="$(forbidden_targets)" || return 1
@@ -195,6 +230,13 @@ isolation_gate() { # isolation_gate <sha>: ENFORCE mode, from every container wi
          SMOKE_AUTODETECT_HOST_IPS=1 SMOKE_PROTECTED_IPS="$ips" SMOKE_ROOTFUL_TARGETS="$rootful" \
          "$ISOLATION_CHECK" "${CARGS[@]}" ); then
     echo "deploy: host isolation check FAILED for $sha (enforce mode)" >&2
+    return 1
+  fi
+  # DNS: the resolver of every service with a route out is the one the guard allows, queried from
+  # inside the container (so the guard polices it); internal-only services resolve nothing outside
+  if ! ( cd "$BASE/releases/$sha" && SMOKE_HOST_ISOLATION=enforce SMOKE_DNS_EXPECT="$(guard_dns)" \
+         "$DNS_CHECK" "${CARGS[@]}" ); then
+    echo "deploy: DNS check FAILED for $sha (enforce mode)" >&2
     return 1
   fi
 }
@@ -240,6 +282,7 @@ activate() { # activate <sha>: start (never build) the release, then verify it
   docker image inspect "internship-hunter-egress:$sha" >/dev/null 2>&1 \
     || { echo "deploy: image internship-hunter-egress:$sha is not loaded" >&2; return 3; }
   compose "$sha" config -q || return 1
+  dns_config_gate "$sha" || return 1
   compose "$sha" up -d --no-build --remove-orphans --wait --wait-timeout 300 || return 1
   verify_running_images "$sha" || return 1
   health_check "$sha" || return 1
@@ -293,6 +336,7 @@ do_rollback() {
   cur_head="$(read_state current_head)"; prev_head="$(read_state previous_head)"
   [[ "$previous" =~ ^[0-9a-f]{40}$ ]] || die "no previous release recorded" 3
   [[ -d "$BASE/releases/$previous" ]] || die "previous release directory missing" 3
+  dns_config_gate "$previous" || die "rollback target $previous is refused: its rendered DNS configuration disagrees with the guard" 11
   # the declaration that matters is the one SIGNED INTO the release we are leaving
   leaving_compat="$(read_state "compat-$current")"
   db_now="$(actual_db_revision "$current")"
@@ -392,6 +436,9 @@ do_deploy() { # do_deploy <normal|irreversible>
   rm -rf "$rel.partial"; mkdir -p "$rel.partial"
   tar -xzf "$stage/source.tar.gz" -C "$rel.partial" --no-same-owner --no-same-permissions
   rm -rf "$rel"; mv "$rel.partial" "$rel"
+  # 6b) the effective compose DNS must match the guard BEFORE images are loaded, the database is
+  # dumped or a container is touched (activate() repeats it right before `up`, for restores too)
+  dns_config_gate "$sha" || die "release $sha is refused: its rendered DNS configuration disagrees with the guard" 11
 
   # 7) immutable images: load, never build
   docker load -i "$stage/images.tar.gz" >/dev/null
@@ -475,7 +522,7 @@ trap '[[ -z "$STAGE" ]] || rm -rf "$STAGE"' EXIT
 main() {
   # A caller's environment must not be able to loosen the gate or redirect compose.
   local v
-  for v in $(compgen -e | grep -E '^(SMOKE_|EGRESS_FORBIDDEN_TARGETS$|COMPOSE_)' || true); do unset "$v"; done
+  for v in $(compgen -e | grep -E '^(SMOKE_|EGRESS_FORBIDDEN_TARGETS$|COMPOSE_|HUNTER_DNS$)' || true); do unset "$v"; done
   case "${SSH_ORIGINAL_COMMAND:-}" in
     deploy|deploy-irreversible|rollback) require_rootless ;;   # before anything is written
     *)                                   die "unsupported command" 2 ;;
