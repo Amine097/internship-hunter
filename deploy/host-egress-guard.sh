@@ -30,7 +30,9 @@
 #   HUNTER-EGRESS-GUARD6    in the IPv6 FORWARD chain: NEW forwarded IPv6 is rejected, and
 #   HUNTER-EGRESS-GUARD6-IN in the IPv6 INPUT chain: NEW IPv6 to the namespace itself (ICMPv6 kept).
 #
-# `status` does not just look for the jump rules: it renders the expected policy into scratch
+# `status` exits 0 (active), 1 (not active, or tampered with) or 3 (the policy is intact and only the set of
+# host addresses it names is stale: `apply` fixes it - deploy/runtime-containment.sh re-applies it without stopping
+# anything). It does not just look for the jump rules: it renders the expected policy into scratch
 # chains, lets the kernel canonicalise it, and compares chain contents, the position of the jump
 # rules (they must be FIRST in DOCKER-USER, INPUT and the IPv6 FORWARD chain) and that Docker's
 # own jump into DOCKER-USER is still first in FORWARD. Any missing, extra, reordered or edited
@@ -345,16 +347,24 @@ check_jumps() { # check_jumps <fn> <chain> <target>: our jumps are the first rul
   jumps_first "$fn" "$from" "$to" \
     || PROBLEMS+=("$from does not start with the jumps into $to (found: $(first_rules "$fn" "$from" 3 | tr '\n' ';'))")
 }
+# A difference that consists ONLY of per-address REJECT rules (`-d <ip>/32 -j REJECT --reject-with
+# icmp-admin-prohibited`) means the policy is intact and merely names a different set of host addresses (a rootful
+# Docker bridge or an interface address came or went, or one of those rules was deleted): `apply` fixes it. Any
+# other difference - a missing jump, an ACCEPT, an edited or reordered rule, a flushed chain - is structural.
+ADDR_RULE='^[<>] -A HUNTER-EGRESS-GUARD -d ([0-9]{1,3}\.){3}[0-9]{1,3}/32 -j REJECT --reject-with icmp-admin-prohibited$'
+ADDR_ONLY=0
 compare_chain() { # compare_chain <fn> <chain>: live chain == canonical expected chain
-  local fn="$1" c="$2" live exp
+  local fn="$1" c="$2" live exp d
   live="$("$fn" -S "$c" 2>/dev/null)" || { PROBLEMS+=("chain $c is missing"); return; }
   exp="$("$fn" -S "$c-X" 2>/dev/null | canon)" || { PROBLEMS+=("cannot render expected $c"); return; }
   if [[ "$live" != "$exp" ]]; then
-    PROBLEMS+=("chain $c differs from the expected policy: $(diff <(echo "$exp") <(echo "$live") | grep '^[<>]' | head -4 | tr '\n' ';')")
+    d="$(diff <(echo "$exp") <(echo "$live") | grep '^[<>]' || true)"
+    PROBLEMS+=("chain $c differs from the expected policy: $(head -4 <<<"$d" | tr '\n' ';')")
+    if [[ "$c" == "$CHAIN" && -n "$d" ]] && ! grep -Evq "$ADDR_RULE" <<<"$d"; then ADDR_ONLY=1; fi
   fi
 }
-verify_policy() {
-  PROBLEMS=()
+verify_policy() { # 0 = the full policy is active; 1 = not active / tampered; 3 = intact, only the host-address set is stale
+  PROBLEMS=(); ADDR_ONLY=0
   verify_target
   if ! docker_chains_ready; then      # checked BEFORE the scratch chains are created
     echo "NOT active: Docker's chains (DOCKER-USER and the FORWARD jump into it) are missing in the daemon namespace $TARGET_NET"
@@ -377,6 +387,10 @@ verify_policy() {
   compare_chain ipt6 "$CHAIN6_IN"
   cleanup_scratch
   [[ ${#PROBLEMS[@]} -eq 0 ]] && return 0
+  if [[ ${#PROBLEMS[@]} -eq 1 && "$ADDR_ONLY" == 1 ]]; then
+    printf 'NOT active (stale host addresses only; re-run apply): %s\n' "${PROBLEMS[0]}"
+    return 3
+  fi
   printf 'NOT active: %s\n' "${PROBLEMS[@]}"
   return 1
 }
@@ -401,12 +415,14 @@ do_apply() {
   note "existing connections are not cut; restart the stack and run deploy/smoke-test.sh to validate"
 }
 
-do_status() {
+do_status() { # exit 0 active; 1 not active or tampered; 3 intact but the host-address set is stale (apply fixes it)
   lock
-  if verify_policy; then
+  local rc=0
+  verify_policy || rc=$?
+  if [[ "$rc" == 0 ]]; then
     echo "active ($MODE namespace $TARGET_NET, pid $PID; ${#HOSTS[@]} host address(es); DNS ${DNS[*]})"
   else
-    return 1
+    return "$rc"
   fi
 }
 

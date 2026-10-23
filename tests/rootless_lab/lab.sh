@@ -181,6 +181,10 @@ stop() {
   if [[ -f "$pidf" ]]; then kill "$(<"$pidf")" 2>/dev/null || true; fi
   for _ in $(seq 1 30); do pgrep -f "rootlesskit --state-dir=$XDG" >/dev/null 2>&1 || break; sleep 1; done
   pkill -f "rootlesskit --state-dir=$XDG" 2>/dev/null || true
+  # containerd and the shim may outlive rootlesskit for a while when containers were running; a new
+  # daemon started on the same data root while the old containerd holds its bolt database times out
+  for _ in $(seq 1 40); do pgrep -f -- "$LAB/data" >/dev/null 2>&1 || break; sleep 1; done
+  pkill -9 -f -- "$LAB/data" 2>/dev/null || true
   sleep 1
 }
 

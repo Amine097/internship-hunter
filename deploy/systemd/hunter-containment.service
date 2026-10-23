@@ -1,0 +1,37 @@
+# Runtime containment for the rootless Docker stack (docs/deployment.md, "Runtime containment").
+# A USER unit of the rootless daemon's owner (hunter-deploy), next to docker.service:
+#   install -d ~/.config/systemd/user
+#   cp /opt/internship-hunter/deploy/systemd/hunter-containment.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hunter-containment
+# `loginctl enable-linger hunter-deploy` must already be set (the daemon needs it too).
+#
+# The script is root-owned (install -o root -m 0755, with the other deploy/ helpers) so the deploy
+# user cannot rewrite the policy it enforces.
+[Unit]
+Description=Internship Hunter runtime containment (host guard, network topology, DNS, supervised start)
+Documentation=file:///opt/internship-hunter/docs/deployment.md
+# Ordering only: a user unit cannot depend on the system's tailscaled. A Tailscale that is late is
+# handled by the script itself (the supervised set is not started until the protected addresses are live).
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/opt/internship-hunter/deploy/runtime-containment.sh watch --interval 10
+# DEAD MAN: whatever ends this process (crash, hang killed by WatchdogSec, `systemctl --user stop`,
+# the manager shutting down) stops the supervised services. A new instance starts them again after
+# verifying every prerequisite; `--no-latch` because a restart is not an incident by itself.
+ExecStopPost=/opt/internship-hunter/deploy/runtime-containment.sh quarantine --reason watchdog-stopped --no-latch
+Restart=always
+RestartSec=3
+# the script reports to systemd every cycle and while it waits for a slow start
+WatchdogSec=300
+TimeoutStopSec=60
+Environment=XDG_RUNTIME_DIR=%t
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
