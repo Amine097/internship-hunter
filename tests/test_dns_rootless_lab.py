@@ -595,9 +595,10 @@ def test_without_daemon_level_dns_ad_hoc_containers_get_no_dns_and_per_container
 
     F-4(b): this used to test the private-upstream half only `if upstream_is_private()`, i.e. never
     on a runner whose upstream is 127.0.0.53 (all of GitHub's), and nobody noticed. The daemon's
-    upstream is now SET by the test (`resolv-conf`: a private address with a live resolver behind
-    it), so the same thing happens on every machine and there is no branch to skip: an ad hoc
-    container inherits it and is refused by the guard, and answered without the guard."""
+    upstream is now SET by the test (DOCKER_TEST_RESOLV_CONF_PATH, see lab.sh: a private address
+    with a live resolver behind it), so the same thing happens on every machine and there is no
+    branch to skip: an ad hoc container inherits it and is refused by the guard, and answered
+    without the guard."""
     run = ["docker", "run", "--rm", "alpine-local:3.20", "nslookup", "-timeout=3", "example.com."]
     explicit = [*run[:3], "--dns", SLIRP_DNS, *run[3:]]
     upstream = lab.path / "lan-upstream-resolv.conf"
