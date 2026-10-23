@@ -663,16 +663,14 @@ def test_ORDER_a_watchdog_killed_right_after_the_cut_still_ends_with_everything_
 
 # ---- 4. FIRST DEPLOY --------------------------------------------------------------------------
 def test_FIRST_DEPLOY_commit_check_on_the_real_compose_files(rig, tmp_path):
-    """The reported reproduction with the REAL docker compose: the compose.yaml of main@a15d5d8
-    (before this PR; every service `unless-stopped`) cannot be put under containment; this can."""
+    """The reported reproduction with the REAL docker compose: a release that renders every service
+    `unless-stopped` (what main did before this PR, derived from today's compose.yaml so it needs
+    no git history, which CI's shallow clone lacks) cannot be put under containment; today's can."""
     old = tmp_path / "pre13"
     old.mkdir()
-    show = subprocess.run(
-        ["git", "show", "a15d5d8:compose.yaml"], cwd=ROOT, capture_output=True, text=True
-    )
-    if show.returncode != 0:
-        pytest.skip("a15d5d8 is not in this clone")
-    (old / "compose.yaml").write_text(show.stdout)
+    text = (ROOT / "compose.yaml").read_text()
+    assert 'restart: "no"' in text
+    (old / "compose.yaml").write_text(text.replace('restart: "no"', "restart: unless-stopped"))
     shutil.copytree(ROOT / "docker", old / "docker")
     shutil.copytree(ROOT / "config", old / "config")
     args = ["-p", "pre13", "-f", "compose.yaml"]
