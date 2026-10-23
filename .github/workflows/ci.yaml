@@ -92,7 +92,7 @@ jobs:
   # which is a policy decision, not something to do silently.
   host-guard-netns:
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       # the workflow-level value makes tests/conftest.py demand a PostgreSQL URL for ANY pytest
       # run; this job runs no database test (the lint-test job does)
@@ -126,6 +126,24 @@ jobs:
           python -m pytest -q -rs -p no:cacheprovider tests/test_host_egress_guard_netns.py tests/test_host_egress_guard_detached_netns.py | tee netns.log
           if grep -qE '[0-9]+ (skipped|deselected)' netns.log; then
             echo "::error title=Security tests skipped::the host-egress-guard namespace tests skipped tests"
+            exit 1
+          fi
+      # QA's adversarial tests that need an unprivileged network namespace: the smoke test's isolation
+      # probe against the real kernel (M-1) and its decision loop with mutants, the egress proxy's
+      # authorization matrix, its differential fuzz against OpenSSL and its slot exhaustion. They skip
+      # on a machine without namespaces (lint-test), so here a skip is a failure.
+      - name: Adversarial integration tests (a failure OR a skip fails the job)
+        shell: bash
+        env:
+          HUNTER_QA_REQUIRED: "1"
+          PROXY_AUTHZ_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          python -m pytest -q -rs -p no:cacheprovider tests/test_integration_smoke_detectors.py \
+            tests/test_integration_proxy_authorization.py tests/test_integration_proxy_differential_fuzz.py \
+            tests/test_integration_proxy_resources.py | tee integ.log
+          if grep -qE '[0-9]+ (skipped|deselected)' integ.log; then
+            echo "::error title=Security tests skipped::the adversarial integration tests skipped tests"
             exit 1
           fi
 
@@ -167,6 +185,25 @@ jobs:
             echo "::error title=Security tests skipped::the rootless DNS lab skipped tests"
             exit 1
           fi
+      # The watchdog as a LONG-RUNNING process (`watch`, as systemd runs it) on the same real daemon:
+      # event latency, the cut-before-stop order, quiet healthchecks, locks and host-address drift,
+      # each with a control for its instrument and a mutant of the script that it must catch; and
+      # failure injected at an exact Docker call (crash mid-quarantine, a cut that always fails,
+      # guard tampering, locks between a deploy and the watchdog, a killed service restarted).
+      - name: Watchdog events, order, locks, drift and failure injection (a failure OR a skip fails the job)
+        shell: bash
+        env:
+          HUNTER_ROOTLESS_LAB: "1"
+          HUNTER_ROOTLESS_LAB_REQUIRED: "1"
+          HUNTER_LAB_LOG_DIR: ${{ runner.temp }}/lab-logs
+        run: |
+          set -euo pipefail
+          python -m pytest -q -rs -p no:cacheprovider tests/test_integration_watchdog_events.py \
+            tests/test_integration_containment_failure_injection.py | tee watchdog.log
+          if grep -qE '[0-9]+ (skipped|deselected)' watchdog.log; then
+            echo "::error title=Security tests skipped::the watchdog event tests skipped tests"
+            exit 1
+          fi
       - name: Daemon log on failure
         if: failure()
         run: |
@@ -206,6 +243,21 @@ jobs:
           python -m pytest -q -rs -p no:cacheprovider tests/test_egress_topology_lab.py | tee topo.log
           if grep -qE '[0-9]+ (skipped|deselected)' topo.log; then
             echo "::error title=Security tests skipped::the topology lab skipped tests"
+            exit 1
+          fi
+      # The same real topology, probed independently: a listener on every service port, a busybox
+      # probe in every container, and a verdict per (container, target) pair that does not depend
+      # on deploy/smoke-test.sh (whose own assessment is tested against fakes in the other job).
+      - name: Hostile-agent sweep (a failure OR a skip fails the job)
+        shell: bash
+        env:
+          HUNTER_ROOTLESS_LAB: "1"
+          HUNTER_ROOTLESS_LAB_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          python -m pytest -q -rs -p no:cacheprovider tests/test_integration_agent_sweep.py | tee sweep.log
+          if grep -qE '[0-9]+ (skipped|deselected)' sweep.log; then
+            echo "::error title=Security tests skipped::the hostile-agent sweep skipped tests"
             exit 1
           fi
 
