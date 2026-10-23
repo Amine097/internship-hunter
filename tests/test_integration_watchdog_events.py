@@ -21,7 +21,8 @@ the real `watch` against the real daemon and ask what an operator would ask:
               gave it is not a project service.
 
 Skipped unless PR #13 (deploy/runtime-containment.sh) is in the tree. Opt-in like the lab
-(HUNTER_ROOTLESS_LAB=1). Open findings are strict xfails: red today, breaking the build when fixed.
+(HUNTER_ROOTLESS_LAB=1). LOCK, ADDR, ORDER and QUIET were fixed in PR #13 and are plain
+assertions now; CONTRACT is still an open strict xfail.
 """
 
 import fcntl
@@ -123,11 +124,6 @@ def test_LATENCY_an_event_wakes_the_cycle_and_the_hostile_endpoint_goes(rig, wat
     print(f"\nLATENCY event -> endpoint removed: {time.monotonic() - t0:.1f}s")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="quarantine() stops the whole set (docker stop, up to 5 s grace each) BEFORE it "
-    "disconnects the unauthorised endpoint: the hostile route outlives the shutdown",
-)
 def test_ORDER_the_hostile_endpoint_is_removed_before_the_set_is_stopped(rig, watcher):
     """Cutting the route is instant (`network disconnect -f`); stopping is not. A hot-attached agent
     must lose its extra network before anything else happens to it."""
@@ -149,11 +145,6 @@ def test_ORDER_the_hostile_endpoint_is_removed_before_the_set_is_stopped(rig, wa
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="every healthcheck run is a container event (exec_create/exec_start/exec_die) and the "
-    "watcher wakes on ALL container events: the watchdog never idles",
-)
 def test_QUIET_healthchecks_do_not_spin_the_watchdog(rig, watcher):
     """9 ordinary containers with a 10 s healthcheck, like the supervised set in production."""
     names = [f"hc-{i}" for i in range(9)]
@@ -201,11 +192,6 @@ def test_CONTRACT_an_imposter_with_agent_labels_but_more_privilege_is_not_accept
         rig.run(["docker", "rm", "-f", "imposter"], check=False)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="remote-deploy.sh takes deploy.lock with `flock -n` and dies 'another deploy is "
-    "running' (exit 4); the watchdog holds the SAME lock, exclusively, for all of every cycle",
-)
 def test_LOCK_the_watchdog_does_not_make_a_deploy_fail_with_another_deploy_is_running(rig):
     """What a deploy does first (deploy/remote-deploy.sh: `exec 9>deploy.lock; flock -n 9 || die
     ... 4`), attempted every ~0.1 s for 60 s against the watchdog as the unit runs it (`--interval
@@ -274,11 +260,6 @@ def _host_address_shim(tmp_path):
     return d, flag
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a host address that the guard does not know yet (here: a rootful Docker bridge) makes "
-    "the watchdog STOP THE WHOLE SET, then repair the guard; the repair alone takes seconds",
-)
 def test_ADDR_a_new_host_address_is_absorbed_without_stopping_the_set(rig, tmp_path):
     d, flag = _host_address_shim(tmp_path)
     w = Watcher(rig, interval=5, path_prefix=str(d))
@@ -304,11 +285,6 @@ def test_ADDR_a_new_host_address_is_absorbed_without_stopping_the_set(rig, tmp_p
         w.stop()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="each repairable guard drift is a quarantine, and three in 15 minutes LATCH the stack "
-    "until a human runs `reset`: three bridge changes on a shared rootful Docker is enough",
-)
 def test_ADDR_three_host_address_changes_do_not_latch_the_stack(rig, tmp_path):
     d, flag = _host_address_shim(tmp_path)
     w = Watcher(rig, interval=5, path_prefix=str(d))
