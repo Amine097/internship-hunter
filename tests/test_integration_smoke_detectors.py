@@ -1,55 +1,63 @@
-"""Detectors for the original findings M-1 and M-2, run against the REAL deploy/smoke-test.sh.
+"""Functional regression tests for the original findings M-1 and M-2, against the REAL
+deploy/smoke-test.sh (PR #14 fixed both; these tests are what keeps them fixed).
 
-M-1  "reach() mistakes DNS scoping and closed ports for isolation" (smoke-test.sh, section 3)
-     gaierror and ECONNREFUSED are both reported as "blocked". A refused connection means a route
-     EXISTS (L3 reachable, only the port is closed); a name that does not resolve proves DNS
-     scoping, not the absence of a route. Only agent-codex was probed, and by name.
-     Required: probe by IP, ENETUNREACH/EHOSTUNREACH/timeout = blocked, ECONNREFUSED = FAIL, all
-     three agents.
-M-2  "The egress-denial suite fails open" (smoke-test.sh, section 4)
-     denied() accepts anything that is not 200, including "error", so with SMOKE_EXTERNAL=0 (no
-     positive control) the whole suite passes with a dead proxy. Required: exactly the proxy's
-     policy refusal (403) counts, upstream failures (502/504) and "error" do not, all three proxies.
+M-1  "reach() mistakes DNS scoping and closed ports for isolation" (section 3). A refused
+     connection means a route EXISTS; a name that does not resolve proves DNS scoping, not the
+     absence of a route; only agent-codex was probed, and by name. #14 replaced reach() with a
+     classifying probe() and a decision loop over all three agents. Two layers here:
 
-The functions are cut out of the script and run for real (exec_in is replaced by a local call), so
-there is no second copy of the logic to drift. Tests that describe a finding that is still OPEN are
-`xfail(strict=True)`: they FAIL today (that is the reproduction), and the day the fix lands they
-XPASS and break the build, which forces the marker off in the same PR (the fix owner removes it).
-Owners: M-1 -> runtime containment (isolation section of smoke-test.sh); M-2 -> CLI egress.
+       1. the REAL probe program, cut out of the script, runs against the REAL kernel: a listening
+          port, a closed port, a full accept queue (a SYN that is never answered), a name that does
+          not resolve, and - inside a network namespace - ENETUNREACH, EHOSTUNREACH and EACCES.
+       2. the REAL section-3 decision loop, cut out of the script, runs over a fake topology whose
+          probe results the test chooses: a clean topology passes, and every leak shape (open,
+          refused, unresolvable, an unseen shared path, broken controls, a missing own proxy) fails
+          for EACH of the three agents.
+
+     The negative controls are mutants of the real text (a classifier that calls a refusal
+     "unreachable", a loop that probes one agent, an assessment that accepts a refusal, one that
+     skips the controls): every one of them must be caught by the same tables, otherwise the tables
+     prove nothing.
+M-2  "The egress-denial suite fails open" (section 4): only a 403 with the proxy's own policy reason
+     is a refusal; a dead proxy, a 5xx or a bare 403 is not. Checked through real sockets.
+
+The functions are cut out of the script, so there is no second copy of the logic to drift.
+SMOKE_UNDER_TEST=<path> points the tests at another copy of the script.
 """
 
+import json
 import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
 import pytest
 
-# SMOKE_UNDER_TEST=<path> points the detectors at another copy (a branch under review, a fix)
 SMOKE = Path(
     os.environ.get("SMOKE_UNDER_TEST")
     or Path(__file__).resolve().parents[1] / "deploy" / "smoke-test.sh"
 )
+SMOKE_TEXT = SMOKE.read_text()
 BASH = shutil.which("bash")
+# the CI job that provides unprivileged namespaces sets this: there a missing tool is a FAILURE
+REQUIRED = os.environ.get("HUNTER_QA_REQUIRED") == "1"
 
 pytestmark = pytest.mark.skipif(
     BASH is None or not hasattr(socket, "AF_UNIX"), reason="needs bash on a POSIX host"
 )
 
-M1 = "M-1: reach() counts ECONNREFUSED and DNS failures as 'blocked' (smoke-test.sh section 3)"
-M2 = "M-2: denied() accepts anything but 200, 'error' included (smoke-test.sh section 4)"
 
-
-def _function(name):
+def _function(name, text=None):
     """The text of `name() { ... }` from smoke-test.sh (ends at the first line that is just `}`)."""
-    lines = SMOKE.read_text().splitlines()
+    lines = (text or SMOKE_TEXT).splitlines()
     start = next((i for i, ln in enumerate(lines) if re.match(rf"{name}\(\)\s*\{{", ln)), None)
     if start is None:
         pytest.fail(
-            f"{name}() is not in {SMOKE.name} any more: these detectors extract it by name. If it "
+            f"{name}() is not in {SMOKE.name} any more: these tests extract it by name. If it "
             "was renamed on purpose, update tests/test_integration_smoke_detectors.py with it."
         )
     if re.search(r"\}\s*(#.*)?$", lines[start]):  # a one-liner, possibly with a trailing comment
@@ -58,20 +66,59 @@ def _function(name):
     return "\n".join(lines[start : end + 1])
 
 
-# exec_in <service> <cmd...> runs in a container in the script; here it runs locally
-PRELUDE = 'exec_in() { shift; "$@"; }\npython() { python3 "$@"; }\n'
+def _need(ok, why):
+    """A tool the test needs is missing: skip, unless the job exists to run it (REQUIRED)."""
+    if not ok:
+        (pytest.fail if REQUIRED else pytest.skip)(why)
 
 
-def _run(snippet, timeout=30):
-    return subprocess.run(
-        [BASH, "-c", PRELUDE + snippet], capture_output=True, text=True, timeout=timeout
-    )
+# =============================================================================================
+# M-1 layer 1: the real probe program against the real kernel
+# =============================================================================================
+_m = re.search(r"^probe\(\) \{.*?<<'PY'.*?\n(.*?)\nPY\n", SMOKE_TEXT, re.S | re.M)
+PROBE = _m.group(1) if _m else ""
+REFUSED_CLAUSE = (
+    '    except (ConnectionRefusedError, ConnectionResetError):\n        return "refused"'
+)
+GAI_CLAUSE = '    except socket.gaierror:\n        return "error"'
 
 
-def reach(target):
-    r = _run(f"{_function('reach')}\nreach any-service {target}")
+def _mutant_probe(refused_as="unreachable", gaierror_as="unreachable"):
+    """The real probe with its classifier broken the way the original reach() was: a refusal and a
+    failed name lookup both look like isolation."""
+    assert REFUSED_CLAUSE in PROBE and GAI_CLAUSE in PROBE, "the probe's classifier changed shape"
+    return PROBE.replace(
+        REFUSED_CLAUSE, REFUSED_CLAUSE.replace('"refused"', f'"{refused_as}"')
+    ).replace(GAI_CLAUSE, GAI_CLAUSE.replace('"error"', f'"{gaierror_as}"'))
+
+
+def _parse(out):
+    res = {ln.split()[1]: ln.split()[2] for ln in out.splitlines() if ln.startswith("RESULT ")}
+    ctl = {ln.split()[1]: ln.split()[2] for ln in out.splitlines() if ln.startswith("CONTROL ")}
+    return res, ctl
+
+
+def run_probe(program, targets, netns_setup=None, timeout=60):
+    """(results, controls) of the probe program for `targets`. With `netns_setup` (shell), the
+    program runs in a fresh unprivileged network namespace after that setup (lo is brought up)."""
+    assert PROBE, "probe() with its python heredoc was not found in smoke-test.sh"
+    if netns_setup is None:
+        cmd = [sys.executable, "-", *targets]
+    else:
+        setup = "ip link set lo up" + (f" && {netns_setup}" if netns_setup else "")
+        cmd = [
+            "unshare",
+            "-Urn",
+            "sh",
+            "-c",
+            f'{setup} && exec "$0" "$@"',
+            sys.executable,
+            "-",
+            *targets,
+        ]
+    r = subprocess.run(cmd, input=program, capture_output=True, text=True, timeout=timeout)
     assert r.returncode == 0, r.stderr
-    return r.stdout.strip()
+    return _parse(r.stdout)
 
 
 @pytest.fixture
@@ -92,71 +139,297 @@ def closed_port():
     return port
 
 
-# ---- M-1 ----------------------------------------------------------------------------------------
-def test_reach_positive_control_a_listening_port_is_reachable(listener):
-    """Without this, every 'blocked' below could be a broken probe (the finding's own lesson)."""
-    host, port = listener
-    assert reach(f"{host}:{port}") == "REACHABLE"
+@pytest.fixture
+def full_backlog():
+    """A listening socket whose accept queue is full: further SYNs are dropped, never answered, so a
+    connect() neither succeeds nor is refused - it times out (the shape of a firewall DROP)."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen(0)
+    fillers = []
+    for _ in range(4):
+        c = socket.socket()
+        c.setblocking(False)
+        c.connect_ex(s.getsockname())
+        fillers.append(c)
+    yield s.getsockname()
+    for c in fillers:
+        c.close()
+    s.close()
 
 
-@pytest.mark.xfail(strict=True, reason=M1)
-def test_M1_a_refused_connection_is_not_reported_as_blocked(closed_port):
-    """ECONNREFUSED = a packet got there and was answered: a ROUTE EXISTS. reach() says 'blocked'.
-    Reproduce: any host that is L3-reachable with the port closed (discovery:8100 in the stack)."""
-    assert reach(f"127.0.0.1:{closed_port}") != "blocked"
+def _addr(a):
+    return f"{a[0]}:{a[1]}"
 
 
-@pytest.mark.xfail(strict=True, reason=M1)
-def test_M1_a_name_that_does_not_resolve_is_not_reported_as_blocked():
-    """gaierror proves DNS scoping, not that there is no route (postgres, api, ... by name)."""
-    assert reach("no-such-service.invalid:5432") != "blocked"
+def test_probe_classifies_open_refused_timeout_and_a_failed_lookup_on_a_real_kernel(
+    listener, closed_port, full_backlog
+):
+    targets = {
+        _addr(listener): "open",
+        f"127.0.0.1:{closed_port}": "refused",  # a route exists, the port is closed: NOT isolation
+        _addr(full_backlog): "timeout",  # a dropped SYN: isolation
+        "no-such-host.invalid:80": "error",  # a name proves nothing about the network
+    }
+    results, controls = run_probe(PROBE, list(targets))
+    assert controls == {"open": "open", "refused": "refused"}
+    assert results == targets
 
 
-def test_reach_reports_blocked_for_an_address_with_no_route():
-    """The other half of the classification must keep working after the fix: no route = blocked."""
-    # 240.0.0.0/4 is reserved: ENETUNREACH or a timeout, never a connection or a refusal
-    assert reach("240.0.0.1:80") == "blocked"
+def test_probe_classifies_the_three_kinds_of_no_route_as_unreachable():
+    """ENETUNREACH (no route), EHOSTUNREACH (an `unreachable` route) and EACCES (`prohibit`) are the
+    kernel's own statements that the packet did not leave. Run in a private network namespace."""
+    _need(shutil.which("unshare") and shutil.which("ip"), "needs unshare and ip")
+    probe = subprocess.run(["unshare", "-Urn", "true"], capture_output=True)
+    _need(probe.returncode == 0, "unprivileged user+network namespaces are not available")
+    setup = "ip route add unreachable 10.254.0.0/16 && ip route add prohibit 10.253.0.0/16"
+    targets = {
+        "10.255.255.1:80": "unreachable",  # ENETUNREACH
+        "10.254.0.1:80": "unreachable",  # EHOSTUNREACH
+        "10.253.0.1:80": "unreachable",  # EACCES
+    }
+    results, controls = run_probe(PROBE, list(targets), netns_setup=setup)
+    assert controls == {"open": "open", "refused": "refused"}
+    assert results == targets
 
 
-def _isolation_probes():
-    """(service, target-list-text) pairs for the L3 isolation loop of section 3."""
-    text = SMOKE.read_text()
-    return re.findall(r'reach\s+(agent-[a-z0-9-]+)\s+"?\$?([^\s"]*)', text)
-
-
-@pytest.mark.xfail(strict=True, reason=M1)
-def test_M1_every_agent_is_probed_for_isolation_not_only_agent_codex():
-    probed = {svc for svc, _ in _isolation_probes()}
-    assert {"agent-claude-1", "agent-claude-2", "agent-codex"} <= probed, probed
-
-
-@pytest.mark.xfail(strict=True, reason=M1)
-def test_M1_isolation_targets_are_addresses_not_service_names():
-    """A service name that does not resolve from the agent says nothing about the route. The loop
-    that proves isolation must probe IPs (docker inspect), at least for the peers it names."""
-    text = SMOKE.read_text()
-    loop = re.search(
-        r"for target in ([^;]*?);\s*do\s*\n\s*\[\[ \"\$\(reach agent-codex", text, re.S
+def test_a_probe_that_cannot_use_its_own_loopback_fails_its_controls():
+    """Inside a namespace whose lo is DOWN every connect fails the way a block does. The probe's
+    own controls (an open and a refused local port) are what tell that apart from isolation, and
+    smoke-test.sh refuses to count any result when they are wrong."""
+    _need(shutil.which("unshare"), "needs unshare")
+    r = subprocess.run(
+        ["unshare", "-Urn", sys.executable, "-", "10.255.255.1:80"],
+        input=PROBE,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
-    assert loop, "the section 3 isolation loop was not found: update this detector"
-    targets = loop.group(1).replace("\\\n", " ").split()
-    names = [t for t in targets if not re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", t)]
-    assert not names, f"probed by name, not address: {names}"
+    if r.returncode != 0 and "Operation not permitted" in r.stderr:
+        _need(False, "unprivileged network namespaces are not available")
+    results, controls = _parse(r.stdout)
+    assert controls != {"open": "open", "refused": "refused"}, controls
 
 
-# ---- M-2 ----------------------------------------------------------------------------------------
-# Two forms of the script exist: the original fail-open denied() (main) and the policy-403-only
-# refused()/ask() (PR #14). The original's checks are strict xfails (the reproduction); the same
-# properties on the new form are plain assertions, so the detectors are red-then-green by design.
-def _has(name):
-    return re.search(rf"^{name}\(\)\s*\{{", SMOKE.read_text(), re.M) is not None
+def test_negative_control_a_classifier_that_calls_refusals_isolation_fails_the_same_table(
+    listener, closed_port, full_backlog
+):
+    """The table above must be able to tell the original reach() mistake apart: with the refusal
+    and the failed lookup reported as isolation it does not pass."""
+    targets = {
+        _addr(listener): "open",
+        f"127.0.0.1:{closed_port}": "refused",
+        _addr(full_backlog): "timeout",
+        "no-such-host.invalid:80": "error",
+    }
+    results, _ = run_probe(_mutant_probe(), list(targets))
+    assert results != targets
+    assert results[f"127.0.0.1:{closed_port}"] == "unreachable"  # the mistake, reproduced
+    assert results["no-such-host.invalid:80"] == "unreachable"
+    assert results[_addr(listener)] == "open"  # and the part that was right stays right
 
 
-OLD = _has("denied")
-NEW = _has("refused") and _has("ask")
-old_form = pytest.mark.skipif(not OLD, reason="denied() was replaced (M-2 fixed in this script)")
-new_form = pytest.mark.skipif(not NEW, reason="this script has no refused()/ask() yet")
-open_m2 = pytest.mark.xfail(OLD, strict=True, reason=M2)
+# =============================================================================================
+# M-1 layer 2: the real section-3 decision loop over a fake topology
+# =============================================================================================
+ISOLATION = SMOKE_TEXT[
+    SMOKE_TEXT.index("# 3. agent isolation") : SMOKE_TEXT.index("# 4. egress policy")
+]
+AGENTS = ["agent-claude-1", "agent-claude-2", "agent-codex"]
+_loop_start = ISOLATION.index("mapfile -t RUNNING_SVCS")
+_loop_end = ISOLATION.index("\ndone\n", ISOLATION.index("for agent in ")) + len("\ndone\n")
+LOOP = ISOLATION[_loop_start:_loop_end]
+
+# service -> {network: ip}. Every agent shares a network with ITS proxy and with `hub`; everything
+# else (the other agents, their proxies, postgres, api) is on a network it does not share.
+TOPOLOGY = {
+    "postgres": {"data": "10.0.1.2"},
+    "api": {"data": "10.0.1.3", "front": "10.0.2.2"},
+    "hub": {"a1": "10.1.0.9", "a2": "10.2.0.9", "a3": "10.3.0.9"},
+    "agent-claude-1": {"a1": "10.1.0.2"},
+    "egress-claude-1": {"a1": "10.1.0.3", "out1": "10.1.1.3"},
+    "agent-claude-2": {"a2": "10.2.0.2"},
+    "egress-claude-2": {"a2": "10.2.0.3", "out2": "10.2.1.3"},
+    "agent-codex": {"a3": "10.3.0.2"},
+    "egress-codex": {"a3": "10.3.0.3", "out3": "10.3.1.3"},
+}
+FAKE_PROBE = r"""
+import json, sys
+topo, scen = json.load(open(sys.argv[1])), json.loads(sys.argv[2])
+agent, targets = sys.argv[3], sys.argv[4:]
+mine = {n for n in topo[agent]}
+shared = {ip for s, nets in topo.items() if s != agent for n, ip in nets.items() if n in mine}
+c = scen.get("controls", {"open": "open", "refused": "refused"})
+print("CONTROL open", c["open"]); print("CONTROL refused", c["refused"])
+for t in targets:
+    host = t.rpartition(":")[0]
+    default = "open" if host in shared else "unreachable"
+    print("RESULT", t, scen.get("override", {}).get(agent, {}).get(t, default))
+"""
+
+
+def _assess(tmp_path, scenario, loop=LOOP):
+    """Run the (possibly mutated) section-3 loop; returns (exit code, stderr)."""
+    (tmp_path / "topo.json").write_text(json.dumps(TOPOLOGY))
+    (tmp_path / "fakeprobe.py").write_text(FAKE_PROBE)
+    prelude = f"""
+set -uo pipefail
+fail() {{ echo "FAIL $*" >&2; exit 1; }}
+ok() {{ echo "ok   $*"; }}
+SERVICES=({" ".join(TOPOLOGY)})
+fakecompose() {{ printf '%s\\n' "${{SERVICES[@]}}"; }}
+COMPOSE=(fakecompose)
+PROTECTED_IPS=(100.64.0.1)
+cid() {{ echo "$1"; }}
+net_ips() {{ python3 - "$1" <<'PY'
+import json, sys
+for n, ip in json.load(open("{tmp_path}/topo.json"))[sys.argv[1]].items(): print(n, ip)
+PY
+}}
+probe() {{ python3 {tmp_path}/fakeprobe.py {tmp_path}/topo.json '{json.dumps(scenario)}' \\
+  "$1" "${{@:2}}"; }}
+{_function("result_of")}
+{_function("probe_port")}
+"""
+    r = subprocess.run(
+        [BASH, "-c", prelude + loop + '\necho "ASSESSMENT-COMPLETE"'],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return r
+
+
+def _target(svc, net, port):
+    return f"{TOPOLOGY[svc][net]}:{port}"
+
+
+def _leaks():
+    """(name, agent, scenario): one defect injected, which the assessment must refuse to certify."""
+    out = []
+    for i, a in enumerate(AGENTS, 1):
+        other = AGENTS[i % 3]
+        peer = _target(other, f"a{(i % 3) + 1}", 8100)  # a separate network's agent
+        pg = _target("postgres", "data", 5432)
+        proxy = _target(f"egress-{a.removeprefix('agent-')}", f"a{i}", 3128)
+        hub = _target("hub", f"a{i}", 9)
+        net = lambda **ov: {"override": {a: ov}}  # noqa: E731
+        out += [
+            (f"{a}:peer-open", a, net(**{peer: "open"})),
+            (f"{a}:peer-refused", a, net(**{peer: "refused"})),
+            (f"{a}:postgres-refused", a, net(**{pg: "refused"})),
+            (f"{a}:internet-open", a, net(**{"1.1.1.1:443": "open"})),
+            (f"{a}:internet-refused", a, net(**{"8.8.8.8:53": "refused"})),
+            (f"{a}:metadata-error", a, net(**{"169.254.169.254:80": "error"})),
+            (f"{a}:lookup-failure", a, net(**{pg: "error"})),
+            (f"{a}:shared-path-unseen", a, net(**{hub: "unreachable"})),
+            (f"{a}:own-proxy-unreachable", a, net(**{proxy: "unreachable"})),
+            (f"{a}:host-error", a, net(**{"100.64.0.1:22": "error"})),
+            (
+                f"{a}:controls-broken",
+                a,
+                {"controls": {"open": "unreachable", "refused": "unreachable"}},
+            ),
+            (f"{a}:control-open-only", a, {"controls": {"open": "open", "refused": "unreachable"}}),
+        ]
+    return out
+
+
+def test_a_clean_topology_is_certified_for_all_three_agents(tmp_path):
+    """Positive control: nothing in the failure table below is a symptom of a broken harness."""
+    r = _assess(tmp_path, {})
+    assert r.returncode == 0 and "ASSESSMENT-COMPLETE" in r.stdout, r.stderr
+
+
+def test_timeouts_count_as_isolation(tmp_path):
+    peer = _target("agent-codex", "a3", 8100)
+    r = _assess(tmp_path, {"override": {"agent-claude-1": {peer: "timeout"}}})
+    assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize("name,agent,scenario", _leaks(), ids=[x[0] for x in _leaks()])
+def test_every_leak_shape_fails_the_assessment_for_each_agent(tmp_path, name, agent, scenario):
+    r = _assess(tmp_path, scenario)
+    assert r.returncode == 1 and "ASSESSMENT-COMPLETE" not in r.stdout, (
+        f"{name}: the assessment certified isolation\n{r.stdout}\n{r.stderr}"
+    )
+    assert r.stderr.startswith("FAIL "), r.stderr
+
+
+def test_a_leak_in_the_last_agent_is_found_not_only_in_the_first(tmp_path):
+    """Original M-1: only agent-codex was probed. Here only agent-claude-2 (the middle one) leaks;
+    the clean run above certifies the others, so the failure is specific to the one that leaks."""
+    peer = _target("agent-codex", "a3", 8100)
+    r = _assess(tmp_path, {"override": {"agent-claude-2": {peer: "open"}}})
+    assert r.returncode == 1 and "agent-claude-2 reaches" in r.stderr, r.stderr
+
+
+MUTANTS = {
+    "accepts a refusal as isolation": (
+        '[[ "$r" == unreachable || "$r" == timeout ]] || fail "$agent reaches',
+        '[[ "$r" != open ]] || fail "$agent reaches',
+    ),
+    "probes only agent-codex": (
+        "for agent in agent-claude-1 agent-claude-2 agent-codex; do",
+        "for agent in agent-codex; do",
+    ),
+    "ignores the probe's own controls": (
+        "|| fail \"$agent: the probe's own controls failed",
+        "|| : \"$agent: the probe's own controls failed",
+    ),
+    "does not need the shared-network positive control": (
+        '[[ "$r" == open || "$r" == refused ]] || fail "$agent cannot reach $t on a network',
+        ': "$agent cannot reach $t on a network',
+    ),
+}
+
+
+_REAL_VERDICT = {}  # scenario -> exit code of the REAL loop (computed once)
+
+
+@pytest.mark.parametrize("mutant", sorted(MUTANTS))
+def test_negative_control_the_tables_catch_a_broken_assessment(tmp_path, mutant):
+    """Each mutant is the real loop with one safeguard removed. At least one case that the real loop
+    rejects must be certified by the mutant, otherwise the table would not notice the regression."""
+    old, new = MUTANTS[mutant]
+    assert old in LOOP, f"the loop no longer contains the text this mutant edits: {old!r}"
+    mutated = LOOP.replace(old, new)
+    certified = []
+    for name, _agent, scenario in _leaks():
+        key = json.dumps(scenario, sort_keys=True)
+        if key not in _REAL_VERDICT:
+            _REAL_VERDICT[key] = _assess(tmp_path, scenario).returncode
+        if _REAL_VERDICT[key] == 1 and _assess(tmp_path, scenario, loop=mutated).returncode == 0:
+            certified.append(name)
+    assert certified, f"nothing in the leak table distinguishes the mutant that {mutant}"
+
+
+def test_the_loop_really_is_the_one_in_smoke_test_sh():
+    """The extraction must contain what #14 claims: classified results and all three agents."""
+    assert "for agent in agent-claude-1 agent-claude-2 agent-codex; do" in LOOP
+    assert "isolation UNVERIFIED" in LOOP and "a refusal is an answer, not isolation" in LOOP
+    assert "reach() {" not in SMOKE_TEXT, "reach() is back"
+    assert not re.search(r"\$\(reach ", SMOKE_TEXT), "something still calls reach()"
+
+
+# =============================================================================================
+# M-2: only the proxy's own policy refusal is a refusal
+# =============================================================================================
+OLD_FORM_GONE = "denied() {" not in SMOKE_TEXT
+
+
+def test_the_fail_open_denied_is_gone():
+    assert OLD_FORM_GONE, "denied() (accepts anything but 200) is back in smoke-test.sh"
+
+
+# exec_in <service> <cmd...> runs in a container in the script; here it runs locally
+PRELUDE = 'exec_in() { shift; "$@"; }\npython() { python3 "$@"; }\n'
+
+
+def _run(snippet, timeout=30):
+    return subprocess.run(
+        [BASH, "-c", PRELUDE + snippet], capture_output=True, text=True, timeout=timeout
+    )
 
 
 class FakeProxy:
@@ -199,7 +472,7 @@ def _with_proxy(response, snippet):
         try:
             proxy = FakeProxy(response)
         except OSError:
-            pytest.skip("127.0.0.1:3128 is busy")
+            _need(False, "127.0.0.1:3128 is busy")
     try:
         r = _run(snippet)
         assert r.returncode == 0, r.stderr
@@ -209,57 +482,6 @@ def _with_proxy(response, snippet):
             proxy.close()
 
 
-# -- the original form: denied() / connect() ------------------------------------------------
-def denied(status):
-    """True if smoke-test.sh's denied() would count `status` as a refusal."""
-    return _run(f"{_function('denied')}\ndenied '{status}'").returncode == 0
-
-
-def _connect(status):
-    """What connect() prints for a proxy answering `status` (None = no proxy)."""
-    response = None if status is None else f"HTTP/1.1 {status}\r\n\r\n".encode()
-    snippet = f"{_function('connect')}\nconnect any-agent 127.0.0.1 example.com 443"
-    return _with_proxy(response, snippet)
-
-
-@old_form
-def test_denied_positive_controls():
-    assert denied("403"), "the policy refusal must count as a denial"
-    assert not denied("200"), "an established tunnel is never a denial"
-
-
-@old_form
-@open_m2
-@pytest.mark.parametrize("status", ["error", "", "000", "502", "504", "500", "407", "400"])
-def test_M2_only_the_policy_refusal_counts_as_a_denial(status):
-    """A dead, wedged or unreachable proxy yields 'error'/5xx, which is NOT evidence of a policy.
-    Reproduce: stop egress-codex, run the suite with SMOKE_EXTERNAL=0: every check still passes."""
-    assert not denied(status), f"denied({status!r}) counts as a denial"
-
-
-@old_form
-def test_connect_reports_what_the_proxy_said():
-    assert _connect("403 Forbidden") == "403"
-    assert _connect("200 Connection established") == "200"
-
-
-@old_form
-@open_m2
-def test_M2_a_dead_proxy_is_not_a_passing_egress_denial():
-    """End to end through the script's own connect() and denied(): nothing listens, the check must
-    NOT count that as 'the proxy refused example.com'."""
-    # (one assertion on purpose: a second, incidental one could fail for the wrong reason and make
-    # the xfail hide the fix)
-    assert not denied(_connect(None)), "denied() certifies a proxy that is not even running"
-
-
-@old_form
-@open_m2
-def test_M2_a_bad_gateway_is_not_a_passing_egress_denial():
-    assert not denied(_connect("502 Bad Gateway"))
-
-
-# -- the policy-403 form: refused() / ask() -------------------------------------------------
 def refused(answer):
     return _run(f"{_function('refused')}\nrefused '{answer}'").returncode == 0
 
@@ -280,13 +502,11 @@ def _http(status, reason=None):
     return f"HTTP/1.1 {status}\r\n{extra}Content-Length: 0\r\n\r\n".encode()
 
 
-@new_form
 @pytest.mark.parametrize("answer", ["403 host", "403 port", "403 method"])
 def test_refused_accepts_the_proxys_policy_answers(answer):
     assert refused(answer)
 
 
-@new_form
 @pytest.mark.parametrize(
     "answer",
     [
@@ -305,20 +525,17 @@ def test_M2_refused_rejects_everything_that_is_not_a_policy_refusal(answer):
     assert not refused(answer), f"refused({answer!r}) counts as a denial"
 
 
-@new_form
+def test_the_dead_proxy_condition_is_real_nothing_answers_on_3128():
+    with socket.socket() as s:
+        assert s.connect_ex(("127.0.0.1", 3128)) != 0, "something is listening on 3128"
+
+
 def test_M2_a_dead_proxy_is_not_a_refusal_end_to_end():
     """Nothing listens on 3128: through the script's own ask() and refused() this must not pass."""
     answer, accepted = _ask(None)
     assert not accepted, f"a dead proxy was certified as refusing ({answer!r})"
 
 
-@new_form
-def test_the_dead_proxy_condition_is_real_nothing_answers_on_3128():
-    with socket.socket() as s:
-        assert s.connect_ex(("127.0.0.1", 3128)) != 0, "something is listening on 3128"
-
-
-@new_form
 @pytest.mark.parametrize(
     "response, accepted",
     [
@@ -334,8 +551,8 @@ def test_M2_ask_and_refused_through_a_real_socket(response, accepted):
     assert _ask(response)[1] is accepted
 
 
-@open_m2
 def test_M2_the_denial_checks_cover_all_three_proxies():
-    """egress-claude-2 is never exercised (original finding)."""
-    text = SMOKE.read_text()
-    assert "egress-claude-2" in re.sub(r"#.*", "", text.split("# 4. egress policy", 1)[1])
+    """egress-claude-2 was never exercised (original finding)."""
+    section = re.sub(r"#.*", "", SMOKE_TEXT.split("# 4. egress policy", 1)[1])
+    for proxy in ("egress-claude-1", "egress-claude-2", "egress-codex"):
+        assert proxy in section, f"{proxy} is not exercised by the denial checks"
