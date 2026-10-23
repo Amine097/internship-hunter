@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tarfile
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -168,6 +169,41 @@ DNS_STUB = textwrap.dedent("""\
     [[ " ${STUB_FAIL_DNS_SHA:-} " == *" $running "* ]] && exit 1
     exit 0
 """)
+CONTAINMENT_STUB = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    running="$(cat "$STUB_DIR/running" 2>/dev/null)"
+    echo "containment $* [running=$running]" >> "$STUB_DIR/containment.log"
+    echo "containment $1" >> "$STUB_DIR/log"          # the same timeline as the docker calls
+    case "$1" in
+      status)
+        if [[ -n "${STUB_CONTAINMENT_STATUS:-}" ]]; then
+          echo "containment status stub: $STUB_CONTAINMENT_STATUS" >&2
+          exit "$STUB_CONTAINMENT_STATUS"
+        fi
+        exit 0 ;;
+      commit)
+        if [[ " $* " == *" --check "* ]]; then
+          # the read-only pre-flight: which release is it about? (--sha <sha>)
+          sha=""; prev=""
+          for a in "$@"; do [[ "$prev" == --sha ]] && sha="$a"; prev="$a"; done
+          if [[ " ${STUB_NONCOMMITTABLE:-} " == *" $sha "* ]]; then
+            echo "runtime-containment: api renders restart=unless-stopped (stub)" >&2; exit 11
+          fi
+          exit 0
+        fi
+        # a real commit happens INSIDE a deploy: its lock and the watchdog action lock are both held
+        if flock -n "$STUB_DIR/../base/state/containment.action.lock" true 2>/dev/null; then
+          echo "commit saw the action lock FREE" >> "$STUB_DIR/lock.log"
+        else
+          echo "commit saw the action lock held by the deploy" >> "$STUB_DIR/lock.log"
+        fi
+        if [[ " ${STUB_FAIL_COMMIT_SHA:-} " == *" $running "* ]]; then
+          echo "commit refused (stub)" >&2; exit 11
+        fi
+        exit 0 ;;
+    esac
+    exit 0
+""")
 SS_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
     [[ -n "${STUB_PORT_BUSY:-}" ]] && echo "LISTEN 0 4096 127.0.0.1:18000 0.0.0.0:*"
@@ -198,7 +234,8 @@ class Env:
         self.conf.chmod(0o644)
         for name, body in (("host-egress-guard.sh", GUARD_STUB),
                            ("check-host-isolation.sh", CHECK_STUB),
-                           ("check-dns.sh", DNS_STUB)):
+                           ("check-dns.sh", DNS_STUB),
+                           ("runtime-containment.sh", CONTAINMENT_STUB)):
             (self.base / "deploy" / name).write_text(body)
             (self.base / "deploy" / name).chmod(0o755)
         self.guard_conf = self.base / "deploy" / "host-egress-guard.conf"
@@ -292,6 +329,11 @@ class Env:
     @property
     def dns_log(self):
         p = self.stub / "dns.log"
+        return p.read_text() if p.exists() else ""
+
+    @property
+    def containment_log(self):
+        p = self.stub / "containment.log"
         return p.read_text() if p.exists() else ""
 
     @property
@@ -1143,3 +1185,185 @@ def test_the_gate_expects_exactly_what_the_guard_conf_says(env):
     assert r.returncode == 0, r.stderr.decode()      # guard and compose agree on a public resolver
     assert "SMOKE_DNS_EXPECT=1.1.1.1" in env.dns_config_log
     assert "SMOKE_DNS_EXPECT=1.1.1.1" in env.dns_log
+
+
+def real_commits(env):
+    """The `commit` calls (not the read-only `commit --check` pre-flights)."""
+    return [ln for ln in env.containment_log.splitlines()
+            if ln.startswith("containment commit") and " --check " not in ln]
+
+
+# ---- runtime containment: the watchdog that keeps the isolation true after the deploy -----------
+def test_deploy_is_refused_when_the_containment_watchdog_script_is_missing_or_untrusted(env):
+    (env.base / "deploy" / "runtime-containment.sh").chmod(0o775)
+    r = env.deploy(SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    assert "runtime containment missing or untrusted" in r.stderr.decode()
+    (env.base / "deploy" / "runtime-containment.sh").unlink()
+    assert env.deploy(SHA_A).returncode == 11
+
+
+@pytest.mark.parametrize("status", ["20", "21"])
+def test_deploy_and_rollback_are_refused_while_the_watchdog_is_dead_or_latched(env, status):
+    r = env.deploy(SHA_A, STUB_CONTAINMENT_STATUS=status)
+    assert r.returncode == 13 and untouched(env)
+    assert "runtime containment is not active" in r.stderr.decode()
+    assert env.deploy(SHA_A).returncode == 0
+    assert env.deploy(SHA_B).returncode == 0
+    r = env.run("rollback", STUB_CONTAINMENT_STATUS=status)
+    assert r.returncode == 13 and env.current_link == SHA_B
+
+
+def test_the_status_check_is_the_require_active_one(env):
+    assert env.deploy(SHA_A).returncode == 0
+    assert "containment status --require-active" in env.containment_log
+
+
+def test_a_release_is_committed_only_after_every_gate_passed_with_the_isolation_parameters(env):
+    r = env.deploy(SHA_A)
+    assert r.returncode == 0, r.stderr.decode()
+    commits = real_commits(env)
+    assert len(commits) == 1
+    c = commits[0]
+    assert f"--sha {SHA_A}" in c and f"--release-dir {env.base}/releases/{SHA_A}" in c
+    assert "--forbidden 100.107.22.84:22,100.107.22.84:8000" in c
+    assert "--protected-ips 100.107.22.84" in c and "--rootful 172.17.0.2:9" in c
+    assert "-- -p internship-hunter -f compose.yaml --env-file" in c
+    # ... and by then the stack is up and both isolation checks ran for this release
+    assert f"[running={SHA_A}]" in c
+    assert f"dns running={SHA_A}" in env.dns_log and f"check running={SHA_A}" in env.isolation_log
+
+
+def test_a_release_the_watchdog_refuses_is_not_kept_and_the_previous_one_is_restored(env):
+    assert env.deploy(SHA_A).returncode == 0
+    r = env.deploy(SHA_B, STUB_FAIL_COMMIT_SHA=SHA_B)
+    assert r.returncode == 1 and "runtime containment refused release" in r.stderr.decode()
+    assert env.current_link == SHA_A and (env.stub / "running").read_text().strip() == SHA_A
+    commits = real_commits(env)
+    assert f"--sha {SHA_A}" in commits[-1]            # the restored release is committed again
+
+
+def test_a_first_deploy_the_watchdog_refuses_is_torn_down_and_recorded_as_stopped(env):
+    r = env.deploy(SHA_A, STUB_FAIL_COMMIT_SHA=SHA_A)
+    assert r.returncode == 1 and env.current_link is None
+    timeline = env.log.splitlines()
+    assert "DOWN" in timeline and "containment desired" in timeline
+    # the watchdog is told BEFORE the stack is torn down, so it cannot restart what is being removed
+    assert timeline.index("containment desired") < timeline.index("DOWN")
+    assert "containment desired stopped" in env.containment_log
+
+
+def test_a_failed_gate_never_reaches_the_commit(env):
+    env.deploy(SHA_A, STUB_FAIL_DNS_SHA=SHA_A)
+    assert real_commits(env) == []
+    env.deploy(SHA_B, STUB_FAIL_ISOLATION_SHA=SHA_B)
+    assert not any(f"--sha {SHA_B}" in ln for ln in real_commits(env))
+
+
+def test_rollback_commits_the_release_it_restored(env):
+    env.deploy(SHA_A)
+    env.deploy(SHA_B)
+    assert env.run("rollback").returncode == 0
+    commits = real_commits(env)
+    assert f"--sha {SHA_A}" in commits[-1]
+
+
+# ---- PR #13 re-review: the action lock; a first deploy with nothing to go back to ----------------
+def test_a_deploy_holds_the_watchdogs_action_lock_for_its_whole_duration(env):
+    assert env.deploy(SHA_A).returncode == 0
+    assert "commit saw the action lock held by the deploy" in (env.stub / "lock.log").read_text()
+    # ... and releases it with the deploy: the watchdog can act again straight afterwards
+    fd = os.open(env.base / "state" / "containment.action.lock", os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+
+
+def test_a_deploy_waits_for_a_watchdog_action_in_flight_and_then_proceeds(env):
+    lock = env.base / "state" / "containment.action.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock, "w")
+    fcntl.flock(fh, fcntl.LOCK_EX)                     # the watchdog is stopping/starting the stack
+    threading.Timer(1.5, lambda: (fcntl.flock(fh, fcntl.LOCK_UN), fh.close())).start()
+    t0 = time.monotonic()
+    r = env.deploy(SHA_A, HUNTER_ACTION_LOCK_WAIT="20")
+    assert r.returncode == 0, r.stderr.decode()
+    assert time.monotonic() - t0 >= 1.2
+
+
+def test_a_deploy_that_cannot_get_the_action_lock_in_time_changes_nothing_and_says_why(env):
+    lock = env.base / "state" / "containment.action.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        r = env.deploy(SHA_A, HUNTER_ACTION_LOCK_WAIT="1")
+    assert r.returncode == 4 and untouched(env)
+    assert b"in the middle of stopping or starting the stack" in r.stderr
+
+
+def test_a_release_runtime_containment_cannot_supervise_is_refused_before_anything_changes(env):
+    r = env.deploy(SHA_A, STUB_NONCOMMITTABLE=SHA_A)
+    assert r.returncode == 11 and untouched(env)
+    assert b"runtime containment cannot supervise it" in r.stderr
+    assert "docker load" not in env.log and "backups" not in os.listdir(env.base)
+
+
+def pre_containment_running(env):
+    """A running release from before runtime containment (it would be refused by `commit`)."""
+    assert env.deploy(SHA_A).returncode == 0
+    return {"STUB_NONCOMMITTABLE": SHA_A}
+
+
+def test_the_first_deploy_over_a_pre_containment_release_needs_an_explicit_acknowledgement(env):
+    knob = pre_containment_running(env)
+    before = env.log
+    r = env.deploy(SHA_B, **knob)
+    assert r.returncode == 14, r.stderr.decode()
+    assert b"predates runtime containment" in r.stderr and b"deploy-irreversible" in r.stderr
+    assert env.current_link == SHA_A and env.state("current_sha") == SHA_A
+    after = env.log[len(before):]
+    assert "docker load" not in after and " up " not in after and "DOWN" not in after
+    assert not (env.base / "backups").exists()
+
+
+def test_acknowledged_it_deploys_and_records_that_there_is_no_way_back(env):
+    knob = pre_containment_running(env)
+    r = env.deploy(SHA_B, command="deploy-irreversible", **knob)
+    assert r.returncode == 0, r.stderr.decode()
+    assert env.current_link == SHA_B and env.state("rollback_ok") == "0"
+    assert b"will NOT be restored" in r.stderr
+
+
+def test_a_failed_acknowledged_deploy_restores_nothing_and_never_reports_a_restore(env):
+    knob = pre_containment_running(env)
+    before = env.log
+    r = env.deploy(SHA_B, command="deploy-irreversible", STUB_FAIL_UP_SHA=SHA_B, **knob)
+    err = r.stderr.decode()
+    assert r.returncode == 10, err
+    assert "NOT restored" in err and "deploy: restored" not in err           # never a false success
+    after = env.log[len(before):]
+    up_lines = [ln for ln in after.splitlines() if " up " in ln]
+    assert all(f"[RELEASE_SHA={SHA_A}]" not in ln for ln in up_lines)
+    assert "DOWN" in after and not (env.stub / "running").exists()          # fail closed
+    assert env.current_link == SHA_A and env.state("current_sha") == SHA_A  # state does not claim B
+    assert "containment desired stopped" in env.containment_log             # the watchdog is told
+    assert "MANUAL RECOVERY REQUIRED" in err
+
+
+def test_a_rollback_to_a_pre_containment_release_is_refused_before_anything_changes(env):
+    assert env.deploy(SHA_A).returncode == 0
+    assert env.deploy(SHA_B).returncode == 0
+    before = env.log
+    r = env.run("rollback", STUB_NONCOMMITTABLE=SHA_A)
+    assert r.returncode == 14, r.stderr.decode()
+    assert b"predates runtime containment" in r.stderr and b"nothing was changed" in r.stderr
+    assert env.current_link == SHA_B and (env.stub / "running").read_text().strip() == SHA_B
+    assert env.log[len(before):].count(" up ") == 0 and "DOWN" not in env.log[len(before):]
+
+
+def test_a_committable_previous_release_is_still_restored_after_a_failed_deploy(env):
+    assert env.deploy(SHA_A).returncode == 0
+    r = env.deploy(SHA_B, STUB_FAIL_UP_SHA=SHA_B)
+    assert r.returncode == 1 and env.current_link == SHA_A
+    assert b"deploy: restored" in r.stderr

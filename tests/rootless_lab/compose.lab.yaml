@@ -1,7 +1,8 @@
 # Test-only override: the REAL compose.yaml topology (networks, dns, internal flags, service names)
 # with every image replaced by the lab's Alpine rootfs and every application process by `sleep`,
 # so that only the NETWORK behaviour of the real file is exercised against a real rootless Docker.
-# Used by tests/test_dns_rootless_lab.py (needs a Compose that understands `!reset`, >= 2.24).
+# Used by tests/test_dns_rootless_lab.py and test_runtime_containment_lab.py (needs a Compose that
+# understands `!reset`, >= 2.24). Restart policies are NOT overridden: the real ones apply.
 # (Written out per service: the tags are not honoured through YAML aliases.)
 services:
   postgres:
@@ -15,7 +16,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   migrate:
     image: alpine-local:3.20
     build: !reset null
@@ -27,7 +27,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   api:
     image: alpine-local:3.20
     build: !reset null
@@ -39,7 +38,8 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
+    # an ephemeral loopback port: the lab must not collide with another lab (or the real stack) on 18000
+    ports: !override ["127.0.0.1::8000"]
   discovery:
     image: alpine-local:3.20
     build: !reset null
@@ -51,7 +51,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   scheduler:
     image: alpine-local:3.20
     build: !reset null
@@ -63,7 +62,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   session-controller:
     image: alpine-local:3.20
     build: !reset null
@@ -75,7 +73,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   telegram:
     image: alpine-local:3.20
     build: !reset null
@@ -87,7 +84,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   agent-claude-1:
     image: alpine-local:3.20
     build: !reset null
@@ -99,7 +95,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   agent-claude-2:
     image: alpine-local:3.20
     build: !reset null
@@ -111,7 +106,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   agent-codex:
     image: alpine-local:3.20
     build: !reset null
@@ -123,7 +117,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   egress-claude-1:
     image: alpine-local:3.20
     build: !reset null
@@ -135,7 +128,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   egress-claude-2:
     image: alpine-local:3.20
     build: !reset null
@@ -147,7 +139,6 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"
   egress-codex:
     image: alpine-local:3.20
     build: !reset null
@@ -159,4 +150,3 @@ services:
     cpus: !reset null
     pids_limit: !reset null
     volumes: !reset []
-    restart: "no"

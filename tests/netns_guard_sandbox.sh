@@ -170,7 +170,9 @@ echo "rules_after_reapply $(ns "$D" iptables -S HUNTER-EGRESS-GUARD | wc -l) jum
 tamper() { # tamper <name> <repairable yes|no> <undo cmd or "-"> -- <iptables cmd...>
   local name="$1" repair="$2" undo="$3"; shift 4
   ns "$D" "$@" >/dev/null 2>&1 || { echo "tamper_$name SETUP-FAILED"; return; }
-  if "$GUARD" status >/dev/null 2>&1; then echo "tamper_$name status_passed"; else echo "tamper_$name status_failed"; fi
+  local rc=0; "$GUARD" status >/dev/null 2>&1 || rc=$?
+  if [[ $rc == 0 ]]; then echo "tamper_$name status_passed"; else echo "tamper_$name status_failed"; fi
+  echo "statusrc_$name $rc"
   if [[ "$repair" == yes ]]; then
     "$GUARD" apply >/dev/null 2>&1 || true
     if "$GUARD" status >/dev/null 2>&1; then echo "repair_$name ok"; else echo "repair_$name FAILED"; fi
@@ -190,6 +192,11 @@ tamper flush_ipv6_chain yes - -- ip6tables -F ${G}6
 tamper flush_ipv6_input_chain yes - -- ip6tables -F ${G}6-IN
 tamper remove_input_jump yes - -- iptables -D INPUT -i br-+ -j $G-IN
 tamper docker_jump_displaced no "iptables -D FORWARD 1" -- iptables -I FORWARD 1 -j ACCEPT
+# host-address drift: the policy is intact, only the set of /32 host rules differs -> exit 3, repaired by apply
+tamper delete_host_address_reject yes - -- iptables -D $G -d 203.0.114.7/32 "${REJ[@]}"
+tamper extra_host_address_reject yes - -- iptables -I $G 3 -d 198.51.100.200/32 "${REJ[@]}"
+# ... but the same difference next to a structural one is NOT address-only (exit 1): an ACCEPT slipped in
+tamper address_drift_plus_accept yes - -- sh -c "iptables -D $G -d 203.0.114.7/32 ${REJ[*]}; iptables -I $G 1 -d 203.0.113.9/32 -j ACCEPT"
 echo "final_status $("$GUARD" status >/dev/null 2>&1 && echo ok || echo bad)"
 "$GUARD" remove >/dev/null
 "$GUARD" status >/dev/null 2>&1 || echo "status inactive"

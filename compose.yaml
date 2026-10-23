@@ -42,6 +42,7 @@ x-app: &app
   cpus: 0.5
 x-agent: &agent
   <<: *hardening
+  restart: "no"    # supervised: started by deploy/runtime-containment.sh, never by the daemon (see "services")
   image: internship-hunter-agent:${RELEASE_SHA:-dev}
   build:
     context: .
@@ -56,6 +57,13 @@ x-agent: &agent
     timeout: 5s
     retries: 5
 
+# RESTART POLICY. Every service with a route out (api, discovery, telegram, the three proxies) and
+# every agent is `restart: "no"`: after a reboot or a daemon restart the Docker daemon starts NONE of
+# them. deploy/runtime-containment.sh (a systemd user unit) starts them, and only once the host
+# guard is verified, the protected host addresses are live (Tailscale can be late) and the rendered
+# DNS matches the guard; it also restarts a crashed one, stops them all if an invariant is lost, and
+# remote-deploy.sh refuses to commit a release in which one of them has another policy.
+# postgres, scheduler and session-controller have no route to the host and keep `unless-stopped`.
 services:
   postgres:
     <<: *hardening
@@ -85,6 +93,7 @@ services:
       postgres: {condition: service_healthy}
   api:
     <<: *app
+    restart: "no"
     entrypoint: ["/usr/local/bin/isolation-gate.sh"]    # refuses to start unguarded (R7)
     command: ["uvicorn", "hunter.api:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
@@ -105,6 +114,7 @@ services:
       retries: 5
   discovery:
     <<: *app
+    restart: "no"
     entrypoint: ["/usr/local/bin/isolation-gate.sh"]    # refuses to start unguarded (R7)
     command: ["python", "-m", "hunter.worker"]
     stop_grace_period: 150s   # finish/release the current scan before SIGKILL (agents <= 110s)
@@ -142,6 +152,7 @@ services:
       migrate: {condition: service_completed_successfully}
   telegram:
     <<: *app
+    restart: "no"
     entrypoint: ["/usr/local/bin/isolation-gate.sh"]    # refuses to start unguarded (R7)
     command: ["python", "-m", "hunter.telegram"]
     environment:
@@ -203,6 +214,7 @@ services:
   # (API-key login) or the ChatGPT backend and its OAuth token endpoint (ChatGPT login).
   egress-claude-1: &egress
     <<: *hardening
+    restart: "no"
     image: internship-hunter-egress:${RELEASE_SHA:-dev}
     build:
       context: .

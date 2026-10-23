@@ -267,6 +267,7 @@ def test_dns_lab_is_a_required_failing_job_without_privileges_and_without_a_skip
     for step in (LAB_STEP, LAB_PROBE):
         assert step["shell"] == "bash" and "set -euo pipefail" in step["run"]
     assert "tests/test_dns_rootless_lab.py" in LAB_STEP["run"]
+    assert "tests/test_runtime_containment_lab.py" in LAB_STEP["run"]   # containment, real daemon
     assert LAB_JOB["env"]["CI_REQUIRE_SERVICES"] == ""
 
 
@@ -309,3 +310,36 @@ def test_all_original_ci_jobs_are_still_there():
     jobs = set(yaml.safe_load((WF / "ci.yaml").read_text())["jobs"])
     assert {"lint-test", "rsm-systemd", "host-guard-netns", "shellcheck", "dependency-audit",
             "secret-scan", "docker"} <= jobs
+
+
+# Every mandatory security job. A superset is fine: a test that counts jobs turns CI red for
+# whichever change merges second.
+REQUIRED_JOBS = frozenset({
+    "lint-test", "secret-scan", "rootless-dns-lab", "dependency-audit", "rsm-systemd", "shellcheck",
+    "docker", "host-guard-netns", "cli-egress-probe", "egress-topology-lab",
+})
+
+
+def missing_or_optional(jobs: dict) -> set:
+    """Required jobs that are absent, or that may fail without failing the workflow."""
+    bad = set(REQUIRED_JOBS - set(jobs))
+    bad |= {j for j in REQUIRED_JOBS & set(jobs)
+            if (jobs[j] or {}).get("continue-on-error") not in (None, False)}
+    return bad
+
+
+def test_runtime_containment_script_is_linted_and_no_required_ci_job_was_dropped():
+    ci = (WF / "ci.yaml").read_text()
+    assert "/mnt/runtime-containment.sh" in ci                       # shellcheck sees it
+    jobs = yaml.safe_load(ci)["jobs"]
+    assert not missing_or_optional(jobs), missing_or_optional(jobs)
+    assert "continue-on-error" not in yaml.safe_dump(jobs["rootless-dns-lab"])
+
+
+def test_the_job_check_accepts_more_jobs_and_rejects_a_dropped_or_optional_required_one():
+    base = {j: {"runs-on": "ubuntu-latest"} for j in REQUIRED_JOBS}
+    assert missing_or_optional(base) == set()
+    assert missing_or_optional({**base, "something-new": {}}) == set()
+    assert missing_or_optional({k: v for k, v in base.items() if k != "docker"}) == {"docker"}
+    optional = {**base, "shellcheck": {"continue-on-error": True}}
+    assert missing_or_optional(optional) == {"shellcheck"}

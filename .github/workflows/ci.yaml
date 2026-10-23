@@ -136,7 +136,7 @@ jobs:
   # packets. A failure OR a skip fails the job: there is no success-on-skip path.
   rootless-dns-lab:
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       CI_REQUIRE_SERVICES: ""
     steps:
@@ -153,7 +153,7 @@ jobs:
             echo "::error title=Mandatory security job cannot run::Unprivileged user namespaces, iptables or curl/tar are unavailable on this runner, so NO evidence exists that DNS takes the guard-policed path on a real rootless Docker. This is a CI blocker, not a skip."
             exit 1
           fi
-      - name: Real rootless Docker, real compose networks, real DNS (a failure OR a skip fails the job)
+      - name: Real rootless Docker, real compose networks, real DNS and runtime containment (a failure OR a skip fails the job)
         shell: bash
         env:
           HUNTER_ROOTLESS_LAB: "1"
@@ -161,7 +161,8 @@ jobs:
           HUNTER_LAB_LOG_DIR: ${{ runner.temp }}/lab-logs
         run: |
           set -euo pipefail
-          python -m pytest -q -rs -p no:cacheprovider tests/test_dns_rootless_lab.py | tee lab.log
+          python -m pytest -q -rs -p no:cacheprovider tests/test_dns_rootless_lab.py \
+            tests/test_runtime_containment_lab.py | tee lab.log
           if grep -qE '[0-9]+ (skipped|deselected)' lab.log; then
             echo "::error title=Security tests skipped::the rootless DNS lab skipped tests"
             exit 1
@@ -263,7 +264,8 @@ jobs:
             koalaman/shellcheck:v0.10.0 -x \
             /mnt/remote-deploy.sh /mnt/smoke-test.sh /mnt/verify-restore.sh /mnt/make-bundle.sh \
             /mnt/build-artifacts.sh /mnt/sign-bundle.sh /mnt/check-host-isolation.sh \
-            /mnt/host-egress-guard.sh /mnt/check-dns.sh /mnt-docker/egress-proxy.sh /mnt-docker/egress-healthcheck.sh \
+            /mnt/host-egress-guard.sh /mnt/check-dns.sh /mnt/runtime-containment.sh \
+            /mnt-docker/egress-proxy.sh /mnt-docker/egress-healthcheck.sh \
             /mnt-docker/egress-forbidden-check.sh /mnt-docker/isolation-gate.sh
 
   dependency-audit:
