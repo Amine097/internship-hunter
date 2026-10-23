@@ -18,9 +18,30 @@ _ENV_ALLOWLIST = (
 )
 _FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 
+# Network hardening of the CLIs themselves, set on every invocation (not in a config file: the
+# agents' home directories are persistent volumes that would hide anything the image ships).
+# Measured with the pinned versions (tests/cli_probe, docs/security-architecture.md "Egress"):
+# without these, Codex also contacts github.com / api.github.com (plugin and skill marketplace
+# sync) and ab.chatgpt.com (analytics), Claude Code may contact telemetry and update endpoints.
+# None of those is on the egress allow-list; these settings keep the CLIs from trying.
+_CLI_FIXED_ENV = {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",   # telemetry, error reporting, updates
+    "DISABLE_AUTOUPDATER": "1",
+}
+CODEX_CONFIG_OVERRIDES = (
+    "check_for_update_on_startup=false",
+    "analytics.enabled=false",
+    "feedback.enabled=false",
+    'otel.exporter="none"',
+    "features.plugins=false",       # marketplace/skill sync from github.com
+    "features.apps=false",          # connector directory from chatgpt.com
+)
+
 
 def cli_env() -> dict[str, str]:
-    return {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+    env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
+    env.update(_CLI_FIXED_ENV)
+    return env
 
 
 def demo_plan(agent: str, profile: dict) -> dict:
@@ -87,8 +108,9 @@ def run_plan(agent: str, profile: dict) -> dict:
 
     with tempfile.TemporaryDirectory() as temp_dir:
         result_file = Path(temp_dir) / "answer.json"
+        overrides = [arg for kv in CODEX_CONFIG_OVERRIDES for arg in ("-c", kv)]
         command = [
-            "codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only",
+            "codex", "exec", *overrides, "--skip-git-repo-check", "--sandbox", "read-only",
             "--output-last-message", str(result_file), prompt,
         ]
         subprocess.run(
