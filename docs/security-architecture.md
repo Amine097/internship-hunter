@@ -101,20 +101,36 @@ also reached `github.com`/`api.github.com` (plugin and skill sync - a public wri
 | `CONNECT` to an unlisted name, an IP or IPv6 literal, another port, a look-alike, the other provider | exact host match, port `443` only: `403 host`/`403 port`, nothing is dialled | `tests/test_egress_proxy.py`; smoke test, all three proxies |
 | plain-HTTP forwarding, other methods | `403 method` | same |
 | DNS rebinding: an allowed name whose answer is private, the host, the tailnet, metadata | the proxy resolves, refuses if **any** A record is not global unicast (`403 resolve-non-global`), then dials **that** literal address (no second lookup) - and the host guard rejects those destinations at the network layer anyway | proxy tests (resolver answers injected); guard: netns packet tests |
-| **SNI swap** on a shared CDN: `CONNECT api.openai.com`, then a ClientHello for another site served by the same edge | the first ClientHello must name exactly the CONNECT host, or the tunnel is cut **before the provider receives a single byte of it** (`tls-sni-mismatch`): records are held until the whole ClientHello has been judged, so a hello split over several records cannot leak its server name to an L4 front end, and no other record type may be interleaved (`tls-interleaved`); this also stops swapping between two allow-listed names | proxy tests with real OpenSSL clients; smoke test against the real providers (`www.cloudflare.com` via each proxy is cut) |
+| **SNI swap** on a shared CDN: `CONNECT api.openai.com`, then a ClientHello for another site served by the same edge | the first ClientHello must name exactly the CONNECT host, or the tunnel is cut **before the provider receives a single byte of it** (`tls-sni-mismatch`): records are held until the whole ClientHello has been judged, so a hello split over several records cannot leak its server name to an L4 front end, and no other record type may be interleaved (`tls-interleaved`); this also stops swapping between two allow-listed names | proxy tests with real OpenSSL clients; smoke test against the real providers (a per-run unique swapped name via each proxy is cut, and that run's log line is the evidence) |
 | second ClientHello after a TLS 1.3 HelloRetryRequest naming another site | every plaintext ClientHello is checked until the real ServerHello; a third one, or one after the ServerHello, is cut | proxy tests (scripted HRR) |
 | no SNI (default virtual host), Encrypted Client Hello / ESNI (hides the real name) | cut (`tls-no-sni`, `tls-ech`) | proxy tests |
 | non-TLS bytes through the tunnel (another protocol to the provider's address) | the first record must be a TLS handshake | proxy tests |
+| bytes smuggled to the provider **before** the hello is judged (empty handshake records, each with an attacker-chosen record-version byte) | nothing is released until the first ClientHello has passed; zero-length handshake records are refused (`tls-empty-fragment`, RFC 8446 5.1) | proxy tests (2000-record reproducer: provider receives 0 bytes) |
+| a client trickling its hello one byte at a time to hold one of the 16 slots | TOTAL deadlines from the `200`: 15 s to a judged first ClientHello (`hello-deadline`), 60 s to the server's real ServerHello (`handshake-deadline`), in both directions; legitimate fragmented hellos and HelloRetryRequest finish well inside them | proxy tests (slot freed after the deadline) |
 | bypassing the proxy | no route: `internal` network | smoke test, `check-host-isolation.sh` |
 | DNS as a channel | agents have no upstream resolver | `check-dns.sh`, `rootless-dns-lab` |
 | QUIC / UDP, CONNECT-UDP | no UDP route; only HTTP/1.x `CONNECT` is parsed | topology; proxy tests |
 | a redirect to another host | invisible inside TLS, but following it needs a new `CONNECT`, judged like any other | - |
 
-**What it cannot see (and does not claim to stop).**
-- **Domain fronting proper.** After the handshake everything is encrypted. If a CDN routes by the
-  HTTP `Host`/`:authority` header rather than by SNI, a request inside a correctly named tunnel could
-  reach another customer of that CDN. No proxy can check this without terminating TLS. Some CDNs
-  reject an SNI/Host mismatch; that is the provider's control, not ours, and nothing here verifies it.
+**What it cannot see (and does not claim to stop).** The gate enforces *transport-layer* identity
+(CONNECT host == SNI, dialled address == validated address). Everything after the handshake is
+encrypted, so these remain possible:
+- **Domain fronting by `Host`/`:authority`.** Inside a correctly named tunnel the HTTP request may
+  name another site. Where the edge routes on `Host` without requiring it to match the SNI, that
+  request reaches another tenant of the CDN. Whether the edges of `api.anthropic.com`,
+  `platform.claude.com`, `api.openai.com`, `auth.openai.com` and `chatgpt.com` reject a mismatch is
+  **unverified** (it cannot be tested offline); it is the provider's control, not ours. Demonstrated
+  against a TLS server that routes by `Host` (review harness, case E03).
+- **Sibling names on the same edge or certificate.** No SNI mismatch is needed for `Host: <sibling>`
+  on a tunnel to an allowed name, for every name the allowed host's certificate/edge also serves
+  (for example a `chatgpt.com` tunnel and the analytics host the CLI hardening switches off). The
+  allow-list is therefore a boundary per *edge*, not per hostname. HTTP/2 connection coalescing
+  across names under one certificate is the same class.
+- **TLS 1.2 renegotiation** with another server name happens encrypted (invisible), and a
+  change-cipher-spec followed by a plaintext ClientHello *after* the real ServerHello is forwarded
+  (case R05) - a real TLS peer treats it as a protocol error; listed for completeness.
+Not possible: an SNI swap at the handshake, split/fragmented/duplicate/late hellos, empty records
+before the hello, ECH/ESNI, non-TLS payloads, DNS rebinding, IP-literal or non-443 targets.
 - **The provider itself.** Whatever the agent's account can do at its provider (store content, use
   provider-side tools), a hostile agent can do. That is inherent to giving it the login.
   Mitigation: dedicated accounts with the smallest plan/scope, spend limits, no organisation-admin
@@ -139,6 +155,22 @@ A per-agent proxy password would be held by the very agent it is meant to constr
 **Audit trail.** Every connection is one JSON line on the proxy's stdout: host, resolved and dialled
 address, SNI, number of ClientHellos and HelloRetryRequests, verdict and reason, bytes each way,
 duration. No request contents, no credentials.
+
+The trail is bounded so an agent cannot rotate earlier evidence away by flooding its proxy
+(`AuditLog` in `docker/egress_proxy.py`):
+- identical events (same client, verdict, reason, host) beyond 100 per 10 s are counted, not
+  written, and reported in one `audit-coalesced` line with the count;
+- all lines together are capped at 50/s (bursts up to 500); the excess is reported in an
+  `audit-dropped` line once per second;
+- every suppressed event is accounted for in a summary line, and pending counts are written at
+  shutdown.
+
+**Retention limits.** Each container keeps 30 MB of `json-file` log (`10m` x 3, `compose.yaml`).
+At about 250 B a line, that is roughly 120 000 lines: weeks of normal use, but about **40 minutes**
+under a sustained flood at the 50 lines/s cap (before the cap: about 25 s, measured by the review).
+The rotating container log is therefore not durable evidence. For an incident that must be
+reconstructed later, ship the proxies' stdout off the host (a log driver or collector); that is an
+operator task before `AGENT_MODE=cli`, not done by this repository.
 
 ## Host boundary (network level, not hostname level)
 

@@ -45,6 +45,21 @@ def test_missing_namespaces_fail_instead_of_reporting_success(tmp_path):
     assert run_step(PREREQ, ok, {**tools, "unshare": "exit 0\n"}).returncode == 0
 
 
+TOPO = yaml.safe_load((WF / "ci.yaml").read_text())["jobs"]["egress-topology-lab"]
+TOPO_STEP = next(s for s in TOPO["steps"] if "every container pair" in s.get("name", ""))
+
+
+def test_the_topology_lab_is_a_required_job_without_privileges_or_a_skip_path(tmp_path):
+    assert "sudo" not in yaml.safe_dump(TOPO) and TOPO["runs-on"] == "ubuntu-22.04"
+    assert TOPO_STEP["env"] == {"HUNTER_ROOTLESS_LAB": "1", "HUNTER_ROOTLESS_LAB_REQUIRED": "1"}
+    assert "tests/test_egress_topology_lab.py" in TOPO_STEP["run"]
+    r = run_step(TOPO_STEP, tmp_path, {"python": fake_python("5 passed, 1 skipped in 9s", 0)})
+    assert r.returncode != 0 and "skipped" in r.stdout
+    ok = tmp_path / "ok"
+    ok.mkdir()
+    assert run_step(TOPO_STEP, ok, {"python": fake_python("6 passed in 200s", 0)}).returncode == 0
+
+
 def test_the_probe_installs_exactly_the_versions_the_agent_image_pins():
     install = (Path(__file__).parent / "cli_probe" / "install.sh").read_text()
     assert "docker/agent.Dockerfile" in install and "CLAUDE_CODE_VERSION" in install

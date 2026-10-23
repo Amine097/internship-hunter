@@ -13,10 +13,13 @@ What a client may do, and what this process checks before a single byte reaches 
   TLS       after `200` the tunnel is gated on the TLS handshake, which is plaintext up to the
             ServerHello: every ClientHello the client sends (the first one and, after a
             HelloRetryRequest, the second) must carry exactly one SNI host_name equal to <host>,
-            and no Encrypted Client Hello. Anything that is not a TLS handshake, a ClientHello
-            after the ServerHello, a third ClientHello, a malformed handshake: connection cut,
-            nothing more forwarded. Once the server's real ServerHello has passed, the tunnel is
-            spliced untouched (end-to-end TLS is never terminated or re-signed).
+            and no Encrypted Client Hello. No client byte reaches the provider before the first
+            ClientHello has been judged: records (fragments included) are held, empty handshake
+            records are refused. Anything that is not a TLS handshake, a ClientHello after the
+            ServerHello, a third ClientHello, a malformed handshake: connection cut, nothing more
+            forwarded. The first hello and the whole handshake have TOTAL deadlines, so a trickling
+            client cannot hold a connection slot. Once the server's real ServerHello has passed,
+            the tunnel is spliced untouched (end-to-end TLS is never terminated or re-signed).
 
 What it CANNOT see (encrypted after the handshake): the HTTP Host / :authority inside TLS. A
 CDN that routes by Host rather than SNI ("domain fronting") is out of reach of any proxy that does
@@ -43,8 +46,8 @@ MAX_HEADERS = 64
 HEAD_TIMEOUT = 10.0         # seconds to send the CONNECT request
 RESOLVE_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 10.0
-HELLO_TIMEOUT = 15.0        # seconds after `200` until the first ClientHello is complete
-HANDSHAKE_TIMEOUT = 60.0    # until the server's real ServerHello
+HELLO_TIMEOUT = 15.0        # TOTAL seconds after `200` until the first ClientHello is judged
+HANDSHAKE_TIMEOUT = 60.0    # TOTAL seconds after `200` until the server's real ServerHello
 IDLE_TIMEOUT = 600.0        # a spliced tunnel with no traffic in either direction
 INSPECT_BUDGET_C2S = 1 << 20    # ClientHello(s) + TLS 1.3 early data before the ServerHello
 INSPECT_BUDGET_S2C = 1 << 18
@@ -66,6 +69,15 @@ _LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 class Silent(Exception):
     """A connection that closed without sending a byte (the healthcheck's `nc -z`): not logged."""
+
+
+class Deadline(TimeoutError):
+    """A phase of the handshake ran out of its TOTAL time (not a per-read idle timeout): a client
+    that trickles one byte at a time cannot hold a connection slot past the deadline."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class Refused(Exception):
@@ -260,6 +272,9 @@ class Tunnel:
         self.alpn = []
         self.up = self.down = 0
         self.last = time.monotonic()
+        # absolute deadlines, counted from the `200`: each read gets only what is LEFT of them
+        self.hello_deadline = self.last + HELLO_TIMEOUT
+        self.handshake_deadline = self.last + HANDSHAKE_TIMEOUT
 
     async def run(self, early: bytes) -> None:
         """Both directions run until both reached EOF; the first error (a violation, a timeout,
@@ -284,6 +299,16 @@ class Tunnel:
         self.last = time.monotonic()
         return data
 
+    async def _read_before(self, reader, deadline: float, reason: str):
+        """One read that must finish before an ABSOLUTE deadline (a phase budget, not idle time)."""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise Deadline(reason)
+        try:
+            return await self._read(reader, left)
+        except TimeoutError:
+            raise Deadline(reason) from None
+
     async def _send(self, writer, data, up):
         writer.write(data)
         await writer.drain()
@@ -306,10 +331,11 @@ class Tunnel:
         self.sni, self.alpn = hello["sni"].lower(), hello["alpn"]
 
     async def _client_to_server(self, early: bytes) -> None:
-        # Records are HELD while a handshake message is incomplete and released only once every
-        # message they carry has been judged: a ClientHello split over several records must not
-        # reach the provider piecemeal (an L4 front end routing on the first record would act on a
-        # server name that is about to be refused).
+        # NOTHING from the client reaches the provider before its first ClientHello has been judged:
+        # records are HELD while a handshake message is incomplete or no ClientHello has passed yet,
+        # and released only once every message they carry has been judged. A ClientHello split
+        # over several records, or preceded by empty records, cannot put a single byte on the
+        # provider's socket (an L4 front end routing on early bytes would act on them).
         stream, seen, raw, held = RecordStream(), 0, False, bytearray()
         if early:
             stream.feed(early)
@@ -317,8 +343,13 @@ class Tunnel:
         while not raw:
             rec = stream.next_record()
             if rec is None:
-                timeout = HELLO_TIMEOUT if self.client_hellos == 0 else HANDSHAKE_TIMEOUT
-                data = await self._read(self.cr, timeout)
+                if self.client_hellos == 0:
+                    data = await self._read_before(self.cr, self.hello_deadline, "hello-deadline")
+                elif not self.server_hello.is_set():
+                    data = await self._read_before(self.cr, self.handshake_deadline,
+                                                   "handshake-deadline")
+                else:
+                    data = await self._read(self.cr, IDLE_TIMEOUT)
                 if not data:
                     self._eof(self.uw)     # held or unfinished records are dropped, never sent
                     return
@@ -335,6 +366,10 @@ class Tunnel:
             if self.client_hellos == 0 and ctype != CT_HANDSHAKE:
                 raise TLSViolation("tls-not-handshake", f"first record type {ctype}")
             if ctype == CT_HANDSHAKE:
+                if not payload:
+                    # RFC 8446 5.1 forbids zero-length handshake fragments; they carry no message to
+                    # judge, only an attacker-chosen record-version byte per header
+                    raise TLSViolation("tls-empty-fragment", "zero-length handshake record")
                 for mtype, body in stream.handshake_messages(payload):
                     if mtype == HS_CLIENT_HELLO:
                         if done_sh:
@@ -343,8 +378,8 @@ class Tunnel:
                     elif not done_sh:
                         raise TLSViolation("tls-unexpected-handshake", f"message {mtype}")
                 held += record
-                if stream.hs:
-                    continue               # a message is still incomplete: keep holding
+                if stream.hs or self.client_hellos == 0:
+                    continue               # incomplete, or nothing judged yet: keep holding
                 await self._send(self.uw, bytes(held), True)
                 held.clear()
                 continue
@@ -366,7 +401,8 @@ class Tunnel:
         while not self.server_hello.is_set():
             rec = stream.next_record()
             if rec is None:
-                data = await self._read(self.ur, HANDSHAKE_TIMEOUT)
+                data = await self._read_before(self.ur, self.handshake_deadline,
+                                               "handshake-deadline")
                 if not data:
                     self._eof(self.cw)
                     return
@@ -473,6 +509,81 @@ async def resolve(host: str) -> list[str]:
     return addrs
 
 
+class AuditLog:
+    """One JSON line per connection on stdout - bounded, so an agent cannot age earlier evidence
+    out of the container's rotating log (json-file 10m x 3 in compose.yaml) by flooding the proxy:
+
+      * identical events (same client, verdict, reason, host, status) beyond PER_KEY within WINDOW
+        seconds are counted, not written; one summary line per key and window gives the count;
+      * all lines together are capped by a token bucket (RATE lines/s, bursts up to BURST); what it
+        drops is counted and reported in an `audit-dropped` line once per second.
+
+    Nothing is dropped silently: every suppressed event is accounted for in a summary line. Worst
+    case sustained output is about RATE lines/s (docs/security-architecture.md, "Audit trail")."""
+
+    WINDOW, PER_KEY, RATE, BURST, MAX_KEYS = 10.0, 100, 50.0, 500.0, 4096
+
+    def __init__(self, sink=None, clock=time.monotonic):
+        self.sink = sink or (lambda line: print(line, flush=True))
+        self.clock = clock
+        self.keys: dict[tuple, list] = {}       # key -> [window start, events, suppressed]
+        self.tokens, self.stamp, self.dropped = self.BURST, clock(), 0
+
+    def _write(self, rec: dict) -> None:
+        self.sink(json.dumps(rec, sort_keys=True))
+
+    def _take(self, now: float) -> bool:
+        self.tokens = min(self.BURST, self.tokens + (now - self.stamp) * self.RATE)
+        self.stamp = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+    def __call__(self, rec: dict) -> None:
+        now = self.clock()
+        key = tuple(str(rec.get(k)) for k in ("client", "verdict", "reason", "host", "status"))
+        entry = self.keys.get(key)
+        if entry is None or now - entry[0] >= self.WINDOW:
+            if entry is not None:
+                self._summarise(key, entry)
+            if len(self.keys) >= self.MAX_KEYS:
+                self.flush(force=True)
+            entry = self.keys[key] = [now, 0, 0]
+        entry[1] += 1
+        if entry[1] > self.PER_KEY:
+            entry[2] += 1
+            return
+        if self._take(now):
+            self._write(rec)
+        else:
+            self.dropped += 1
+
+    def _summarise(self, key: tuple, entry: list) -> None:
+        if entry[2]:
+            client, verdict, reason, host, status = key
+            self._write({"event": "audit-coalesced", "client": client, "verdict": verdict,
+                         "reason": reason, "host": host, "status": status, "suppressed": entry[2],
+                         "window_seconds": self.WINDOW})
+
+    def flush(self, force: bool = False) -> None:
+        """Summaries for finished windows (all windows with `force`) and for rate-limited lines."""
+        now = self.clock()
+        for key, entry in list(self.keys.items()):
+            if force or now - entry[0] >= self.WINDOW:
+                self._summarise(key, entry)
+                del self.keys[key]
+        if self.dropped:
+            self._write({"event": "audit-dropped", "dropped": self.dropped,
+                         "rate_per_second": self.RATE})
+            self.dropped = 0
+
+    async def flush_loop(self) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            self.flush()
+
+
 class Proxy:
     def __init__(self, allow: frozenset[str], max_clients: int = 16, resolver=resolve, log=None,
                  upstream_port: int = 443):
@@ -480,7 +591,8 @@ class Proxy:
         self.slots = asyncio.Semaphore(max_clients)
         self.resolver = resolver
         self.upstream_port = upstream_port      # 443 in production; tests use a local server
-        self.log = log or (lambda rec: print(json.dumps(rec, sort_keys=True), flush=True))
+        self.audit = None if log else AuditLog()
+        self.log = log or self.audit
 
     async def handle(self, creader, cwriter) -> None:
         peer = (cwriter.get_extra_info("peername") or ("?",))[0]
@@ -517,8 +629,8 @@ class Proxy:
             except Refused as e:
                 rec.update(verdict="refused", reason=e.reason, status=e.status, detail=e.detail)
                 await self._reply(cwriter, e.status, e.reason)
-            except asyncio.TimeoutError:
-                rec.update(verdict="timeout")
+            except asyncio.TimeoutError as e:
+                rec.update(verdict="timeout", reason=getattr(e, "reason", "timeout"))
             except Silent:
                 rec = None                 # a bare liveness probe: nothing to audit
             except (ConnectionError, OSError) as e:
@@ -589,8 +701,11 @@ async def main() -> int:
         loop.add_signal_handler(sig, stop.set)
     print(json.dumps({"event": "listening", "listen": f"{host}:{port}", "allow": sorted(allow)}),
           flush=True)
+    flusher = asyncio.create_task(proxy.audit.flush_loop())
     async with server:
         await stop.wait()
+    flusher.cancel()
+    proxy.audit.flush(force=True)              # nothing counted is lost at shutdown
     return 0
 
 

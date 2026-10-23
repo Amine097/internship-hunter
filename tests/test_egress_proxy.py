@@ -523,6 +523,206 @@ def test_the_inspection_budget_bounds_pre_handshake_data(h, monkeypatch):
     assert h.wait_log()["reason"] == "tls-inspect-budget"
 
 
+# ---- nothing before the first judged ClientHello (review finding: empty records leaked) ---------
+def test_two_thousand_empty_handshake_records_put_nothing_on_the_provider_socket(h):
+    """Reproducer of the review's E01: header-only handshake records, each carrying one
+    attacker-chosen byte (the record-version minor), used to be relayed before any ClientHello was
+    judged - 10 000 bytes, byte for byte. Now the first one cuts the tunnel."""
+    flood = b"".join(struct.pack(">BHH", 22, 0x0300 | (i % 256), 0) for i in range(2000))
+    s, up = tunnel(h)
+    s.sendall(flood)
+    time.sleep(0.5)
+    assert up.received == b""
+    try:
+        s.sendall(ch(sni="evil.test"))
+    except OSError:
+        pass                                   # already cut: that is the point
+    assert is_cut(s)
+    time.sleep(0.2)
+    assert up.received == b"" and h.wait_log()["reason"] == "tls-empty-fragment"
+
+
+def test_an_empty_handshake_record_before_a_good_hello_is_refused(h):
+    """RFC 8446 5.1 forbids zero-length handshake fragments; no real client sends them."""
+    s, up = tunnel(h, script=[server_hello()])
+    s.sendall(rec(22, b"") + ch(sni="allowed.test"))
+    assert is_cut(s)
+    time.sleep(0.2)
+    assert up.received == b"" and h.wait_log()["reason"] == "tls-empty-fragment"
+
+
+# ---- total deadlines (review finding: the hello timeout was per read) ---------------------------
+def trickle(s, data, every):
+    for b in data:
+        try:
+            s.sendall(bytes([b]))
+        except OSError:
+            return
+        time.sleep(every)
+
+
+def test_a_trickled_client_hello_is_cut_at_the_total_hello_deadline(h, monkeypatch):
+    monkeypatch.setattr(ep, "HELLO_TIMEOUT", 1.0)
+    s, up = tunnel(h)
+    t0 = time.monotonic()
+    threading.Thread(target=trickle, args=(s, ch(sni="allowed.test"), 0.2), daemon=True).start()
+    log = h.wait_log(timeout=8)
+    took = time.monotonic() - t0
+    assert log["verdict"] == "timeout" and log["reason"] == "hello-deadline", log
+    assert 0.8 < took < 3.0, took             # per-read timing would have let it run ~13 s
+    assert up.received == b""
+
+
+def test_a_trickling_client_cannot_keep_its_proxy_slot(h, monkeypatch):
+    """One slot, one trickler: after the hello deadline the slot is free for a real request."""
+    monkeypatch.setattr(ep, "HELLO_TIMEOUT", 1.0)
+    up = Upstream(script=[server_hello()])
+    port = h.proxy(h.serve(up.handle), max_clients=1)
+    s, status, _ = connect(port)
+    assert status == 200
+    threading.Thread(target=trickle, args=(s, ch(sni="allowed.test") * 4, 0.2), daemon=True).start()
+    _, busy, _ = connect(port)
+    assert busy == 503                         # the slot is taken while the trickle lasts ...
+    h.wait_log(n=2, timeout=8)                 # (the 503, then the deadline)
+    s2, status2, _ = connect(port)
+    assert status2 == 200                      # ... and free again after the deadline
+    s2.sendall(ch(sni="allowed.test"))
+    assert s2.recv(65536).startswith(b"\x16\x03")
+
+
+def test_a_provider_that_never_answers_is_cut_at_the_handshake_deadline(h, monkeypatch):
+    monkeypatch.setattr(ep, "HANDSHAKE_TIMEOUT", 1.0)
+    s, up = tunnel(h)                          # scripted provider: says nothing
+    s.sendall(ch(sni="allowed.test"))
+    log = h.wait_log(timeout=8)
+    assert log["verdict"] == "timeout" and log["reason"] == "handshake-deadline", log
+
+
+def test_a_provider_trickling_its_server_hello_is_cut_at_the_handshake_deadline(h, monkeypatch):
+    monkeypatch.setattr(ep, "HANDSHAKE_TIMEOUT", 1.5)
+
+    class Slow(Upstream):
+        async def handle(self, reader, writer):
+            await reader.read(65536)
+            for b in server_hello():
+                writer.write(bytes([b]))
+                await writer.drain()
+                await asyncio.sleep(0.2)
+    up = Slow()
+    port = h.proxy(h.serve(up.handle))
+    s, status, _ = connect(port)
+    s.sendall(ch(sni="allowed.test"))
+    log = h.wait_log(timeout=10)
+    assert log["verdict"] == "timeout" and log["reason"] == "handshake-deadline", log
+
+
+def test_a_legitimately_fragmented_hello_with_gaps_inside_the_deadline_still_works(h, monkeypatch):
+    monkeypatch.setattr(ep, "HELLO_TIMEOUT", 3.0)
+    body = hs(1, client_hello_body(sni="allowed.test"))
+    step = -(-len(body) // 4)
+    s, up = tunnel(h, script=[server_hello()])
+    for i in range(0, len(body), step):
+        s.sendall(rec(22, body[i:i + step]))
+        time.sleep(0.3)
+    assert s.recv(65536).startswith(b"\x16\x03")
+    assert up.hellos == ["allowed.test"]
+
+
+def test_hello_retry_request_flow_still_works_under_the_deadlines(h, monkeypatch):
+    monkeypatch.setattr(ep, "HELLO_TIMEOUT", 2.0)
+    monkeypatch.setattr(ep, "HANDSHAKE_TIMEOUT", 4.0)
+    s, up = tunnel(h, script=[server_hello(hrr=True), server_hello() + APPDATA])
+    s.sendall(ch(sni="allowed.test"))
+    assert s.recv(65536).startswith(server_hello(hrr=True))
+    time.sleep(0.5)
+    s.sendall(CCS + ch(sni="allowed.test"))
+    assert s.recv(65536).startswith(server_hello())
+    assert up.hellos == ["allowed.test", "allowed.test"]
+
+
+# ---- the audit trail cannot be flooded away (review finding: log rotation in ~25 s) --------------
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def audit(clock):
+    lines = []
+    return ep.AuditLog(sink=lines.append, clock=clock), lines
+
+
+def parsed(lines):
+    import json
+    return [json.loads(ln) for ln in lines]
+
+
+def refusal(host="evil.test", client="172.30.0.2"):
+    return {"client": client, "verdict": "refused", "reason": "host", "status": 403, "host": host}
+
+
+def test_identical_events_beyond_the_per_key_allowance_are_counted_not_written():
+    clock = Clock()
+    log, lines = audit(clock)
+    for _ in range(1000):
+        log(refusal())
+    assert len(lines) == ep.AuditLog.PER_KEY
+    clock.t += ep.AuditLog.WINDOW
+    log.flush()
+    summary = parsed(lines)[-1]
+    assert summary["event"] == "audit-coalesced"
+    assert summary["suppressed"] == 1000 - ep.AuditLog.PER_KEY
+    assert summary["reason"] == "host" and summary["host"] == "evil.test"
+
+
+def test_distinct_events_are_capped_by_the_rate_and_every_drop_is_reported():
+    clock = Clock()
+    log, lines = audit(clock)
+    n = 2000
+    for i in range(n):
+        log(refusal(host=f"h{i}.test"))
+    written = len(lines)
+    assert written == int(ep.AuditLog.BURST)
+    log.flush()
+    dropped = parsed(lines)[-1]
+    assert dropped["event"] == "audit-dropped" and dropped["dropped"] == n - written
+
+
+def test_every_event_is_accounted_for_written_coalesced_or_dropped():
+    clock = Clock()
+    log, lines = audit(clock)
+    total = 0
+    for second in range(30):                   # a sustained mixed flood over 30 s
+        for i in range(400):
+            log(refusal(host=f"h{i % 7}.test", client=f"10.0.{second % 3}.1"))
+            total += 1
+        clock.t += 1.0
+        log.flush()
+    log.flush(force=True)
+    recs = parsed(lines)
+    events = [r for r in recs if "event" not in r]
+    coalesced = sum(r["suppressed"] for r in recs if r.get("event") == "audit-coalesced")
+    dropped = sum(r["dropped"] for r in recs if r.get("event") == "audit-dropped")
+    assert len(events) + coalesced + dropped == total
+    assert len(lines) <= ep.AuditLog.BURST + 30 * (ep.AuditLog.RATE + 40)   # bounded output
+
+
+def test_ordinary_traffic_is_logged_line_by_line():
+    clock = Clock()
+    log, lines = audit(clock)
+    for i in range(80):                        # e.g. a test suite's worth of different refusals
+        log(refusal(host=f"h{i}.test"))
+        clock.t += 0.05
+    assert len(lines) == 80 and all("event" not in r for r in parsed(lines))
+
+
+def test_the_production_proxy_uses_the_bounded_audit_log():
+    p = ep.Proxy(ALLOW)
+    assert isinstance(p.audit, ep.AuditLog) and p.log is p.audit
+
+
 # ==== compatibility: real TLS through the gate ====================================================
 @pytest.fixture(scope="module")
 def certs(tmp_path_factory):
