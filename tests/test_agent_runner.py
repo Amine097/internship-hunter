@@ -142,7 +142,10 @@ def test_cli_env_excludes_infrastructure_secrets(monkeypatch):
         monkeypatch.setenv(key, "secret")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/home/hunter/.claude")
     env = agents.cli_env()
-    assert set(env) <= set(agents._ENV_ALLOWLIST)
+    # inherited variables come only from the allow-list; the rest are fixed hardening constants
+    assert set(env) <= set(agents._ENV_ALLOWLIST) | set(agents._CLI_FIXED_ENV)
+    assert {k: env[k] for k in agents._CLI_FIXED_ENV} == agents._CLI_FIXED_ENV
+    assert "secret" not in env.values()
     assert "CLAUDE_CONFIG_DIR" in env
 
 

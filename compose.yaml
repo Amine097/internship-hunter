@@ -196,9 +196,11 @@ services:
       egress-codex: {condition: service_healthy}
     networks: [agent_codex]
 
-  # Allow-listing egress proxies, one per agent (the hostname lists are the policy).
-  # The lists below are the documented defaults; verify them against the pinned CLI versions
-  # before AGENT_MODE=cli (docs/security-architecture.md).
+  # Allow-listing egress proxies, one per agent (the hostname lists are the policy; the proxy also
+  # requires TLS SNI == the CONNECT host, see docker/egress_proxy.py). The defaults are exactly the
+  # hosts the PINNED CLIs contact, as invoked by hunter/agents.py, measured by tests/cli_probe
+  # (CI job cli-egress-probe): Claude Code - the API and its OAuth token endpoint; Codex - the API
+  # (API-key login) or the ChatGPT backend and its OAuth token endpoint (ChatGPT login).
   egress-claude-1: &egress
     <<: *hardening
     image: internship-hunter-egress:${RELEASE_SHA:-dev}
@@ -206,7 +208,7 @@ services:
       context: .
       dockerfile: docker/egress-proxy.Dockerfile
     environment:
-      EGRESS_ALLOW: ${EGRESS_ALLOW_ANTHROPIC:-api.anthropic.com,console.anthropic.com,claude.ai,statsig.anthropic.com}
+      EGRESS_ALLOW: ${EGRESS_ALLOW_ANTHROPIC:-api.anthropic.com,platform.claude.com}
       EGRESS_FORBIDDEN_TARGETS: ${EGRESS_FORBIDDEN_TARGETS:-}
     dns: ["${HUNTER_DNS:-10.0.2.3}"]   # explicit resolver: queries leave the container and cross the guard (docs/deployment.md, "DNS")
     networks: [egress_claude_1, agent_claude_1]
