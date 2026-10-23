@@ -1,12 +1,19 @@
 """Resource limits of the egress proxy (docker/egress_proxy.py, PR #14), against the real Proxy.
 
-HELLO_TIMEOUT is documented as "seconds after `200` until the first ClientHello is complete", but it
-is applied to each read(), not to the whole phase: a client that sends one byte just inside the
-timeout, forever, keeps its slot. The proxy serves ONE agent, so the victim is that agent's own
-egress (it can lock itself out of its provider with MAX_CLIENTS dripping connections); it is not a
-route out. Scaled down here: HELLO_TIMEOUT = 1 s, a byte every 0.7 s.
+The first QA review found that HELLO_TIMEOUT was applied to each read(), not to the whole phase: a
+client that sends one byte just inside the timeout, forever, kept its slot, and MAX_CLIENTS of them
+locked the agent out of its own provider (a self-DoS of that agent's egress, not a route out).
+#14 replaced it with ABSOLUTE deadlines counted from the `200` (`Tunnel._read_before`). These tests
+keep it fixed, with the two controls that make a pass mean something:
 
-PROXY_DIR points at a directory holding egress_proxy.py (default: docker/); skipped when absent.
+  * CONTROL      while the drippers are inside their deadline all four slots really are held (a
+                 fifth CONNECT is answered 503 "busy"), so the later 200 is not a proxy that never
+                 counted slots;
+  * NEGATIVE     the old per-read behaviour, patched into the real Tunnel class, keeps the slots for
+                 the whole test: the same measurement fails on it.
+
+Scaled down: HELLO_TIMEOUT = 1 s, a byte every 0.7 s. PROXY_DIR points at a directory holding
+egress_proxy.py (default: docker/); skipped when absent.
 """
 
 import asyncio
@@ -36,17 +43,37 @@ def _hello():
     return b"\x16\x03\x01" + len(hs).to_bytes(2, "big") + hs
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="HELLO_TIMEOUT is per read(): a ClientHello trickled one byte per interval holds a slot "
-    "indefinitely (bounded only by the 1 MiB inspection budget)",
-)
-def test_a_trickled_client_hello_does_not_hold_a_slot_past_the_hello_deadline(monkeypatch):
+@pytest.fixture
+def ep(monkeypatch):
     monkeypatch.syspath_prepend(str(PROXY_DIR))
     sys.modules.pop("egress_proxy", None)
-    import egress_proxy as ep
+    import egress_proxy
 
-    monkeypatch.setattr(ep, "HELLO_TIMEOUT", 1.0)
+    monkeypatch.setattr(egress_proxy, "HELLO_TIMEOUT", 1.0)
+    return egress_proxy
+
+
+def _per_read_timeout(ep):
+    """The behaviour the first review found: while the ClientHello is incomplete, every read gets
+    the full HELLO_TIMEOUT again. Everything else (the server side, the handshake budget) is the
+    real code, so the only difference from the shipped proxy is the one defect."""
+    real = ep.Tunnel._read_before
+
+    async def _read_before(self, reader, deadline, reason):
+        if reason != "hello-deadline":
+            return await real(self, reader, deadline, reason)
+        try:
+            return await self._read(reader, ep.HELLO_TIMEOUT)
+        except TimeoutError:
+            raise ep.Deadline(reason) from None
+
+    return _read_before
+
+
+def _drip(ep):
+    """Four drippers (a byte every 0.7 s, never completing) against a proxy with four slots.
+    Returns the status a fifth CONNECT gets (a) during the drip, inside the deadline, and (b) after
+    five hello deadlines."""
 
     async def scenario():
         async def sink(r, w):
@@ -77,16 +104,40 @@ def test_a_trickled_client_hello_does_not_hold_a_slot_past_the_hello_deadline(mo
             except (ConnectionError, OSError):
                 pass
 
+        async def probe():
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            w.write(req)
+            line = (await asyncio.wait_for(r.read(300), 5)).split(b"\r\n")[0]
+            w.close()
+            return line
+
         tasks = [asyncio.create_task(dripper()) for _ in range(4)]
-        await asyncio.sleep(5.0)  # five hello deadlines
-        r, w = await asyncio.open_connection("127.0.0.1", port)
-        w.write(req)
-        status = (await asyncio.wait_for(r.read(300), 5)).split(b"\r\n")[0]
+        await asyncio.sleep(0.4)  # all four are past the 200 and inside their 1 s deadline
+        during = await probe()
+        await asyncio.sleep(4.6)  # five hello deadlines in all
+        after = await probe()
         for t in tasks:
             t.cancel()
         srv.close()
         usrv.close()
-        return status
+        return during, after
 
-    status = asyncio.run(scenario())
-    assert b" 200 " in status, f"a legitimate CONNECT after five deadlines got: {status!r}"
+    return asyncio.run(scenario())
+
+
+def test_control_while_the_drippers_are_inside_their_deadline_every_slot_is_held(ep):
+    during, _after = _drip(ep)
+    assert b" 503 " in during, f"a fifth CONNECT inside the deadline got: {during!r}"
+
+
+def test_a_trickled_client_hello_does_not_hold_a_slot_past_the_hello_deadline(ep):
+    _during, after = _drip(ep)
+    assert b" 200 " in after, f"a legitimate CONNECT after five deadlines got: {after!r}"
+
+
+def test_negative_control_a_per_read_timeout_would_keep_the_slots(ep, monkeypatch):
+    """Re-introduce the original defect into the real class: the same measurement must fail."""
+    monkeypatch.setattr(ep.Tunnel, "_read_before", _per_read_timeout(ep))
+    during, after = _drip(ep)
+    assert b" 503 " in during
+    assert b" 503 " in after, f"the old behaviour was not detected: a CONNECT got {after!r}"
