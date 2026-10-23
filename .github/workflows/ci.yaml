@@ -14,7 +14,7 @@ env:
 jobs:
   lint-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40   # the suite (the containment matrix and the integration tests) outgrew 20
     services:
       postgres:
         image: postgres:17-alpine
@@ -154,7 +154,7 @@ jobs:
   # packets. A failure OR a skip fails the job: there is no success-on-skip path.
   rootless-dns-lab:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 80
     env:
       CI_REQUIRE_SERVICES: ""
     steps:
@@ -180,7 +180,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pytest -q -rs -p no:cacheprovider tests/test_dns_rootless_lab.py \
-            tests/test_runtime_containment_lab.py | tee lab.log
+            tests/test_runtime_containment_lab.py tests/test_runtime_containment_spec_lab.py | tee lab.log
           if grep -qE '[0-9]+ (skipped|deselected)' lab.log; then
             echo "::error title=Security tests skipped::the rootless DNS lab skipped tests"
             exit 1

@@ -268,6 +268,7 @@ def test_dns_lab_is_a_required_failing_job_without_privileges_and_without_a_skip
         assert step["shell"] == "bash" and "set -euo pipefail" in step["run"]
     assert "tests/test_dns_rootless_lab.py" in LAB_STEP["run"]
     assert "tests/test_runtime_containment_lab.py" in LAB_STEP["run"]   # containment, real daemon
+    assert "tests/test_runtime_containment_spec_lab.py" in LAB_STEP["run"]  # impostors
     assert LAB_JOB["env"]["CI_REQUIRE_SERVICES"] == ""
 
 

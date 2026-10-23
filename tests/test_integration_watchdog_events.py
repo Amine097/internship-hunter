@@ -14,8 +14,9 @@ fix that PR #13 made to the findings of the first QA review:
            running" while nothing is wrong.
   ADDR     a new host address (a rootful Docker bridge) is absorbed into the guard's policy without
            stopping the set, repeatedly, without latching the stack.
-  CONTRACT a container that merely CLAIMS to be an agent is not a project service (OPEN finding:
-           strict xfail, red today).
+  CONTRACT a container that merely CLAIMS to be an agent (labels, network) but carries privileges
+           the release never gave it is not a project service: the watchdog latches and stops it
+           (the spec check; the full matrix is tests/test_runtime_containment_spec_lab.py).
 
 Every fix has three kinds of evidence, none of which is "CI is green":
   * the behaviour itself, measured with an instrument that is independent of the one #13's own
@@ -313,14 +314,11 @@ def test_QUIET_negative_control_an_unfiltered_event_stream_is_caught(rig, use_mu
     assert cycles > 2, f"the mutant was not caught: only {cycles} cycles"
 
 
-# ---- CONTRACT (open) ----------------------------------------------------------------------------
-@pytest.mark.xfail(
-    strict=True,
-    reason="the assessor compares networks and four flags, not capabilities, mounts or devices",
-)
+# ---- CONTRACT -----------------------------------------------------------------------------------
 def test_CONTRACT_an_imposter_with_agent_labels_but_more_privilege_is_not_accepted(rig):
     """A container that claims to be agent-codex (same labels, same network) plus NET_ADMIN, no
-    seccomp and the host's root mounted: nothing the release declares."""
+    seccomp and the host's root mounted: nothing the release declares. It must be caught (the
+    security latch is set) AND the unauthorised container that was running must be stopped."""
     try:
         rig.run(
             ["docker", "run", "-d", "--name", "imposter",
@@ -330,13 +328,17 @@ def test_CONTRACT_an_imposter_with_agent_labels_but_more_privilege_is_not_accept
              "--security-opt", "seccomp=unconfined", "-v", "/:/host:ro",
              "alpine-local:3.20", "sleep", "600"]
         )  # fmt: skip
-        r = rig.once()
-        imposter_running = "imposter" in rig.run(["docker", "ps", "--format", "{{.Names}}"]).stdout
-        assert rig.latched() or not imposter_running, (
-            "the watchdog certified a container with CAP_NET_ADMIN and a host bind mount: "
-            + r.stdout[-300:]
-            + r.stderr[-300:]
+        assert "imposter" in rig.run(["docker", "ps", "--format", "{{.Names}}"]).stdout.split(), (
+            "the impostor never ran: the test would prove nothing"
         )
+        r = rig.once()
+        output = r.stdout[-300:] + r.stderr[-300:]
+        assert rig.latched(), (
+            "the watchdog certified a container with CAP_NET_ADMIN and a bind mount: " + output
+        )
+        assert "SPEC" in rig.latch_reason(), rig.latch_reason()
+        still_running = rig.run(["docker", "ps", "--format", "{{.Names}}"]).stdout.split()
+        assert "imposter" not in still_running, "the latch is set but the impostor keeps running"
     finally:
         rig.run(["docker", "rm", "-f", "imposter"], check=False)
 
