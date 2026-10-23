@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS node
+FROM node:25-bookworm-slim AS node
 FROM python:3.12-slim-bookworm
 ARG CLAUDE_CODE_VERSION=2.1.301
 ARG CODEX_VERSION=0.162.1
