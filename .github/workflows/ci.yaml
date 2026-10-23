@@ -185,6 +185,25 @@ jobs:
             echo "::error title=Security tests skipped::the rootless DNS lab skipped tests"
             exit 1
           fi
+      # The watchdog as a LONG-RUNNING process (`watch`, as systemd runs it) on the same real daemon:
+      # event latency, the cut-before-stop order, quiet healthchecks, locks and host-address drift,
+      # each with a control for its instrument and a mutant of the script that it must catch; and
+      # failure injected at an exact Docker call (crash mid-quarantine, a cut that always fails,
+      # guard tampering, locks between a deploy and the watchdog, a killed service restarted).
+      - name: Watchdog events, order, locks, drift and failure injection (a failure OR a skip fails the job)
+        shell: bash
+        env:
+          HUNTER_ROOTLESS_LAB: "1"
+          HUNTER_ROOTLESS_LAB_REQUIRED: "1"
+          HUNTER_LAB_LOG_DIR: ${{ runner.temp }}/lab-logs
+        run: |
+          set -euo pipefail
+          python -m pytest -q -rs -p no:cacheprovider tests/test_integration_watchdog_events.py \
+            tests/test_integration_containment_failure_injection.py | tee watchdog.log
+          if grep -qE '[0-9]+ (skipped|deselected)' watchdog.log; then
+            echo "::error title=Security tests skipped::the watchdog event tests skipped tests"
+            exit 1
+          fi
       - name: Daemon log on failure
         if: failure()
         run: |

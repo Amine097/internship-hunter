@@ -33,6 +33,15 @@ WIRED = [
         ["tests/test_integration_agent_sweep.py"],
         {"HUNTER_ROOTLESS_LAB": "1", "HUNTER_ROOTLESS_LAB_REQUIRED": "1"},
     ),
+    (
+        "rootless-dns-lab",
+        "Watchdog events, order, locks, drift and failure injection",
+        [
+            "tests/test_integration_watchdog_events.py",
+            "tests/test_integration_containment_failure_injection.py",
+        ],
+        {"HUNTER_ROOTLESS_LAB": "1", "HUNTER_ROOTLESS_LAB_REQUIRED": "1"},
+    ),
 ]
 
 
