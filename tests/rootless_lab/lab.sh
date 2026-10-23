@@ -7,6 +7,13 @@
 #
 #   lab.sh up      [dns]   start the daemon (optional daemon-level `dns`), write $LAB/env.sh
 #   lab.sh restart [dns]   stop and start it again (new network namespace, no guard)
+#
+# HUNTER_LAB_RESOLV_CONF=<file> is handed to the daemon as DOCKER_TEST_RESOLV_CONF_PATH (Docker's own
+# hook for tests; daemon.json has no such directive): the upstream resolvers that containers without
+# their own `dns` inherit. Without it Docker picks the host's /etc/resolv.conf, or
+# /run/systemd/resolve/resolv.conf when that names only the 127.0.0.53 stub (decided once, at daemon
+# start: every GitHub runner is the second case, WSL the first), so a test that needs a KNOWN upstream
+# must not depend on the machine it runs on. Docker logs "Using OriginResolvConfPath from env".
 #   lab.sh down
 #
 # Environment: HUNTER_LAB_DIR (state; default: a new mktemp dir, printed), HUNTER_LAB_CACHE
@@ -123,15 +130,36 @@ export PATH='$LAB/bin':\$PATH
 ENV
 }
 
+address_pool() { # the first candidate /16 that contains none of THIS host's IPv4 addresses
+  python3 - "$(hostname -I 2>/dev/null || true)" <<'PY'
+import ipaddress, sys
+mine = [ipaddress.ip_address(a) for a in sys.argv[1].split() if "." in a]
+for cand in ("198.19.0.0/16", "100.96.0.0/16", "10.217.0.0/16", "100.112.0.0/16"):
+    net = ipaddress.ip_network(cand)
+    if not any(a in net for a in mine):
+        print(cand)
+        break
+else:
+    sys.exit("no address pool free of the host's own addresses")
+PY
+}
+
 start() {
-  local dns="$1" j=""
+  local dns="$1" j="" pool
   [[ -z "$dns" ]] || j=", \"dns\": [\"$dns\"]"
+  # Docker's default pools (172.17-31/16) can cover the host's own address (WSL: 172.22.34.80,
+  # reached by the 6th compose network): a packet to the host then goes into that bridge instead
+  # of out of the uplink, which looks like a DNS or guard failure and is neither. The lab's
+  # bridges therefore live in a range the host does not use.
+  pool="$(address_pool)" || die "cannot choose an address pool"
+  j="$j, \"default-address-pools\": [{\"base\": \"$pool\", \"size\": 24}], \"bip\": \"${pool%.0.0/16}.255.1/24\""
   # cgroupfs: a CI runner has no systemd user session to hand cgroups to (limits are not under test)
   echo "{\"runtimes\": {\"runcw\": {\"path\": \"$LAB/bin/runcw\"}}, \"default-runtime\": \"runcw\", \"exec-opts\": [\"native.cgroupdriver=cgroupfs\"]$j}" \
     >"$LAB/home/.config/docker/daemon.json"
   (
     export XDG_RUNTIME_DIR="$XDG" HOME="$LAB/home" PATH="$LAB/bin:$PATH" DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns
     export DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS="--subid-source=dynamic"
+    [[ -z "${HUNTER_LAB_RESOLV_CONF:-}" ]] || export DOCKER_TEST_RESOLV_CONF_PATH="$HUNTER_LAB_RESOLV_CONF"
     exec setsid "$LAB/bin/dockerd-rootless.sh" --group root --config-file "$LAB/home/.config/docker/daemon.json" --data-root "$LAB/data" --host "unix://$XDG/docker.sock" \
       >"$LAB/dockerd.log" 2>&1
   ) &
