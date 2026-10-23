@@ -123,6 +123,12 @@ def test_the_sni_swap_evidence_is_from_this_run_only():
     assert "$RANDOM" in external
 
 
+def test_no_caller_of_the_removed_unclassified_probe_remains():
+    """`reach()` (every OSError = blocked) is gone, and nothing still calls it."""
+    assert "reach() {" not in SMOKE
+    assert not re.search(r"\$\(reach ", SMOKE)
+
+
 def test_errno_values_used_by_the_classifier_exist():
     for name in ("EHOSTUNREACH", "ENETUNREACH", "EACCES", "EPERM"):
         assert hasattr(errno, name)

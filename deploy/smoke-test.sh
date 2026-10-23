@@ -222,8 +222,10 @@ for k in DATABASE_URL ADMIN_TOKEN TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD REDIS_URL
 done
 ok "agent environment holds no infrastructure credentials"
 
+# by service NAME, as hunter/settings.py configures the orchestrator; only `open` is success
+out="$(probe discovery agent-claude-1:8100 agent-claude-2:8100 agent-codex:8100)"
 for a in agent-claude-1 agent-claude-2 agent-codex; do
-  [[ "$(reach discovery "$a:8100")" == REACHABLE ]] || fail "orchestrator cannot reach $a"
+  [[ "$(result_of "$out" "$a:8100")" == open ]] || fail "orchestrator cannot reach $a ($(result_of "$out" "$a:8100"))"
 done
 ok "orchestrator reaches every agent runner"
 
