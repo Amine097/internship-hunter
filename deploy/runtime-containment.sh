@@ -461,7 +461,21 @@ quarantine() { # quarantine <latch 0|1> <reason>: latch (if any), cut hostile en
   fi
 }
 guard_apply_verified() { # re-apply the guard (idempotent; the daemon's own ExecStartPost call) and verify the FULL policy
-  nolock "$GUARD" apply --wait 20 >/dev/null 2>&1 && nolock "$GUARD" status >/dev/null 2>&1
+  # The host can change its addresses again between the apply and the verification (a rootful Docker bridge
+  # created and removed in quick succession): status exit 3 right after an apply is another address-only drift,
+  # not a failed repair, so apply again (a few times); anything else is a failure.
+  local out attempt rc
+  for attempt in 1 2 3 4; do
+    if ! out="$(nolock "$GUARD" apply --wait 20 2>&1)"; then
+      log CRIT GUARD-APPLY-FAILED "host-egress-guard.sh apply: $(tr '\n' ' ' <<<"$out" | cut -c1-300)"; return 1
+    fi
+    rc=0; out="$(nolock "$GUARD" status 2>&1)" || rc=$?
+    [[ "$rc" == 0 ]] && return 0
+    [[ "$rc" == 3 ]] && continue
+    log CRIT GUARD-VERIFY-FAILED "host-egress-guard.sh status after apply: $(tr '\n' ' ' <<<"$out" | cut -c1-300)"; return 1
+  done
+  log CRIT GUARD-VERIFY-FAILED "the host address set kept changing during $attempt apply attempts: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
+  return 1
 }
 SUPERVISED_ALL=()
 load_supervised() { mapfile -t SUPERVISED_ALL < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["services"]
@@ -627,22 +641,30 @@ cycle_pass() { # one pass; 0 healthy/waiting, 1 acted on a violation, 2 unverifi
     addr_only=0
     [[ ${#PROBLEMS[@]} -eq 1 && "${PROBLEMS[0]}" == GUARD-ADDR\ * ]] && addr_only=1
     [[ ${#PROBLEMS[@]} -eq 1 && "${PROBLEMS[0]}" == GUARD\ * ]] && only_guard=1
-    if [[ "$addr_only" == 1 ]]; then
-      # The only difference is the set of host addresses the guard names: a rootful Docker bridge or an
-      # interface address came or went. `apply` fixes it in about a second - quicker than `docker stop`'s own
-      # grace period - so stopping the set first would add an outage without closing the gap any sooner. Repair
-      # and verify FIRST; stop only if the repair does not hold. A repaired drift is not a flap.
+    # The only difference is the set of host addresses the guard names: a rootful Docker bridge or an interface
+    # address came or went. `apply` fixes it in about a second - quicker than `docker stop`'s own grace period -
+    # so stopping the set first would add an outage without closing the gap any sooner. Repair and verify
+    # FIRST; stop only if the repair does not hold. A repaired drift is not a flap. The host may move again
+    # while we look (a refresh takes seconds): a fresh address-only drift is repaired again, a few times.
+    local round=0
+    while [[ "$addr_only" == 1 ]]; do
       need_lock || return $?
+      if (( round++ >= 3 )); then
+        log CRIT GUARD-UNREPAIRABLE "the host address set keeps changing: stopping the supervised set"
+        only_guard=1; break
+      fi
       if guard_apply_verified; then
         log INFO GUARD-ADDRESS-ABSORBED "host address set changed; host-egress-guard.sh apply updated the policy ($(tr '\n' ' ' <<<"${PROBLEMS[0]#GUARD-ADDR }" | cut -c1-160))"
         repaired=1
         refresh "$([[ ${#SUP_IDS[@]} -eq 0 ]] && echo 1 || echo 0)" || { set_state unverified "docker unavailable"; return 2; }
         problems_now
+        addr_only=0
+        [[ ${#PROBLEMS[@]} -eq 1 && "${PROBLEMS[0]}" == GUARD-ADDR\ * ]] && addr_only=1
       else
         log CRIT GUARD-UNREPAIRABLE "host address drift could not be absorbed by host-egress-guard.sh apply: stopping the supervised set"
-        only_guard=1
+        only_guard=1; break
       fi
-    fi
+    done
     if [[ ${#PROBLEMS[@]} -gt 0 ]]; then
       # a structural guard problem, a missing prerequisite, a soft finding: stop what runs, repair what can be repaired
       need_lock || return $?

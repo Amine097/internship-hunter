@@ -432,8 +432,12 @@ class Watcher:
         env = {**rig.env(), **rig.wenv()}
         if path_prefix:
             env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
+        launcher = ["bash"]
+        if os.environ.get("REV_TRACE"):  # debugging aid: xtrace of the watchdog into a file
+            trace = 'exec 19>>"$1"; export BASH_XTRACEFD=19; shift; exec bash -x "$@"'
+            launcher = ["bash", "-c", trace, "x", os.environ["REV_TRACE"]]
         self.proc = subprocess.Popen(
-            ["bash", str(CONTAINMENT), "watch", "--interval", str(interval)],
+            launcher + [str(CONTAINMENT), "watch", "--interval", str(interval)],
             env=env,
             stdout=self.log,
             stderr=subprocess.STDOUT,
@@ -549,6 +553,8 @@ def ip_shim(tmp_path, address):
         "#!/bin/sh\n"
         f'out=$({real.stdout.strip()} "$@"); rc=$?\n'
         '[ -n "$out" ] && printf \'%s\\n\' "$out"\n'
+        f'[ "$*" = "-4 -o addr show scope global" ] && '
+        f'echo "$(date +%T.%N) flag=$([ -e {flag} ] && echo 1 || echo 0)" >> {d}/calls\n'
         f'if [ -e {flag} ] && [ "$*" = "-4 -o addr show scope global" ]; then\n'
         f"  echo '99: br-qa    inet {address}/24 brd 255.255.255.255 scope global br-qa'\n"
         "fi\n"
@@ -558,26 +564,32 @@ def ip_shim(tmp_path, address):
     return d, flag
 
 
-def test_ADDR_new_host_addresses_are_absorbed_three_times_while_the_set_keeps_running(
-    rig, tmp_path
-):
+def test_ADDR_three_new_host_addresses_are_absorbed_while_the_set_keeps_running(rig, tmp_path):
     d, flag = ip_shim(tmp_path, "172.31.77.1")  # what a rootful docker network create does
     w = watching(rig, 5, str(d))
+
+    def in_policy():
+        return "-d 172.31.77.1/32" in rig.netns("iptables", "-S", "HUNTER-EGRESS-GUARD").stdout
+
+    def diag():
+        return (d / "calls").read_text()[-1200:] + rig.log()[-6000:]
+
     try:
         full = len(rig.supervised_running())
         assert full == len(SUPERVISED)
         lowest = full
-        for i in range(1, 4):  # the old watchdog latched the stack on the third change
+        for _ in range(3):  # the old watchdog latched the stack on the third change
             flag.write_text("")
-            assert wait_for(lambda: rig.log().count("GUARD-ADDRESS-ABSORBED") >= i, 40), rig.log()
+            assert wait_for(in_policy, 40), diag()
             lowest = min(lowest, len(rig.supervised_running()))
-            assert (
-                rig.guard("status").returncode == 0
-            )  # the applied policy matches the new address set
-            flag.unlink()
-            time.sleep(2)  # the next cycle sees the address gone: stale again, absorbed again
-        assert lowest == full, f"the set dropped to {lowest}/{full}"
+            time.sleep(7)  # a human-paced change, not a flip after every apply
+            flag.unlink()  # ... and the address going away is a change too
+            assert wait_for(lambda: not in_policy(), 40), diag()
+            lowest = min(lowest, len(rig.supervised_running()))
+            time.sleep(7)
+        assert lowest == full, f"the set dropped to {lowest}/{full}:\n" + diag()
         assert not rig.latched() and not (rig.state_dir / "flaps").exists()
+        assert rig.log().count("GUARD-ADDRESS-ABSORBED") >= 6
     finally:
         w.stop()
 

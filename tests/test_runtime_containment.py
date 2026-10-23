@@ -204,7 +204,13 @@ GUARD = textwrap.dedent("""\
               fi
               echo active ;;
       apply)  [[ -e "$STUB_DIR/guard_unrepairable" ]] && exit 1
-              rm -f "$STUB_DIR/guard_broken" "$STUB_DIR/guard_stale"; echo applied ;;
+              rm -f "$STUB_DIR/guard_broken" "$STUB_DIR/guard_stale"
+              # "the host moved again right after the apply": the next N applies are overtaken
+              if [[ -s "$STUB_DIR/guard_restale" ]]; then
+                n="$(cat "$STUB_DIR/guard_restale")"; echo $((n - 1)) > "$STUB_DIR/guard_restale"
+                [[ "$n" -gt 0 ]] && : > "$STUB_DIR/guard_stale"
+              fi
+              echo applied ;;
     esac
 """)
 ISOLATION = textwrap.dedent("""\
@@ -1567,3 +1573,22 @@ def test_QUIET_the_event_stream_is_filtered_to_lifecycle_events():
     for ev in ("create", "start", "die", "destroy", "connect", "disconnect"):
         assert f"--filter event={ev}" in line, ev
     assert "exec_" not in line and "health_status" not in line
+
+
+def test_ADDR_the_host_moving_again_right_after_the_apply_is_not_a_failed_repair(rig):
+    rig.flag("guard_stale")
+    (rig.stub / "guard_restale").write_text("2")  # the next two applies are overtaken
+    r = rig.once()
+    assert r.returncode == 0, r.stderr
+    assert rig.mutating_calls() == [] and all(rig.is_running(s) for s in SUPERVISED)
+    assert "GUARD-ADDRESS-ABSORBED" in rig.log and "GUARD-VERIFY-FAILED" not in rig.log
+    assert [e for e in rig.events if e.startswith("guard apply")].__len__() == 3
+
+
+def test_ADDR_a_host_that_never_stops_changing_ends_in_a_quarantine_not_a_loop(rig):
+    rig.flag("guard_stale")
+    (rig.stub / "guard_restale").write_text("99")
+    r = rig.once()
+    assert r.returncode == 1 and stopped_all_supervised(rig)
+    assert "kept changing" in rig.log
+    assert len([e for e in rig.events if e.startswith("guard apply")]) <= 12   # bounded
