@@ -164,3 +164,27 @@ def test_remove_restores_dockers_own_rules_exactly(stages):
     assert "status inactive" in stages["_"]
     assert stages["removed"] == stages["before"]
     assert "leftover_rules 0" in stages["_"]
+
+
+def _statusrc(stages, name):
+    line = next(ln for ln in stages["_"] if ln.startswith(f"statusrc_{name} "))
+    return int(line.split()[1])
+
+
+def test_host_address_drift_alone_is_reported_with_its_own_exit_code(stages):
+    """exit 3 = the policy is intact and only the set of host addresses it names is stale: what a
+    rootful
+    Docker bridge coming or going does. deploy/runtime-containment.sh re-applies instead of
+    stopping the stack."""
+    # a host address nobody blocks any more
+    assert _statusrc(stages, "delete_host_address_reject") == 3
+    # a rule for an address the host no longer has
+    assert _statusrc(stages, "extra_host_address_reject") == 3
+    for name in ("delete_host_address_reject", "extra_host_address_reject"):
+        assert f"repair_{name} ok" in stages["_"], name             # `apply` fixes it
+
+
+def test_every_structural_tampering_is_still_exit_1_never_3(stages):
+    for name in TAMPERS + ["docker_jump_displaced", "address_drift_plus_accept"]:
+        assert _statusrc(stages, name) == 1, name
+    assert "repair_address_drift_plus_accept ok" in stages["_"]

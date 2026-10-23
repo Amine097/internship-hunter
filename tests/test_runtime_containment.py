@@ -18,6 +18,7 @@ import fcntl
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import textwrap
@@ -69,6 +70,9 @@ DOCKER = textwrap.dedent("""\
         sys.exit(1)
     if os.path.exists(D + "/docker_hang") and args[0] in ("ps", "info"):
         time.sleep(120)
+    if args[0] in ("ps", "inspect") and os.environ.get("STUB_DOCKER_DELAY"):
+        # a slow daemon: cycles that take a while
+        time.sleep(float(os.environ["STUB_DOCKER_DELAY"]))
     def load(): return json.load(open(ST))
     def save(s): json.dump(s, open(ST, "w"))
     def labels(c):
@@ -112,6 +116,13 @@ DOCKER = textwrap.dedent("""\
                 os.remove(D + "/events.trigger"); print("network connect", flush=True)
             time.sleep(0.1)
     s = load()
+    # "a deploy replaced the containers meanwhile"
+    if verb == "ps" and os.environ.get("STUB_HEAL_AT_PS_CALL"):
+        n = int(open(D + "/ps.count").read()) + 1 if os.path.exists(D + "/ps.count") else 1
+        open(D + "/ps.count", "w").write(str(n))
+        if n == int(os.environ["STUB_HEAL_AT_PS_CALL"]):
+            s["containers"]["c-agent-codex"]["nets"] = ["net-agent_codex"]
+            save(s)
     if verb == "ps":
         want = [f.split("=", 1)[1] for f in flt(args) if f.startswith("label=")]
         everything = any(a in ("-a", "-aq") for a in args)
@@ -134,12 +145,21 @@ DOCKER = textwrap.dedent("""\
             print(json.dumps([network_json(s, n) for n in args[2:]])); sys.exit(0)
         if args[1] == "disconnect":
             net, cid = args[-2], args[-1]
+            latch = os.environ.get("STUB_LATCH_PATH", "")
+            open(D + "/events.log", "a").write(
+                "note disconnect latch_present=%s\\n" % (bool(latch) and os.path.exists(latch)))
             if os.path.exists(D + "/disconnect_fails"):
                 sys.exit(1)
             if net in s["containers"][cid]["nets"]:
                 s["containers"][cid]["nets"].remove(net)
             save(s); sys.exit(0)
     if verb in ("stop", "kill"):
+        # the test kills the script now
+        if verb == "stop" and os.path.exists(D + "/crash_on_stop"):
+            open(D + "/crash_marker", "w").write("stopping")
+            time.sleep(60)
+        if verb == "stop" and os.path.exists(D + "/slow_stop"):
+            time.sleep(float(open(D + "/slow_stop").read() or 2))
         ids = [a for a in args[1:] if not a.startswith("-") and not a.isdigit()]
         for cid in ids:
             s["containers"][cid]["running"] = False
@@ -179,9 +199,12 @@ GUARD = textwrap.dedent("""\
     echo "guard $*" >> "$STUB_DIR/events.log"
     case "$1" in
       status) if [[ -e "$STUB_DIR/guard_broken" ]]; then echo "NOT active: stub says so"; exit 1; fi
+              if [[ -e "$STUB_DIR/guard_stale" ]]; then
+                echo "NOT active (stale host addresses only; re-run apply): stub"; exit 3
+              fi
               echo active ;;
       apply)  [[ -e "$STUB_DIR/guard_unrepairable" ]] && exit 1
-              rm -f "$STUB_DIR/guard_broken"; echo applied ;;
+              rm -f "$STUB_DIR/guard_broken" "$STUB_DIR/guard_stale"; echo applied ;;
     esac
 """)
 ISOLATION = textwrap.dedent("""\
@@ -238,6 +261,7 @@ class Rig:
             d.mkdir(parents=True, exist_ok=True)
         (self.base / "shared" / ".env").write_text("X=1\n")
         self.lock = self.base / "state" / "deploy.lock"
+        self.action_lock = self.base / "state" / "containment.action.lock"
         self.state_dir = self.base / "state" / "containment"
         for name, body in (
             ("host-egress-guard.sh", GUARD),
@@ -374,6 +398,7 @@ class Rig:
             "HUNTER_CONTAINMENT_DOCKER_TIMEOUT": "5",
             "HUNTER_CONTAINMENT_START_TIMEOUT": "5",
             "XDG_RUNTIME_DIR": str(self.tmp / "xdg"),
+            "STUB_LATCH_PATH": str(self.state_dir / "latch"),
         }
         e.update(extra)
         return e
@@ -387,11 +412,31 @@ class Rig:
             timeout=timeout,
         )
 
-    def under_deploy_lock(self, *argv, **extra):
-        """Run a command the way remote-deploy.sh does: while it holds deploy.lock."""
+    def deploy_locks(self):
+        """What remote-deploy.sh holds for the whole of a deploy: deploy.lock (one deploy at a
+        time) AND the
+        watchdog's action lock. Returns a context manager; the truncating open stamps the lock's
+        mtime."""
         self.lock.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.lock, "w") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
+        rig = self
+
+        class Held:
+            def __enter__(self):
+                self.a = open(rig.lock, "w")
+                fcntl.flock(self.a, fcntl.LOCK_EX)
+                self.b = open(rig.action_lock, "w")
+                fcntl.flock(self.b, fcntl.LOCK_EX)
+                return self
+
+            def __exit__(self, *exc):
+                self.b.close()
+                self.a.close()
+
+        return Held()
+
+    def under_deploy_lock(self, *argv, **extra):
+        """Run a command the way remote-deploy.sh does: while it holds both of its locks."""
+        with self.deploy_locks():
             return self.run(*argv, **extra)
 
     def commit(self, **extra):
@@ -906,8 +951,7 @@ def test_a_stack_the_deploy_stopped_stays_stopped_without_alarm(rig):
 
 def test_while_a_deploy_holds_the_lock_nothing_is_touched(rig):
     rig.attach("agent-codex", "egress_claude_1")  # a violation that WOULD latch
-    with open(rig.lock, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+    with rig.deploy_locks():
         r = rig.once()
     assert r.returncode == 0 and rig.state.startswith("paused")
     assert rig.mutating_calls() == [] and not rig.latched
@@ -917,10 +961,9 @@ def test_while_a_deploy_holds_the_lock_nothing_is_touched(rig):
 
 def test_a_deploy_lock_held_for_too_long_is_a_hung_deploy_and_does_not_disable_containment(rig):
     rig.attach("agent-codex", "egress_claude_1")
-    with open(rig.lock, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+    with rig.deploy_locks():
         old = time.time() - 7200
-        os.utime(rig.lock, (old, old))
+        os.utime(rig.action_lock, (old, old))
         r = rig.once(HUNTER_CONTAINMENT_MAX_DEPLOY_PAUSE="600")
     assert r.returncode == 1 and rig.latched and "DEPLOY-LOCK" in rig.log
 
@@ -1071,8 +1114,10 @@ def test_the_loop_reacts_to_a_docker_event_long_before_the_next_poll(rig):
         rig.attach("agent-codex", "egress_claude_1")
         (rig.stub / "events.trigger").write_text("")  # `docker events` reports a connect
         deadline = time.time() + 15
-        while time.time() < deadline and not rig.latched:
-            time.sleep(0.1)
+        while time.time() < deadline and not (rig.latched and stopped_all_supervised(rig)):
+            time.sleep(
+                0.1
+            )  # the latch is written FIRST (crash safety); the cut and the stop follow
         assert rig.latched and stopped_all_supervised(rig)
     finally:
         p.terminate()
@@ -1183,3 +1228,342 @@ def test_the_script_reports_to_systemd_every_cycle_and_while_waiting_for_a_slow_
     # the long waits keep the heartbeat alive, otherwise WatchdogSec would kill a slow start
     wait = text[text.index("healthy_wait()") : text.index("start_services()")]
     assert "beat" in wait
+
+
+# ============ PR #13 re-review: locks, address drift, quarantine order, commit --check ============
+def try_flock(path, wait=0.0):
+    """True if the lock was free (taken and released at once); with `wait`, if it became free in
+    time."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    try:
+        end = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return True
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    return False
+                time.sleep(0.02)
+    finally:
+        os.close(fd)
+
+
+def watching(rig, interval=1, **env):
+    return subprocess.Popen(
+        ["bash", str(SCRIPT), "watch", "--interval", str(interval)],
+        env=rig.env(**env),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def stop_watching(p):
+    p.terminate()
+    p.wait(timeout=10)
+
+
+# ---- 1. LOCK: a deploy must never be refused because the watchdog is checking ----
+def test_LOCK_a_running_watchdog_never_makes_a_deploy_lock_attempt_fail(rig):
+    """What remote-deploy.sh does first is `flock -n` on deploy.lock. With a slow daemon (every
+    cycle takes
+    ~1 s) and a 1 s interval the old watchdog held that lock for most of the time (87% refused in
+    the QA lab)."""
+    p = watching(rig, interval=1, STUB_DOCKER_DELAY="0.4")
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline and not (rig.state_dir / "state").exists():
+            time.sleep(0.1)
+        attempts = refused_deploy = refused_action = 0
+        end = time.monotonic() + 8
+        while time.monotonic() < end:
+            attempts += 1
+            refused_deploy += not try_flock(rig.lock)
+            refused_action += not try_flock(rig.action_lock)
+            time.sleep(0.05)
+    finally:
+        stop_watching(p)
+    assert attempts > 50
+    assert refused_deploy == 0, f"{refused_deploy}/{attempts} deploy-lock attempts found it taken"
+    assert refused_action == 0, (
+        f"{refused_action}/{attempts} action-lock attempts: a healthy cycle must take no lock"
+    )
+
+
+def test_LOCK_the_watchdog_acts_under_the_action_lock_only_and_a_deploy_waits_for_it(rig):
+    """While the watchdog is stopping the set it holds the ACTION lock (a deploy waits for it)
+    and never the
+    deploy lock (a second deploy is still told 'another deploy is running' by flock -n on ITS
+    lock, not by us)."""
+    rig.attach("agent-codex", "egress_claude_1")
+    (rig.stub / "slow_stop").write_text("3")
+    p = subprocess.Popen(
+        ["bash", str(SCRIPT), "once"],
+        env=rig.env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.time() + 15
+        while time.time() < deadline and not any("docker stop" in e for e in rig.events):
+            time.sleep(0.05)
+        assert any("docker stop" in e for e in rig.events), "the watchdog never reached its stop"
+        assert try_flock(rig.lock), "the watchdog holds the DEPLOY lock while it acts"
+        assert not try_flock(rig.action_lock), "an action in flight must hold the action lock"
+        t0 = time.monotonic()
+        assert try_flock(rig.action_lock, wait=20), "the action lock was never released"
+        print(f"\ndeploy waited {time.monotonic() - t0:.1f}s for the in-flight action")
+    finally:
+        p.wait(timeout=30)
+    assert rig.latched and stopped_all_supervised(rig)
+
+
+def test_LOCK_a_decision_is_remade_on_a_fresh_snapshot_after_the_lock_was_taken(rig):
+    """The first observation sees a hot attachment; by the time the watchdog holds the lock a
+    deploy has
+    replaced the containers and the endpoint is gone. It must NOT latch on the stale observation."""
+    rig.attach("agent-codex", "egress_claude_1")
+    r = rig.once(
+        STUB_HEAL_AT_PS_CALL="2"
+    )  # the 2nd `docker ps` (after the lock) sees a clean stack
+    assert r.returncode == 0, r.stderr
+    assert not rig.latched and all(rig.is_running(s) for s in SUPERVISED)
+    assert rig.mutating_calls() == []
+
+
+def test_LOCK_a_busy_action_lock_makes_the_cycle_yield_without_touching_anything(rig):
+    rig.attach("agent-codex", "egress_claude_1")
+    with rig.deploy_locks():
+        r = rig.once()
+    assert r.returncode == 0 and rig.state.startswith("paused")
+    assert rig.mutating_calls() == [] and not rig.latched
+
+
+def test_LOCK_reset_waits_briefly_for_the_action_lock_and_then_says_why_it_failed(rig):
+    rig.attach("agent-codex", "egress_claude_1")
+    rig.once()
+    assert rig.latched
+    with open(rig.action_lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        t0 = time.monotonic()
+        r = rig.run("reset", timeout=60)
+    assert r.returncode == 4 and "action lock is held" in r.stderr
+    assert (
+        "or the watchdog is stopping/starting" in r.stderr
+    )  # no longer claims a deploy is the only reason
+    assert time.monotonic() - t0 >= 25
+
+
+# ---- 2. ADDR: a host-address change is absorbed, not an outage ----
+def test_ADDR_a_stale_host_address_set_is_absorbed_without_stopping_anything(rig):
+    rig.flag("guard_stale")
+    r = rig.once()
+    assert r.returncode == 0, r.stderr
+    assert rig.mutating_calls() == [] and all(rig.is_running(s) for s in SUPERVISED)
+    assert "GUARD-ADDRESS-ABSORBED" in rig.log and not rig.latched
+    assert not (rig.state_dir / "flaps").exists()
+    assert any(e == "guard apply --wait 20" for e in rig.events)
+    assert rig.state.startswith("ok")
+
+
+def test_ADDR_the_repair_is_verified_before_the_cycle_is_declared_healthy(rig):
+    rig.flag("guard_stale")
+    rig.once()
+    ev = rig.events
+    applied = max(i for i, e in enumerate(ev) if e.startswith("guard apply"))
+    assert any(e == "guard status" for e in ev[applied + 1 :]), ev
+
+
+def test_ADDR_ten_address_changes_never_latch_the_stack(rig):
+    for _ in range(10):
+        rig.flag("guard_stale")
+        assert rig.once().returncode == 0
+    assert not rig.latched and not (rig.state_dir / "flaps").exists()
+    assert all(rig.is_running(s) for s in SUPERVISED)
+    assert rig.log.count("GUARD-ADDRESS-ABSORBED") == 10
+
+
+def test_ADDR_if_the_repair_does_not_hold_the_set_is_stopped_after_all(rig):
+    rig.flag("guard_stale")
+    rig.flag("guard_unrepairable")
+    r = rig.once()
+    assert r.returncode == 1 and stopped_all_supervised(rig)
+    assert "GUARD-UNREPAIRABLE" in rig.log and "QUARANTINE" in rig.log
+    assert not rig.latched  # one failed repair is a quarantine, not an incident
+    rig.flag("guard_unrepairable", False)
+    rig.once()
+    assert all(rig.is_running(s) for s in SUPERVISED)
+
+
+def test_ADDR_a_structural_guard_problem_is_still_stop_first(rig):
+    """Tampered or missing rules (exit 1, not 3) keep the earlier behaviour: stop, repair,
+    verify, restart."""
+    rig.flag("guard_broken")
+    rig.once()
+    ev = [e for e in rig.events if e.startswith(("guard apply", "docker stop"))]
+    assert ev.index(next(e for e in ev if e.startswith("docker stop"))) < ev.index(
+        "guard apply --wait 20"
+    )
+
+
+def test_ADDR_address_drift_next_to_another_problem_is_not_waved_through(rig):
+    rig.flag("guard_stale")
+    rig.flag("targets_down")  # irrelevant while running, so only the drift remains...
+    assert rig.once().returncode == 0
+    (rig.base / "deploy" / "host-egress-guard.conf").write_text(
+        "DNS=1.1.1.1\n"
+    )  # ...but a DNS-CONF problem too
+    rig.flag("guard_stale")
+    r = rig.once()
+    assert r.returncode == 1 and stopped_all_supervised(rig)
+
+
+# ---- 3. ORDER: latch, cut the hostile route, then stop ----
+def test_ORDER_the_hostile_endpoint_is_removed_before_anything_is_stopped(rig):
+    rig.attach("agent-codex", "egress_claude_1")
+    rig.once()
+    ev = rig.events
+    cut = next(i for i, e in enumerate(ev) if "network disconnect" in e)
+    stop = next(i for i, e in enumerate(ev) if e.startswith("docker stop"))
+    assert cut < stop, ev
+    assert stopped_all_supervised(rig) and rig.latched
+
+
+def test_ORDER_the_intent_is_on_disk_before_the_first_docker_mutation(rig):
+    rig.attach("agent-codex", "egress_claude_1")
+    rig.once()
+    assert "note disconnect latch_present=True" in rig.events
+
+
+def test_ORDER_the_same_holds_when_the_latch_is_already_set_and_someone_attaches_again(rig):
+    rig.attach("agent-codex", "egress_claude_1")
+    rig.once()
+    rig.clear_events()
+    rig.mutate(lambda s: s["containers"]["c-api"].update(running=True))
+    rig.attach("api", "agent_codex")
+    rig.once()
+    ev = rig.events
+    cut = next(i for i, e in enumerate(ev) if "network disconnect" in e)
+    stop = next(i for i, e in enumerate(ev) if e.startswith("docker stop"))
+    assert cut < stop, ev
+
+
+def test_ORDER_an_endpoint_that_cannot_be_removed_gets_its_container_killed_and_the_set_still_stops(
+    rig,
+):
+    rig.attach("agent-codex", "egress_claude_1")
+    rig.flag("disconnect_fails")
+    r = rig.once()
+    assert r.returncode == 1 and rig.latched
+    assert stopped_all_supervised(rig)
+    assert "DISCONNECT-FAILED" in rig.log and "KILLED" in rig.log
+    assert "could NOT be removed" in rig.log
+    ev = rig.events
+    kill = next(i for i, e in enumerate(ev) if e.startswith("docker kill"))
+    stop = next(i for i, e in enumerate(ev) if e.startswith("docker stop"))
+    assert kill < stop
+
+
+def test_ORDER_a_foreign_endpoint_that_cannot_be_removed_does_not_get_its_container_killed(rig):
+    rig.mutate(lambda s: s["containers"]["c-adhoc"]["nets"].append("net-agent_codex"))
+    rig.flag("disconnect_fails")
+    rig.once()
+    assert rig.latched and stopped_all_supervised(rig)
+    assert rig.docker_state()["containers"]["c-adhoc"]["running"] is True  # not ours: left alone
+    assert "KILLED" not in rig.log
+
+
+def test_ORDER_a_crash_between_the_cut_and_the_stop_does_not_fail_open(rig):
+    """The process dies while `docker stop` is running. The extra endpoint is already gone, so
+    the evidence that
+    caused the latch has vanished: only the durable latch makes the next cycle finish the job."""
+    rig.attach("agent-codex", "egress_claude_1")
+    (rig.stub / "crash_on_stop").write_text("")
+    p = subprocess.Popen(
+        ["bash", str(SCRIPT), "once"],
+        env=rig.env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.time() + 15
+    while time.time() < deadline and not (rig.stub / "crash_marker").exists():
+        time.sleep(0.05)
+    assert (rig.stub / "crash_marker").exists()
+    os.killpg(p.pid, signal.SIGKILL)  # the script and its docker stub die mid-stop
+    p.wait(timeout=10)
+    assert (
+        "net-egress_claude_1" not in rig.docker_state()["containers"]["c-agent-codex"]["nets"]
+    )  # evidence gone
+    assert rig.latched  # ... but the intent survived
+    assert not stopped_all_supervised(rig)  # (nothing was stopped yet)
+    (rig.stub / "crash_on_stop").unlink()
+    r = rig.once()
+    assert r.returncode == 1 and stopped_all_supervised(rig) and rig.latched
+
+
+# ---- 4. commit --check: could this release be put under containment? (read-only, no lock) ----
+def test_commit_check_accepts_a_committable_release_and_writes_nothing(tmp_path):
+    r = Rig(tmp_path)
+    out = r.run(
+        "commit",
+        "--check",
+        "--sha",
+        SHA,
+        "--release-dir",
+        str(r.base / "releases" / SHA),
+        "--",
+        *r.args,
+    )
+    assert out.returncode == 0 and "can be put under runtime containment" in out.stdout, out.stderr
+    assert not (r.state_dir / "contract.json").exists() and not (r.state_dir / "desired").exists()
+
+
+@pytest.mark.parametrize("svc", ["api", "egress-codex", "agent-codex"])
+def test_commit_check_refuses_a_release_that_predates_containment_without_changing_anything(
+    tmp_path, svc
+):
+    r = Rig(tmp_path)
+    out = r.run(
+        "commit",
+        "--check",
+        "--sha",
+        SHA,
+        "--release-dir",
+        str(r.base / "releases" / SHA),
+        "--",
+        *r.args,
+        STUB_RESTART=f"{svc}=unless-stopped",
+    )
+    assert out.returncode == 11 and f"{svc} renders restart=unless-stopped" in out.stderr
+    assert not (r.state_dir / "contract.json").exists()
+
+
+def test_commit_check_needs_no_deploy_lock_and_does_not_disturb_a_committed_release(rig):
+    before = (rig.state_dir / "contract.json").read_text()
+    out = rig.run(
+        "commit",
+        "--check",
+        "--sha",
+        "b" * 40,
+        "--release-dir",
+        str(rig.base / "releases" / SHA),
+        "--",
+        *rig.args,
+        STUB_RESTART="api=unless-stopped",
+    )
+    assert out.returncode == 11
+    assert (rig.state_dir / "contract.json").read_text() == before
+
+
+# ---- QUIET: only lifecycle events wake the loop (a healthcheck run is not news) ----
+def test_QUIET_the_event_stream_is_filtered_to_lifecycle_events():
+    text = SCRIPT.read_text()
+    line = text[text.index("docker events") : text.index("--format", text.index("docker events"))]
+    for ev in ("create", "start", "die", "destroy", "connect", "disconnect"):
+        assert f"--filter event={ev}" in line, ev
+    assert "exec_" not in line and "health_status" not in line

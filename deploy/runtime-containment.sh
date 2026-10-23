@@ -80,7 +80,9 @@ else
   # helpers this script trusts, and a fixed PATH
   unset BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PYTHONPATH PYTHONHOME PYTHONSTARTUP \
         PYTHONUSERBASE PYTHONINSPECT HUNTER_BASE HUNTER_GUARD_PROC HUNTER_GUARD_TEST_MODE \
-        HUNTER_GUARD_TEST_NSFS_TYPE HUNTER_DNS HUNTER_TEST_MODE DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG
+        HUNTER_GUARD_TEST_NSFS_TYPE HUNTER_DNS HUNTER_TEST_MODE DOCKER_HOST DOCKER_CONTEXT DOCKER_CONFIG \
+        HUNTER_CONTAINMENT_DOCKER_TIMEOUT HUNTER_CONTAINMENT_HEARTBEAT_MAX_AGE HUNTER_CONTAINMENT_MAX_DEPLOY_PAUSE \
+        HUNTER_CONTAINMENT_RESTART_BACKOFF HUNTER_CONTAINMENT_START_TIMEOUT
   for v in $(compgen -e | grep -E '^(SMOKE_|COMPOSE_|EGRESS_)' || true); do unset "$v"; done
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   export PATH
@@ -93,6 +95,7 @@ GUARD_CONF="$BASE/deploy/host-egress-guard.conf"
 ISOLATION_CONF="$BASE/deploy/host-isolation.conf"
 STATE="$BASE/state/containment"
 DEPLOY_LOCK="$BASE/state/deploy.lock"
+ACTION_LOCK="$BASE/state/containment.action.lock"
 PROJECT=internship-hunter
 INTERVAL=10
 DOCKER_TIMEOUT="${HUNTER_CONTAINMENT_DOCKER_TIMEOUT:-25}"
@@ -112,7 +115,10 @@ if [[ "$TEST_MODE" == 0 ]]; then
   RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$MYUID}"
   export DOCKER_HOST="unix://$RUNTIME_DIR/docker.sock"
 fi
-docker() { timeout "$DOCKER_TIMEOUT" docker "$@"; }
+# Children never inherit the action lock descriptor: an orphaned or hung child would otherwise keep the lock
+# (flock follows the open file description) for as long as it lives, long after this process died.
+nolock() { if [[ -n "${ACT_FD:-}" && "$ACT_FD" != none ]]; then "$@" {ACT_FD}<&-; else "$@"; fi; }
+docker() { nolock timeout "$DOCKER_TIMEOUT" docker "$@"; }
 
 trusted_file() { # a regular, non-symlink file owned by root (the test user in test mode), not writable by others
   local want_uid=0 owner mode; [[ "$TEST_MODE" == 1 ]] && want_uid="$MYUID"
@@ -178,7 +184,7 @@ daemon_resolvers() { # the upstream resolvers of the daemon itself (what a conta
 # ---- the assessor: contract + Docker's own description of the containers and networks -------------------------
 # Pure function of its inputs: prints one record per line, tab separated:
 #   F <LEVEL> <LATCH 0|1> <ID> <message>     a finding (LEVEL CRIT|WARN)
-#   A disconnect <network id> <container id> <what>
+#   A disconnect <network id> <container id> <what> <owner project|foreign>
 #   SUP <container id> <service>             supervised (or unknown project) containers that RUN
 #   MISSING <service>                        supervised services of the contract that are not running
 ASSESS="$(cat <<'PY'
@@ -192,7 +198,7 @@ S = contract["services"]
 LP, LS, LN = "com.docker.compose.project", "com.docker.compose.service", "com.docker.compose.network"
 out = []
 def find(level, latch, ident, msg): out.append("F\t%s\t%d\t%s\t%s" % (level, latch, ident, msg.replace("\t", " ").replace("\n", " ")))
-def act(netid, cid, what): out.append("A\tdisconnect\t%s\t%s\t%s" % (netid, cid, what))
+def act(netid, cid, what, owner): out.append("A\tdisconnect\t%s\t%s\t%s\t%s" % (netid, cid, what, owner))
 nets = {n["Id"]: n for n in networks}
 def project_net(n): return n is not None and (n.get("Labels") or {}).get(LP) == P
 # --- networks: the flags that make a network a boundary ---
@@ -215,7 +221,7 @@ for c in containers:
             n = nets.get(ep.get("NetworkID"))
             if project_net(n):
                 find("CRIT", 1, "ATTACH-FOREIGN", "container %s (not part of the release) is attached to project network %s" % (name, n["Name"]))
-                act(n["Id"], cid, "foreign container %s on %s" % (name, n["Name"]))
+                act(n["Id"], cid, "foreign container %s on %s" % (name, n["Name"]), "foreign")
         continue
     svc_name = labels.get(LS, "?")
     svc = S.get(svc_name)
@@ -233,13 +239,13 @@ for c in containers:
         n = nets.get(ep.get("NetworkID"))
         if not project_net(n):
             find("CRIT", 1, "ATTACH-UNEXPECTED", "%s (%s) is attached to %s, which is not a network of this release" % (name, svc_name, nname))
-            act(ep.get("NetworkID", nname), cid, "%s on foreign network %s" % (name, nname))
+            act(ep.get("NetworkID", nname), cid, "%s on foreign network %s" % (name, nname), "project")
             continue
         logical = (n.get("Labels") or {}).get(LN)
         logical_now.add(logical)
         if logical not in svc["networks"]:
             find("CRIT", 1, "ATTACH-UNEXPECTED", "%s (%s) is attached to %s, but the release declares only %s" % (name, svc_name, n["Name"], sorted(svc["networks"])))
-            act(n["Id"], cid, "%s on %s" % (name, n["Name"]))
+            act(n["Id"], cid, "%s on %s" % (name, n["Name"]), "project")
     # --- how it was started: no way around the networks ---
     hc = c.get("HostConfig") or {}
     mode = hc.get("NetworkMode") or ""
@@ -321,7 +327,7 @@ ACTIONS=()    # "netid|cid|what"
 SUP_IDS=()    # running supervised (and unknown project) containers
 MISSING=()    # supervised services that do not run
 assess() { # assess: topology + runtime DNS from the Docker snapshot, into the arrays above
-  local facts rec kind a b c d resolvers have_res=1
+  local facts rec kind a b c d e resolvers have_res=1
   FINDINGS=(); ACTIONS=(); SUP_IDS=(); MISSING=()
   resolvers="$(daemon_resolvers 2>/dev/null)" || have_res=0
   facts="$(GUARD_DNS_NOW="$(guard_dns 2>/dev/null || true)" RESOLVERS_NOW="$resolvers" HAVE_RES="$have_res" python3 -c '
@@ -330,10 +336,10 @@ print(json.dumps({"guard_dns": os.environ["GUARD_DNS_NOW"] or None,
                   "resolvers": os.environ["RESOLVERS_NOW"] if os.environ["HAVE_RES"] == "1" else None}))')"
   rec="$(python3 -c "$ASSESS" "$CONTRACT" "$TMP/containers.json" "$TMP/networks.json" "$facts")" \
     || { FINDINGS+=("CRIT|0|UNVERIFIED|the assessor failed: nothing is certified"); return; }
-  while IFS=$'\t' read -r kind a b c d; do
+  while IFS=$'\t' read -r kind a b c d e; do
     case "$kind" in
       F) FINDINGS+=("$a|$b|$c|$d") ;;
-      A) ACTIONS+=("$b|$c|$d") ;;
+      A) ACTIONS+=("$b|$c|$d|$e") ;;
       SUP) SUP_IDS+=("$a") ;;
       MISSING) MISSING+=("$a") ;;
       '') ;;
@@ -353,10 +359,10 @@ compose_cmd() { # compose_cmd <args...>: docker compose in the committed release
 dns_config_ok() { # the rendered DNS must equal the guard's, judged by the root-owned check
   local rel args
   rel="$(contract_get release_dir)"; mapfile -t args < <(contract_args)
-  ( cd "$rel" && RELEASE_SHA="$(contract_get release_sha)" SMOKE_DNS_CONFIG_ONLY=1 SMOKE_DNS_EXPECT="$1" "$DNS_CHECK" "${args[@]}" )
+  ( cd "$rel" && RELEASE_SHA="$(contract_get release_sha)" SMOKE_DNS_CONFIG_ONLY=1 SMOKE_DNS_EXPECT="$1" nolock "$DNS_CHECK" "${args[@]}" )
 }
 prereqs() { # prereqs <with_targets 0|1>: what the HOST must provide; PREREQ gets one entry per missing thing
-  local with_targets="$1" out dnsexp f
+  local with_targets="$1" out dnsexp f grc
   PREREQ=()
   for f in "$GUARD" "$ISOLATION_CHECK" "$DNS_CHECK"; do
     trusted_exec "$f" || PREREQ+=("TRUST $f is missing, not a regular executable, or writable by others")
@@ -364,7 +370,12 @@ prereqs() { # prereqs <with_targets 0|1>: what the HOST must provide; PREREQ get
   trusted_file "$GUARD_CONF" || PREREQ+=("TRUST $GUARD_CONF is missing or untrusted")
   trusted_file "$ISOLATION_CONF" || PREREQ+=("TRUST $ISOLATION_CONF is missing or untrusted")
   [[ ${#PREREQ[@]} -eq 0 ]] || return 0
-  if ! out="$("$GUARD" status 2>&1)"; then
+  grc=0; out="$(nolock "$GUARD" status 2>&1)" || grc=$?
+  if [[ "$grc" == 3 ]]; then
+    # the policy is intact except for the set of host addresses it names (a rootful bridge came or went, an
+    # interface got an address): repairable in a second by `apply`, no need to stop anything first
+    PREREQ+=("GUARD-ADDR host-egress-guard.sh status: $(tr '\n' ' ' <<<"$out" | cut -c1-300)")
+  elif [[ "$grc" != 0 ]]; then
     PREREQ+=("GUARD host-egress-guard.sh status: $(tr '\n' ' ' <<<"$out" | cut -c1-300)")
   fi
   dnsexp="$(guard_dns 2>/dev/null || true)"
@@ -375,23 +386,39 @@ prereqs() { # prereqs <with_targets 0|1>: what the HOST must provide; PREREQ get
   fi
   if [[ "$with_targets" == 1 ]]; then
     if ! out="$(EGRESS_FORBIDDEN_TARGETS="$(contract_get forbidden_targets)" SMOKE_ROOTFUL_TARGETS="$(rootful_targets 2>/dev/null || true)" \
-                SMOKE_EXPECT_ROOTLESS=1 "$ISOLATION_CHECK" --verify-targets 2>&1)"; then
+                SMOKE_EXPECT_ROOTLESS=1 nolock "$ISOLATION_CHECK" --verify-targets 2>&1)"; then
       PREREQ+=("TARGETS protected host addresses are not live yet (Tailscale late?): $(tr '\n' ' ' <<<"$out" | cut -c1-240)")
     fi
   fi
 }
 
 # ---- actions -----------------------------------------------------------------------------------------------------
+# ORDER (docs/deployment.md, "Runtime containment"): (1) record the intent durably, (2) cut the hostile route,
+# (3) stop. Cutting a route is instant (`network disconnect -f`); stopping a container is not (SIGTERM, up to a
+# 5 s grace): a stop-first order keeps the hostile endpoint alive for the whole shutdown. The intent is recorded
+# first so that a crash anywhere below cannot fail open: the next cycle sees the latch and finishes the job even
+# though the evidence (the extra endpoint) is already gone.
 stop_ids() { # stop_ids <ids...>
   [[ $# -gt 0 ]] || return 0
-  docker stop -t 5 "$@" >/dev/null 2>&1 || { log CRIT STOP-FAILED "docker stop failed for ${#} container(s): killing"; docker kill "$@" >/dev/null 2>&1 || true; }
+  docker stop -t 5 "$@" >/dev/null 2>&1 || { log CRIT STOP-FAILED "docker stop failed for $# container(s): killing"; docker kill "$@" >/dev/null 2>&1 || true; }
 }
-do_actions() { local a netid cid what
+do_actions() { # remove every unauthorised endpoint; a failure is retried once, then the container is killed if it is ours
+  local a netid cid what owner failed=0
   for a in "${ACTIONS[@]}"; do
-    IFS='|' read -r netid cid what <<<"$a"
-    if docker network disconnect -f "$netid" "$cid" >/dev/null 2>&1; then log CRIT DISCONNECTED "$what"
-    else log CRIT DISCONNECT-FAILED "$what"; fi
+    IFS='|' read -r netid cid what owner <<<"$a"
+    if docker network disconnect -f "$netid" "$cid" >/dev/null 2>&1 \
+       || { sleep 0.5; docker network disconnect -f "$netid" "$cid" >/dev/null 2>&1; }; then
+      log CRIT DISCONNECTED "$what"
+    else
+      failed=1
+      log CRIT DISCONNECT-FAILED "$what"
+      if [[ "$owner" == project ]]; then
+        # the route cannot be removed and the container is ours: it must not keep running with it
+        docker kill "$cid" >/dev/null 2>&1 && log CRIT KILLED "container with an unremovable unauthorised endpoint: $what"
+      fi
+    fi
   done
+  return "$failed"
 }
 latch_set() { # latch_set <reason>
   printf '{"time": %s, "reason": %s}\n' "$(now)" "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1")" | atomic_write "$STATE/latch"
@@ -403,13 +430,15 @@ flap_record() { # flap_record -> exits 0 normally, 1 when the flap limit is reac
   n="$(grep -c . "$STATE/flaps" || true)"
   (( n < FLAP_MAX ))
 }
-quarantine() { # quarantine <latch 0|1> <reason>: stop the supervised set now, remove unauthorised endpoints
-  local latch="$1" reason="$2"
+quarantine() { # quarantine <latch 0|1> <reason>: latch (if any), cut hostile endpoints, then stop the supervised set
+  local latch="$1" reason="$2" cut=0
   ACTED=1
-  if [[ ${#SUP_IDS[@]} -gt 0 ]]; then stop_ids "${SUP_IDS[@]}"; fi
-  do_actions
+  if [[ "$latch" == 1 ]]; then latch_set "$reason"; fi           # 1. intent first: a crash below must not fail open
+  do_actions || cut=1                                            # 2. the hostile routes go first
+  [[ ${#ACTIONS[@]} -gt 0 ]] && ACTIONS=()                       #    (done: the latched branch must not redo them)
+  if [[ ${#SUP_IDS[@]} -gt 0 ]]; then stop_ids "${SUP_IDS[@]}"; fi     # 3. then the set
   if [[ "$latch" == 1 ]]; then
-    latch_set "$reason"; log CRIT LATCHED "$reason: ${#SUP_IDS[@]} container(s) stopped; stays stopped until 'runtime-containment.sh reset'"
+    log CRIT LATCHED "$reason: ${#SUP_IDS[@]} container(s) stopped$([[ "$cut" == 1 ]] && echo ', an unauthorised endpoint could NOT be removed'); stays stopped until 'runtime-containment.sh reset'"
     set_state latched "$reason"
   else
     if ! flap_record; then
@@ -420,6 +449,9 @@ quarantine() { # quarantine <latch 0|1> <reason>: stop the supervised set now, r
       set_state quarantined "$reason"
     fi
   fi
+}
+guard_apply_verified() { # re-apply the guard (idempotent; the daemon's own ExecStartPost call) and verify the FULL policy
+  nolock "$GUARD" apply --wait 20 >/dev/null 2>&1 && nolock "$GUARD" status >/dev/null 2>&1
 }
 SUPERVISED_ALL=()
 load_supervised() { mapfile -t SUPERVISED_ALL < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["services"]
@@ -463,26 +495,43 @@ verify_started() { # the deploy gate's enforce-mode checks, once, after THIS scr
   local rel args out
   rel="$(contract_get release_dir)"; mapfile -t args < <(contract_args)
   if ! out="$( cd "$rel" && SMOKE_HOST_ISOLATION=enforce SMOKE_EXPECT_ROOTLESS=1 SMOKE_REQUIRE_TAILNET=1 SMOKE_AUTODETECT_HOST_IPS=1 \
-               SMOKE_PROTECTED_IPS="$ips" SMOKE_ROOTFUL_TARGETS="$rootful" "$ISOLATION_CHECK" "${args[@]}" 2>&1 )"; then
+               SMOKE_PROTECTED_IPS="$ips" SMOKE_ROOTFUL_TARGETS="$rootful" nolock "$ISOLATION_CHECK" "${args[@]}" 2>&1 )"; then
     echo "$out" >&2; return 1
   fi
-  if ! out="$( cd "$rel" && SMOKE_HOST_ISOLATION=enforce SMOKE_DNS_EXPECT="$dnsexp" "$DNS_CHECK" "${args[@]}" 2>&1 )"; then
+  if ! out="$( cd "$rel" && SMOKE_HOST_ISOLATION=enforce SMOKE_DNS_EXPECT="$dnsexp" nolock "$DNS_CHECK" "${args[@]}" 2>&1 )"; then
     echo "$out" >&2; return 1
   fi
 }
 
 # ---- one cycle ----------------------------------------------------------------------------------------------------
-DEPLOY_FD=""
-take_deploy_lock() { # 0 = we hold it; 1 = a deploy holds it (paused); 2 = held too long (hung deploy: act anyway)
-  [[ -e "$DEPLOY_LOCK" ]] || { mkdir -p "$(dirname "$DEPLOY_LOCK")"; : >>"$DEPLOY_LOCK"; }
-  exec {DEPLOY_FD}<"$DEPLOY_LOCK"
-  if flock -n "$DEPLOY_FD"; then return 0; fi
-  exec {DEPLOY_FD}<&-; DEPLOY_FD=""
-  local age=$(( $(now) - $(stat -c %Y "$DEPLOY_LOCK" 2>/dev/null || now) ))
-  (( age > MAX_DEPLOY_PAUSE )) && return 2
-  return 1
+# LOCKING. Two locks, two jobs:
+#   state/deploy.lock          held by remote-deploy.sh for the whole of a deploy (flock -n: one deploy at a time).
+#                              The watchdog NEVER takes it, so a legitimate deploy cannot be refused because a
+#                              check cycle happens to be running (it was: 87% of attempts in a measured run).
+#   state/containment.action.lock   the right to CHANGE the stack (stop, disconnect, start, re-apply the guard,
+#                              latch). The watchdog takes it only when a cycle has something to change, and only
+#                              without waiting; remote-deploy.sh takes it (waiting) for the whole of a deploy. A
+#                              watchdog action and a deploy therefore never overlap, and a healthy cycle - the
+#                              overwhelmingly common one - takes no lock at all.
+# A cycle first OBSERVES (read-only). When it decides to act it takes the action lock and observes AGAIN: what it
+# decided on may be a deploy ago. If the lock is busy the cycle yields ("paused"); a lock older than
+# MAX_DEPLOY_PAUSE is a hung deploy and does not disable containment.
+ACT_FD=""
+need_lock() { # 0: the action lock is ours and the snapshot is fresh; 99: just taken, observe again; 98: busy, yield
+  [[ -n "$ACT_FD" ]] && return 0
+  [[ -e "$ACTION_LOCK" ]] || { mkdir -p "$(dirname "$ACTION_LOCK")"; : >>"$ACTION_LOCK"; }
+  exec {ACT_FD}<"$ACTION_LOCK"
+  if flock -n "$ACT_FD"; then return 99; fi
+  exec {ACT_FD}<&-; ACT_FD=""
+  local age=$(( $(now) - $(stat -c %Y "$ACTION_LOCK" 2>/dev/null || now) ))
+  if (( age > MAX_DEPLOY_PAUSE )); then
+    log WARN DEPLOY-LOCK "the action lock has been held for more than ${MAX_DEPLOY_PAUSE}s: treating the deploy as hung and acting without it"
+    ACT_FD=none
+    return 99
+  fi
+  return 98
 }
-drop_deploy_lock() { [[ -z "$DEPLOY_FD" ]] || { exec {DEPLOY_FD}<&-; DEPLOY_FD=""; }; }
+drop_lock() { [[ -z "$ACT_FD" || "$ACT_FD" == none ]] || exec {ACT_FD}<&-; ACT_FD=""; }
 
 summarise() { printf '%s; ' "$@" | cut -c1-400; }
 
@@ -509,8 +558,8 @@ note_waiting() { # log a change of the reason the set is not running, once
   set_state waiting "$reason"
 }
 
-cycle_locked() { # runs with the deploy lock held (or a hung deploy's): returns 0 healthy/waiting, 1 acted on a violation, 2 unverified
-  local desired latched f level latch id msg warns=() crit_latch=() r s cold due=() rc=0
+cycle_pass() { # one pass; 0 healthy/waiting, 1 acted on a violation, 2 unverified, 98 busy (yield), 99 observe again
+  local desired latched f level latch id msg warns=() crit_latch=() r s cold due=() rc=0 addr_only
   desired="$(read_file "$STATE/desired")"; latched=0; [[ -f "$STATE/latch" ]] && latched=1
   load_supervised
   collect || rc=$?
@@ -520,7 +569,6 @@ cycle_locked() { # runs with the deploy lock held (or a hung deploy's): returns 
     return 2
   fi
   assess
-  prereqs "$([[ ${#SUP_IDS[@]} -eq 0 ]] && echo 1 || echo 0)"
   for f in "${FINDINGS[@]}"; do
     IFS='|' read -r level latch id msg <<<"$f"
     if [[ "$level" == WARN ]]; then warns+=("$id $msg")
@@ -531,47 +579,78 @@ cycle_locked() { # runs with the deploy lock held (or a hung deploy's): returns 
       if [[ "$(read_file "$STATE/last_warn")" != "$r" ]]; then log WARN "${r%% *}" "${r#* }"; printf '%s\n' "$r" | atomic_write "$STATE/last_warn"; fi
     done
   else rm -f "$STATE/last_warn"; fi
+  # Integrity first, BEFORE the (slower) prerequisite checks: a hostile endpoint is acted on at once.
   # 1. a latch stays until an operator resets it, whatever else is true
   if [[ "$latched" == 1 ]]; then
-    if [[ ${#SUP_IDS[@]} -gt 0 ]]; then ACTED=1; stop_ids "${SUP_IDS[@]}"; log CRIT LATCHED "the latch is set and supervised containers were running: stopped them again"; fi
-    do_actions
+    if [[ ${#SUP_IDS[@]} -gt 0 || ${#ACTIONS[@]} -gt 0 ]]; then
+      need_lock || return $?
+      ACTED=1
+      do_actions || true                                        # the route first,
+      ACTIONS=()
+      if [[ ${#SUP_IDS[@]} -gt 0 ]]; then stop_ids "${SUP_IDS[@]}"; fi     # then the set
+      log CRIT LATCHED "the latch is set and supervised containers were running or an unauthorised endpoint was present: acted again"
+    fi
     set_state latched "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["reason"])' "$STATE/latch" 2>/dev/null || echo unknown)"
     return 1
   fi
-  # 2. integrity events: stop, remove the unauthorised endpoints, latch
+  # 2. integrity events: latch, cut the endpoint, stop, in that order
   if [[ ${#crit_latch[@]} -gt 0 ]]; then
+    need_lock || return $?
     quarantine 1 "$(summarise "${crit_latch[@]}")"
     return 1
   fi
   # 3. nothing may run that no deploy committed
   if [[ "$desired" != running ]]; then
     if [[ ${#SUP_IDS[@]} -gt 0 ]]; then
+      need_lock || return $?
       quarantine 1 "DESIRED: supervised containers run but the last deploy did not leave the stack running (desired='${desired:-unset}')"
       return 1
     fi
     set_state stopped "desired state is '${desired:-unset}'"
     return 0
   fi
-  # 4. a prerequisite or a soft finding is wrong: stop what runs, repair what can be repaired
+  # 4. prerequisites (guard, DNS, protected addresses) and soft findings
+  prereqs "$([[ ${#SUP_IDS[@]} -eq 0 ]] && echo 1 || echo 0)"
   problems_now
   if [[ ${#PROBLEMS[@]} -gt 0 ]]; then
-    local acted=0 only_guard=0
+    local acted=0 only_guard=0 repaired=0
+    addr_only=0
+    [[ ${#PROBLEMS[@]} -eq 1 && "${PROBLEMS[0]}" == GUARD-ADDR\ * ]] && addr_only=1
     [[ ${#PROBLEMS[@]} -eq 1 && "${PROBLEMS[0]}" == GUARD\ * ]] && only_guard=1
-    if [[ ${#SUP_IDS[@]} -gt 0 ]]; then quarantine 0 "$(summarise "${PROBLEMS[@]}")"; acted=1; fi
-    if [[ "$acted" == 1 && ( "$(read_file "$STATE/state")" == latched* ) ]]; then return 1; fi   # the flap limit just latched
-    if [[ "$only_guard" == 1 ]]; then
-      # only the guard is wrong: re-apply it (idempotent, the same call as the daemon's ExecStartPost)
-      if "$GUARD" apply --wait 20 >/dev/null 2>&1 && "$GUARD" status >/dev/null 2>&1; then
-        log INFO GUARD-REPAIRED "host-egress-guard.sh apply restored the policy"
+    if [[ "$addr_only" == 1 ]]; then
+      # The only difference is the set of host addresses the guard names: a rootful Docker bridge or an
+      # interface address came or went. `apply` fixes it in about a second - quicker than `docker stop`'s own
+      # grace period - so stopping the set first would add an outage without closing the gap any sooner. Repair
+      # and verify FIRST; stop only if the repair does not hold. A repaired drift is not a flap.
+      need_lock || return $?
+      if guard_apply_verified; then
+        log INFO GUARD-ADDRESS-ABSORBED "host address set changed; host-egress-guard.sh apply updated the policy ($(tr '\n' ' ' <<<"${PROBLEMS[0]#GUARD-ADDR }" | cut -c1-160))"
+        repaired=1
+        refresh "$([[ ${#SUP_IDS[@]} -eq 0 ]] && echo 1 || echo 0)" || { set_state unverified "docker unavailable"; return 2; }
+        problems_now
       else
-        log CRIT GUARD-UNREPAIRABLE "host-egress-guard.sh apply did not restore the policy; the supervised set stays stopped"
+        log CRIT GUARD-UNREPAIRABLE "host address drift could not be absorbed by host-egress-guard.sh apply: stopping the supervised set"
+        only_guard=1
       fi
     fi
-    refresh 1 || { set_state unverified "docker unavailable"; return 2; }
-    problems_now
     if [[ ${#PROBLEMS[@]} -gt 0 ]]; then
-      note_waiting "$(summarise "${PROBLEMS[@]}")"
-      [[ "$acted" == 1 ]] && return 1 || return 0
+      # a structural guard problem, a missing prerequisite, a soft finding: stop what runs, repair what can be repaired
+      need_lock || return $?
+      if [[ ${#SUP_IDS[@]} -gt 0 ]]; then quarantine 0 "$(summarise "${PROBLEMS[@]}")"; acted=1; fi
+      if [[ "$acted" == 1 && ( "$(read_file "$STATE/state")" == latched* ) ]]; then return 1; fi   # the flap limit just latched
+      if [[ "$only_guard" == 1 && "$repaired" == 0 ]]; then
+        if guard_apply_verified; then
+          log INFO GUARD-REPAIRED "host-egress-guard.sh apply restored the policy"
+        else
+          log CRIT GUARD-UNREPAIRABLE "host-egress-guard.sh apply did not restore the policy; the supervised set stays stopped"
+        fi
+      fi
+      refresh 1 || { set_state unverified "docker unavailable"; return 2; }
+      problems_now
+      if [[ ${#PROBLEMS[@]} -gt 0 ]]; then
+        note_waiting "$(summarise "${PROBLEMS[@]}")"
+        [[ "$acted" == 1 ]] && return 1 || return 0
+      fi
     fi
   fi
   rm -f "$STATE/last_waiting"
@@ -582,6 +661,7 @@ cycle_locked() { # runs with the deploy lock held (or a hung deploy's): returns 
       if [[ "$cold" == 1 ]] || (( $(now) - $(cat "$STATE/restart.$s" 2>/dev/null || echo 0) >= RESTART_BACKOFF )); then due+=("$s"); fi
     done
     if [[ ${#due[@]} -gt 0 ]]; then
+      need_lock || return $?
       for s in "${due[@]}"; do now >"$STATE/restart.$s"; done
       log INFO START "starting ${due[*]}$([[ "$cold" == 1 ]] && echo ' (cold start: every prerequisite verified first)')"
       if ! start_services "${due[@]}"; then
@@ -611,16 +691,19 @@ cycle_locked() { # runs with the deploy lock held (or a hung deploy's): returns 
   return 0
 }
 
-cycle() { # one pass; 0 healthy/idle/waiting/paused, 1 acted on a violation (even if it healed), 2 unverified
-  local lockrc=0 rc=0
+cycle() { # one cycle; 0 healthy/idle/waiting/paused, 1 acted on a violation (even if it healed), 2 unverified
+  local rc=0 pass=0
   ACTED=0
   beat
   if [[ ! -f "$CONTRACT" ]]; then set_state idle "no release has been committed"; return 0; fi
-  take_deploy_lock || lockrc=$?
-  if [[ "$lockrc" == 1 ]]; then set_state paused "a deploy is running"; return 0; fi
-  [[ "$lockrc" != 2 ]] || log WARN DEPLOY-LOCK "the deploy lock has been held for more than ${MAX_DEPLOY_PAUSE}s: treating the deploy as hung"
-  cycle_locked || rc=$?
-  drop_deploy_lock
+  while :; do
+    rc=0; cycle_pass || rc=$?
+    if [[ "$rc" == 99 && "$pass" == 0 ]]; then pass=1; continue; fi     # the lock was just taken: decide on a FRESH snapshot
+    break
+  done
+  if [[ "$rc" == 98 ]]; then set_state paused "a deploy (or an operator command) holds the action lock"; rc=0; fi
+  [[ "$rc" != 99 ]] || rc=2                                          # cannot happen (the lock is held on the second pass)
+  drop_lock
   [[ "$rc" != 0 || "$ACTED" == 0 ]] || rc=1
   return "$rc"
 }
@@ -634,9 +717,10 @@ hold_deploy_lock_required() { # commit/desired are for remote-deploy.sh, which h
 }
 
 cmd_commit() {
-  local sha="" rel="" forbidden="" ips="" rootful="" args=()
+  local sha="" rel="" forbidden="" ips="" rootful="" check=0 args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --check) check=1; shift ;;      # read-only pre-flight: could this release be committed? (no lock, nothing written)
       --sha) sha="${2:?}"; shift 2 ;; --release-dir) rel="${2:?}"; shift 2 ;;
       --forbidden) forbidden="${2:-}"; shift 2 ;; --protected-ips) ips="${2:-}"; shift 2 ;;
       --rootful) rootful="${2:-}"; shift 2 ;; --) shift; args=("$@"); break ;; *) die "commit: unknown argument $1" 2 ;;
@@ -645,18 +729,19 @@ cmd_commit() {
   [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "commit: --sha must be a 40-hex commit" 2
   [[ -d "$rel" ]] || die "commit: --release-dir is not a directory" 2
   [[ ${#args[@]} -gt 0 ]] || die "commit: compose arguments are required after --" 2
-  hold_deploy_lock_required commit
+  [[ "$check" == 1 ]] || hold_deploy_lock_required commit
   local dnsv cfg i
   for ((i = 0; i < ${#args[@]}; i++)); do   # the compose project name (-p), as the labels carry it
     if [[ "${args[$i]}" == -p && -n "${args[$((i + 1))]:-}" ]]; then PROJECT="${args[$((i + 1))]}"; fi
   done
-  dnsv="$(guard_dns)" || die "commit: $GUARD_CONF has no valid trusted DNS=" 11
+  if [[ "$check" == 1 ]]; then dnsv="$(guard_dns 2>/dev/null || true)"
+  else dnsv="$(guard_dns)" || die "commit: $GUARD_CONF has no valid trusted DNS=" 11; fi
   cfg="$( cd "$rel" && RELEASE_SHA="$sha" docker compose "${args[@]}" config --format json 2>/dev/null )" \
     || die "commit: docker compose config failed" 1
-  python3 - "$PROJECT" "$sha" "$rel" "$dnsv" "$forbidden" "$ips" "$rootful" "$(daemon_resolvers 2>/dev/null || true)" "$(now)" "$cfg" "${args[@]}" >"$TMP/contract.json" <<'PY' || die "commit: the release cannot be put under containment (see the message above)" 11
+  python3 - "$PROJECT" "$sha" "$rel" "$dnsv" "$forbidden" "$ips" "$rootful" "$(daemon_resolvers 2>/dev/null || true)" "$(now)" "$cfg" "$check" "${args[@]}" >"$TMP/contract.json" <<'PY' || die "commit: the release cannot be put under containment (see the message above)" 11
 import json, sys
-project, sha, rel, dns, forbidden, ips, rootful, resolvers, ts, cfg = sys.argv[1:11]
-args = sys.argv[11:]
+project, sha, rel, dns, forbidden, ips, rootful, resolvers, ts, cfg, check = sys.argv[1:12]
+args = sys.argv[12:]
 cfg = json.loads(cfg)
 nets = cfg.get("networks") or {}
 services, bad = {}, []
@@ -672,6 +757,8 @@ for name, svc in sorted((cfg.get("services") or {}).items()):
     services[name] = {"networks": attached, "out": out, "supervised": supervised, "dns": list(svc.get("dns") or [])}
 if bad:
     print("\n".join("runtime-containment: " + b for b in bad), file=sys.stderr); sys.exit(1)
+if check == "1":
+    sys.exit(0)                      # pre-flight only: the release is committable
 contract = {"version": 1, "project": project, "release_sha": sha, "release_dir": rel, "compose_args": args,
             "dns": dns, "forbidden_targets": forbidden, "protected_ips": ips, "rootful_targets": rootful,
             "resolver_baseline": resolvers if resolvers else None, "committed": int(ts),
@@ -679,6 +766,7 @@ contract = {"version": 1, "project": project, "release_sha": sha, "release_dir":
             "services": services}
 json.dump(contract, sys.stdout, indent=1)
 PY
+  if [[ "$check" == 1 ]]; then echo "ok: release $sha can be put under runtime containment"; return 0; fi
   atomic_write "$CONTRACT" <"$TMP/contract.json"
   echo running | atomic_write "$STATE/desired"
   rm -f "$STATE/flaps" "$STATE/last_warn"
@@ -742,6 +830,7 @@ cmd_quarantine() {
   assess
   # the dead-man switch must not itself count towards the flap limit
   if [[ "$latch" == 0 ]]; then
+    do_actions || true
     if [[ ${#SUP_IDS[@]} -gt 0 ]]; then stop_ids "${SUP_IDS[@]}"; fi
     log CRIT QUARANTINE "$reason: ${#SUP_IDS[@]} container(s) stopped"
     set_state quarantined "$reason"
@@ -751,16 +840,17 @@ cmd_quarantine() {
 }
 
 cmd_reset() {
-  local disconnect=0 lockrc=0 rc=0 f level latch id msg bad=0 r
+  local disconnect=0 f level latch id msg bad=0 r
   [[ "${1:-}" == --disconnect-foreign ]] && disconnect=1
   [[ -f "$CONTRACT" ]] || die "reset: nothing is under containment" 2
-  take_deploy_lock && lockrc=0 || lockrc=$?
-  [[ "$lockrc" != 1 ]] || die "reset: a deploy is running" 4
-  trap 'drop_deploy_lock; cleanup' EXIT
+  [[ -e "$ACTION_LOCK" ]] || { mkdir -p "$(dirname "$ACTION_LOCK")"; : >>"$ACTION_LOCK"; }
+  exec {ACT_FD}<"$ACTION_LOCK"
+  flock -w 30 "$ACT_FD" || die "reset: the action lock is held (a deploy is running, or the watchdog is stopping/starting the stack); retry in a minute" 4
+  trap 'drop_lock; cleanup' EXIT
   load_supervised
   collect || die "reset: Docker cannot be inspected" 22
   assess
-  if [[ "$disconnect" == 1 && ${#ACTIONS[@]} -gt 0 ]]; then do_actions; collect || die "reset: Docker cannot be inspected" 22; assess; fi
+  if [[ "$disconnect" == 1 && ${#ACTIONS[@]} -gt 0 ]]; then do_actions || true; collect || die "reset: Docker cannot be inspected" 22; assess; fi
   # the stack must be verifiably clean WITH the supervised set stopped: stop it first if the operator left it running
   if [[ ${#SUP_IDS[@]} -gt 0 ]]; then stop_ids "${SUP_IDS[@]}"; collect || die "reset: Docker cannot be inspected" 22; assess; fi
   for f in "${FINDINGS[@]}"; do
@@ -770,7 +860,7 @@ cmd_reset() {
     echo "reset refused: $id $msg" >&2; bad=1
   done
   prereqs 1
-  for r in "${PREREQ[@]}"; do echo "reset refused: ${r%%|*} $(cut -d'|' -f2 <<<"$r")" >&2; bad=1; done
+  for r in "${PREREQ[@]}"; do echo "reset refused: $r" >&2; bad=1; done
   [[ "$bad" == 0 ]] || { [[ ${#ACTIONS[@]} -eq 0 ]] || echo "hint: --disconnect-foreign removes the unauthorised endpoints listed above" >&2; return 1; }
   rm -f "$STATE/latch" "$STATE/flaps"
   log INFO RESET "operator reset: latch cleared; the watchdog restarts the supervised set after verifying everything"
@@ -790,7 +880,9 @@ cmd_watch() {
     # a Tailscale / DHCP / bridge address or route appearing, and Docker network or container events,
     # run a cycle at once; the interval is only the backstop
     if command -v ip >/dev/null 2>&1; then ( exec ip monitor address route 2>/dev/null ) >&6 & evpids+=("$!"); fi
-    ( exec docker events --filter type=network --filter type=container --format '{{.Type}} {{.Action}}' 2>/dev/null ) >&6 & evpids+=("$!")
+    ( exec docker events --filter type=network --filter type=container \
+        --filter event=create --filter event=start --filter event=die --filter event=destroy \
+        --filter event=connect --filter event=disconnect --format '{{.Type}} {{.Action}}' 2>/dev/null ) >&6 & evpids+=("$!")
   }
   # shellcheck disable=SC2317,SC2329  # invoked by the trap
   stop_wakers() { for p in "${evpids[@]:-}"; do [[ -z "$p" ]] || kill "$p" 2>/dev/null || true; done; }

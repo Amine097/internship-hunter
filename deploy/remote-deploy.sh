@@ -32,7 +32,8 @@
 #    containment"), and a stack this script tears down is recorded as intentionally stopped
 #  * exit codes: 2 bad input, 3 missing files/ports, 4 locked, 5 not rootless, 7 integrity,
 #    8 backup, 9 schema, 10/6 restore failed (stack stopped), 11 isolation prerequisites, 12 guard,
-#    13 runtime containment inactive or latched
+#    13 runtime containment inactive or latched, 14 a release that predates runtime containment cannot be
+#    restored under it (deploy-irreversible acknowledges it; a rollback to it is refused before anything changes)
 set -Eeuo pipefail
 
 # ---- the forced-command boundary --------------------------------------------------------------
@@ -69,6 +70,8 @@ ISOLATION_CONF="$BASE/deploy/host-isolation.conf"      # REQUIRED: ROOTFUL_TARGE
 DNS_CHECK="$BASE/deploy/check-dns.sh"
 GUARD_CONF="$BASE/deploy/host-egress-guard.conf"       # REQUIRED here: DNS=<the one resolver the guard allows>
 CONTAINMENT="$BASE/deploy/runtime-containment.sh"      # REQUIRED: keeps the isolation true AFTER this script is done
+ACTION_LOCK_WAIT=180     # seconds a deploy waits for an in-flight watchdog action (a cold start can take minutes)
+[[ "$TEST_MODE" == 1 ]] && ACTION_LOCK_WAIT="${HUNTER_ACTION_LOCK_WAIT:-$ACTION_LOCK_WAIT}"
 API_PORT=18000          # host side; the container side stays 8000 (Gluetun lives on tailnet:8000)
 KEEP_RELEASES=5
 PROJECT=internship-hunter
@@ -297,6 +300,13 @@ containment_commit() { # containment_commit <sha>: put the verified release unde
     --protected-ips "$ips" --rootful "$(rootful_targets)" -- "${CARGS[@]}"
 }
 
+containment_committable() { # containment_committable <sha>: could this release be put under runtime containment? (read-only)
+  local sha="$1"
+  [[ -d "$BASE/releases/$sha" ]] || return 1
+  compose_args "$sha"
+  "$CONTAINMENT" commit --check --sha "$sha" --release-dir "$BASE/releases/$sha" -- "${CARGS[@]}" >/dev/null 2>&1
+}
+
 activate() { # activate <sha>: start (never build) the release, then verify it
   # Explicit `|| return`: errexit is suppressed when this runs inside `if !`/`||`.
   local sha="$1"
@@ -365,6 +375,8 @@ do_rollback() {
   [[ "$previous" =~ ^[0-9a-f]{40}$ ]] || die "no previous release recorded" 3
   [[ -d "$BASE/releases/$previous" ]] || die "previous release directory missing" 3
   dns_config_gate "$previous" || die "rollback target $previous is refused: its rendered DNS configuration disagrees with the guard" 11
+  containment_committable "$previous" \
+    || die "rollback target $previous predates runtime containment (its services render a restart policy) and cannot be restored under it: nothing was changed, the running release $current stays. Deploy a fixed release instead (docs/deployment.md, \"First deploy with runtime containment\")" 14
   # the declaration that matters is the one SIGNED INTO the release we are leaving
   leaving_compat="$(read_state "compat-$current")"
   db_now="$(actual_db_revision "$current")"
@@ -467,6 +479,24 @@ do_deploy() { # do_deploy <normal|irreversible>
   # 6b) the effective compose DNS must match the guard BEFORE images are loaded, the database is
   # dumped or a container is touched (activate() repeats it right before `up`, for restores too)
   dns_config_gate "$sha" || die "release $sha is refused: its rendered DNS configuration disagrees with the guard" 11
+  # 6c) ... and runtime containment must accept the release (a supervised service with a restart policy is
+  # refused): found out HERE, not at the end of an activation that has already migrated the database
+  if ! containment_committable "$sha"; then
+    "$CONTAINMENT" commit --check --sha "$sha" --release-dir "$BASE/releases/$sha" -- "${CARGS[@]}" >&2 || true
+    die "release $sha is refused: runtime containment cannot supervise it (its services with a route out, and its agents, must render restart: \"no\")" 11
+  fi
+  # 6d) can the release running NOW be restored under containment? A release from before runtime
+  # containment renders restart: unless-stopped, which `commit` refuses: after a failed activation there would be
+  # nothing to go back to. Never pretend otherwise: the operator must acknowledge it BEFORE anything changes.
+  local previous_restorable=1
+  if [[ -n "$running" && "$running" != "$sha" ]] && ! containment_committable "$running"; then
+    previous_restorable=0
+    rollback_ok=0
+    if [[ "$mode" != irreversible ]]; then
+      die "the running release $running predates runtime containment (its services render a restart policy) and cannot be restored under it: if this deploy fails there is NO previous release to go back to and the stack would be stopped. Use deploy-irreversible to acknowledge that (docs/deployment.md, \"First deploy with runtime containment\")" 14
+    fi
+    echo "deploy: accepted IRREVERSIBLE deploy: $running predates runtime containment; if $sha fails it will NOT be restored and the stack will be stopped" >&2
+  fi
 
   # 7) immutable images: load, never build
   docker load -i "$stage/images.tar.gz" >/dev/null
@@ -490,7 +520,15 @@ do_deploy() { # do_deploy <normal|irreversible>
   export ACCEPT_SCHEMA_REVISION=""
   if ! ( set_current "$sha" && activate "$sha" ); then
     echo "deploy: $sha failed (migration, start or health check); restoring ${previous:-<none>}" >&2
-    if [[ -n "$previous" ]]; then
+    if [[ -n "$previous" && "$previous_restorable" == 0 ]]; then
+      # Nothing to restore TO: the running release cannot be committed under runtime containment. Fail closed,
+      # say so, and do not report a restore that did not happen.
+      echo "deploy: $previous predates runtime containment and CANNOT be restored; it was NOT restored. The stack is being stopped (fail closed)." >&2
+      stop_stack "$sha"
+      set_current "$previous"
+      manual_recovery
+      exit 10
+    elif [[ -n "$previous" ]]; then
       # The new release may already have migrated the database. Read the REAL revision and
       # let the previous release accept it only if this bundle's signed declaration says so.
       local db_now accept
@@ -558,6 +596,13 @@ main() {
   mkdir -p "$BASE"/{releases,state,staging,shared}
   exec 9>"$BASE/state/deploy.lock"
   flock -n 9 || die "another deploy is running" 4
+  # The watchdog's right to change the stack (runtime-containment.sh, "LOCKING"): taken for the whole of this
+  # deploy so that a deploy and a watchdog stop/start never overlap. It is held by the watchdog only while it is
+  # ACTING, so this normally returns at once; if the watchdog is in the middle of an action, wait for it. The
+  # truncating open makes the lock file's mtime the start of this deploy (the hung-deploy bound).
+  exec 8>"$BASE/state/containment.action.lock"
+  flock -w "$ACTION_LOCK_WAIT" 8 \
+    || die "the runtime-containment watchdog is in the middle of stopping or starting the stack (waited ${ACTION_LOCK_WAIT}s); retry in a minute" 4
   case "$SSH_ORIGINAL_COMMAND" in
     deploy)              do_deploy normal ;;
     deploy-irreversible) do_deploy irreversible ;;
