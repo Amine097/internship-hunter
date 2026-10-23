@@ -14,7 +14,7 @@ env:
 jobs:
   lint-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40   # the suite (the containment matrix and the integration tests) outgrew 20
     services:
       postgres:
         image: postgres:17-alpine
