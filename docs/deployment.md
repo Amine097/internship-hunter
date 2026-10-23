@@ -239,10 +239,12 @@ The post-start check (V11) remains: it proves Docker honoured the rendered value
 
 **CLI mode (`AGENT_MODE=cli`) is a separate requirement; this change does not enable it.** What holds today
 is structural and is already tested in demo mode: agents are internal-only, so DNS gives them neither a
-way out nor a tunnel. Blockers to clear before CLI mode, none solved here: (1) the pinned Claude/Codex CLI
-versions must be run to confirm they hand the *hostname* to the proxy (`CONNECT host:443`) instead of resolving
-it themselves - a CLI that resolves locally gets SERVFAIL and fails, and the fix must not be to give agents a
-resolver; (2) the provider allow-lists (`EGRESS_ALLOW_*`) are still the documented defaults; (3) RSM stays off
+way out nor a tunnel. Blockers to clear before CLI mode: (1) ~~the pinned Claude/Codex CLI versions must be
+run to confirm they hand the *hostname* to the proxy~~ - **done**: they do (no DNS query at all, `CONNECT
+host:443`, SNI == host; CI job `cli-egress-probe`, docs/security-architecture.md "Egress"); a CLI that resolved
+locally would get SERVFAIL, and the fix must never be to give agents a resolver; (2) ~~the provider allow-lists
+are still the documented defaults~~ - **done**: the defaults are now exactly the hosts the pinned CLIs need
+(measured), and the probe fails if a CLI upgrade needs more; (3) RSM stays off
 (its DNS independence flag is unrelated to this); (4) the proxies' resolver is shared with `discovery`/`telegram`
 through `10.0.2.3`, so a compromised *proxy* still has DNS as a covert channel to the public Internet (see
 "Limits you accept").
@@ -602,10 +604,12 @@ child's mount namespace only):
 | start gate of a service on `docker0` | stops it | lets it run |
 | 9 kinds of tampering (a reject deleted, ACCEPT inserted before our jumps, a jump removed, chain flushed, ACCEPT inside the chain, INPUT chain edited, IPv6 chain flushed, INPUT jump removed, ACCEPT inserted before Docker's own jump) | - | `status` fails; `apply` repairs (the displaced Docker jump is reported, not "repaired") |
 
-With the real `docker/egress-proxy.sh` (tinyproxy 1.11.3; the image ships Alpine 3.20's) in the same
-sandbox: `CONNECT` to an allow-listed public name -> `200` before and after; to an allow-listed *name that
-resolves to the host's tailnet IP* -> `200` before (the hostname filter does not protect the host) and `500`
-after; IP literals, other ports, other names -> `403` both ways. The probe and gate scripts were also run
+With the then-current `docker/egress-proxy.sh` (tinyproxy, Alpine 3.20's 1.11.x; replaced since by
+`docker/egress_proxy.py`, see docs/security-architecture.md "Egress") in the same sandbox: `CONNECT` to an
+allow-listed public name -> `200` before and after; to an allow-listed *name that resolves to the host's
+tailnet IP* -> `200` before (the hostname filter did not protect the host) and `500` after; IP literals,
+other ports, other names -> `403` both ways. The replacement refuses such a name itself
+(`403 resolve-non-global`) before the guard is even consulted. The probe and gate scripts were also run
 with **Alpine 3.20's own busybox `nc`** (1.36.1): `nc -vv -z` prints `Connection refused` /
 `Host is unreachable` / `Network unreachable` / `Operation timed out`, and **`nc -z` alone is silent on a
 refusal** - which is why the probes use `-vv` and calibrate against it.
@@ -656,7 +660,10 @@ incomplete result fails the job.
 ### Limits you accept
 
 - Public Internet space stays open at the network level: a compromised proxy can open a socket to
-  any public IP and port; only the hostname list narrows the CONNECT path.
+  any public IP and port; the CONNECT path is narrowed by the hostname list, the pinned global address
+  and the SNI check, not by the network. Inside a correctly named TLS session the proxy sees nothing
+  (domain fronting by `Host` header is not detectable without terminating TLS; docs/security-architecture.md,
+  "Egress").
 - DNS is a covert channel for anything with a route out: `10.0.2.3` forwards arbitrary names to the host's
   resolver (and from there to the Internet), so a compromised `egress-*`, `discovery`, `telegram` or `api`
   container could tunnel data through queries. Internal-only services (the agents) cannot; the proxies'

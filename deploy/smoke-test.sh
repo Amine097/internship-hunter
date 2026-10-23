@@ -120,44 +120,101 @@ PY
 ok "database rejects forged task kinds/states (no function names, no payloads)"
 
 # 3. agent isolation --------------------------------------------------------------------------
-reach() { # reach <service> <host:port> -> REACHABLE|blocked
-  exec_in "$1" python - <<PY | tr -d '\r'
-import socket
-h, p = "${2%%:*}", int("${2##*:}")
-try:
-    socket.create_connection((h, p), timeout=4)
-    print("REACHABLE")
-except OSError:
-    print("blocked")
+# Every probe result is CLASSIFIED, and only a result that proves the packet did not get through
+# counts as isolation: `unreachable` (EHOSTUNREACH/ENETUNREACH/EACCES/EPERM) or `timeout`. A refusal
+# (ECONNREFUSED/reset) is an ANSWER from the target: the path exists. A name that does not resolve
+# proves nothing about the network, so every target is an IP ADDRESS read from Docker itself. Each
+# probe run carries positive controls: the tool must see an open and a refused local port in that
+# very container, and every address on a network the agent DOES share must be reached.
+probe() { # probe <service> <ip:port>... -> CONTROL lines + "RESULT <ip:port> <open|refused|unreachable|timeout|error>"
+  exec_in "$1" python - "${@:2}" <<'PY' | tr -d '\r'
+import errno, socket, sys, threading
+BLOCKED = {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EACCES, errno.EPERM}
+def classify(host, port):
+    try:
+        socket.create_connection((host, int(port)), timeout=4).close()
+        return "open"
+    except (ConnectionRefusedError, ConnectionResetError):
+        return "refused"
+    except TimeoutError:
+        return "timeout"
+    except socket.gaierror:
+        return "error"              # targets are IP literals: any name lookup is a probe defect
+    except OSError as e:
+        return "unreachable" if e.errno in BLOCKED else "error"
+srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1); port = srv.getsockname()[1]
+print("CONTROL open", classify("127.0.0.1", port))
+srv.close()
+print("CONTROL refused", classify("127.0.0.1", port))
+res = {}
+def run(t):
+    host, _, p = t.rpartition(":")
+    res[t] = classify(host, p)
+threads = [threading.Thread(target=run, args=(t,)) for t in sys.argv[1:]]
+for t in threads: t.start()
+for t in threads: t.join()
+for t in sys.argv[1:]:
+    print("RESULT", t, res[t])
 PY
 }
-for target in postgres:5432 agent-claude-1:8100 api:8000 discovery:8100 egress-claude-1:3128 \
-              1.1.1.1:443 8.8.8.8:53 169.254.169.254:80; do
-  [[ "$(reach agent-codex "$target")" == blocked ]] || fail "agent-codex can reach $target"
+result_of() { awk -v t="$2" '$1 == "RESULT" && $2 == t {print $3}' <<<"$1"; }
+cid() { "${COMPOSE[@]}" ps -q "$1"; }
+net_ips() { # net_ips <service> -> "<network> <ip>" per attached network
+  docker inspect -f '{{range $n, $c := .NetworkSettings.Networks}}{{$n}} {{$c.IPAddress}}{{"\n"}}{{end}}' "$(cid "$1")"
+}
+probe_port() { case "$1" in postgres) echo 5432 ;; api) echo 8000 ;; agent-*) echo 8100 ;; egress-*) echo 3128 ;; *) echo 9 ;; esac; }
+mapfile -t RUNNING_SVCS < <("${COMPOSE[@]}" ps --services --status running)
+host_leaks=()
+for agent in agent-claude-1 agent-claude-2 agent-codex; do
+  mine=" $(net_ips "$agent" | awk '{print $1}' | tr '\n' ' ') "
+  shared=(); separate=()
+  for svc in "${RUNNING_SVCS[@]}"; do
+    [[ "$svc" == "$agent" ]] && continue
+    port="$(probe_port "$svc")"
+    while read -r net ip; do
+      [[ -n "$ip" ]] || continue
+      if [[ "$mine" == *" $net "* ]]; then shared+=("$ip:$port"); else separate+=("$ip:$port"); fi
+    done < <(net_ips "$svc")
+  done
+  internet=(1.1.1.1:443 8.8.8.8:53 169.254.169.254:80)
+  hostt=(); for ip in "${PROTECTED_IPS[@]}"; do hostt+=("$ip:22" "$ip:8000"); done
+  [[ ${#shared[@]} -ge 2 && ${#separate[@]} -ge 5 ]] \
+    || fail "$agent: the topology the isolation probe expects is missing (shared=${shared[*]} separate=${separate[*]})"
+  out="$(probe "$agent" "${shared[@]}" "${separate[@]}" "${internet[@]}" "${hostt[@]}")"
+  [[ "$(awk '$1 == "CONTROL" && $2 == "open" {print $3}' <<<"$out")" == open \
+     && "$(awk '$1 == "CONTROL" && $2 == "refused" {print $3}' <<<"$out")" == refused ]] \
+    || fail "$agent: the probe's own controls failed - isolation UNVERIFIED ($out)"
+  for t in "${shared[@]}"; do      # positive control: a path that must exist is seen as one
+    r="$(result_of "$out" "$t")"
+    [[ "$r" == open || "$r" == refused ]] || fail "$agent cannot reach $t on a network it shares ($r): the probe cannot see a path, isolation UNVERIFIED"
+  done
+  for t in "${separate[@]}" "${internet[@]}"; do
+    r="$(result_of "$out" "$t")"
+    [[ "$r" == unreachable || "$r" == timeout ]] || fail "$agent reaches $t ($r: a refusal is an answer, not isolation)"
+  done
+  for t in "${hostt[@]}"; do
+    r="$(result_of "$out" "$t")"
+    case "$r" in
+      unreachable|timeout) ;;
+      open|refused) host_leaks+=("$agent->$t") ;;
+      *) fail "$agent: unclassifiable result for host address $t ($r) - isolation UNVERIFIED" ;;
+    esac
+  done
+  own="$(net_ips "egress-${agent#agent-}" | awk -v m="$mine" 'index(m, " " $1 " ") {print $2; exit}')"
+  [[ -n "$own" && "$(result_of "$out" "$own:3128")" == open ]] || fail "$agent cannot reach its own proxy by address"
 done
 # The host's own addresses follow SMOKE_HOST_ISOLATION like deploy/check-host-isolation.sh: on a
 # rootful CI runner an internal network's gateway IS an address of the host (sshd listens on
 # 0.0.0.0), so there it is reported; on the production host it must be unreachable (enforce).
-host_leaks=()
-for ip in "${PROTECTED_IPS[@]}"; do
-  for port in 22 8000; do
-    [[ "$(reach agent-codex "$ip:$port")" == blocked ]] || host_leaks+=("$ip:$port")
-  done
-done
 if [[ ${#host_leaks[@]} -gt 0 ]]; then
   case "${SMOKE_HOST_ISOLATION:-enforce}" in
-    report) echo "WARN agent-codex reaches host address(es) ${host_leaks[*]} (report mode: a rootful" \
+    report) echo "WARN agents reach host address(es) ${host_leaks[*]} (report mode: a rootful" \
                  "daemon exposes the bridge gateway; NOT acceptable in production)" >&2 ;;
-    *) fail "agent-codex can reach host address(es): ${host_leaks[*]}" ;;
+    *) fail "agents reach host address(es): ${host_leaks[*]}" ;;
   esac
 fi
-if [[ ${#host_leaks[@]} -eq 0 ]]; then
-  ok "agent cannot reach postgres / peers / api / orchestrator / other proxies / the host / the Internet directly"
-else
-  ok "agent cannot reach postgres / peers / api / orchestrator / other proxies / the Internet directly (host: see WARN)"
-fi
-[[ "$(reach agent-codex egress-codex:3128)" == REACHABLE ]] || fail "agent cannot reach its own proxy"
-ok "agent reaches only its own egress proxy"
+ok "all three agents: every address on another network, the Internet$([[ ${#host_leaks[@]} -eq 0 ]] && echo ' and the host') unreachable (classified, by IP); every address on a shared network reached; probe controls verified"
+ok "each agent reaches its own egress proxy by address"
 
 env_dump="$(exec_in agent-codex env)"
 for k in DATABASE_URL ADMIN_TOKEN TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD REDIS_URL; do
@@ -165,8 +222,10 @@ for k in DATABASE_URL ADMIN_TOKEN TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD REDIS_URL
 done
 ok "agent environment holds no infrastructure credentials"
 
+# by service NAME, as hunter/settings.py configures the orchestrator; only `open` is success
+out="$(probe discovery agent-claude-1:8100 agent-claude-2:8100 agent-codex:8100)"
 for a in agent-claude-1 agent-claude-2 agent-codex; do
-  [[ "$(reach discovery "$a:8100")" == REACHABLE ]] || fail "orchestrator cannot reach $a"
+  [[ "$(result_of "$out" "$a:8100")" == open ]] || fail "orchestrator cannot reach $a ($(result_of "$out" "$a:8100"))"
 done
 ok "orchestrator reaches every agent runner"
 
@@ -189,56 +248,112 @@ ctl_mounts="$(docker inspect --format '{{range .Mounts}}{{.Source}} {{end}}' \
 ok "demo stack: session-controller has no broker socket and RSM is disabled"
 
 # 4. egress policy ----------------------------------------------------------------------------
-connect() { # connect <agent> <proxy> <host> <port> -> HTTP status of CONNECT, or "error"
-  exec_in "$1" python - <<PY | tr -d '\r'
-import socket
+# Every agent reaches the outside only through ITS proxy (docker/egress_proxy.py). A refusal counts
+# only as the proxy's POLICY answer - exactly `403` with an X-Egress-Reason - never as "anything but
+# 200": a dead, crashed or misrouted proxy (connection error, 502, 503) must FAIL this test.
+PAIRS=("agent-claude-1 egress-claude-1 api.anthropic.com" "agent-claude-2 egress-claude-2 api.anthropic.com"
+       "agent-codex egress-codex api.openai.com")
+ask() { # ask <agent> <proxy> <request line> -> "<status> <X-Egress-Reason or ->", or "error <why>"
+  exec_in "$1" python - "$2" "$3" <<'PY' | tr -d '\r'
+import socket, sys
 try:
-    s = socket.create_connection(("$2", 3128), timeout=8)
-    s.sendall(b"CONNECT $3:$4 HTTP/1.1\r\nHost: $3:$4\r\n\r\n")
-    print(s.recv(256).split(b" ")[1].decode())
-except Exception:
-    print("error")
+    s = socket.create_connection((sys.argv[1], 3128), timeout=8)
+    host = sys.argv[2].split(" ")[1].split("/")[2] if "://" in sys.argv[2] else sys.argv[2].split(" ")[1]
+    s.sendall(f"{sys.argv[2]} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(1024)
+        if not chunk:
+            break
+        head += chunk
+    lines = head.split(b"\r\n\r\n")[0].decode("latin-1").split("\r\n")
+    reason = next((ln.split(": ", 1)[1] for ln in lines[1:] if ln.lower().startswith("x-egress-reason: ")), "-")
+    print(lines[0].split(" ")[1], reason)
+except Exception as e:
+    print("error", type(e).__name__)
 PY
 }
-denied() { [[ "$1" != 200 ]] && return 0 || return 1; }
-# the proxy must also refuse CONNECT to the real host addresses (hostname filtering; the
-# network-level proof that the host is unreachable is deploy/check-host-isolation.sh below)
-host_targets=()
-for ip in "${PROTECTED_IPS[@]}"; do host_targets+=("$ip 22" "$ip 8000" "$ip 443"); done
-for t in "${host_targets[@]}"; do
-  read -r host port <<<"$t"
-  denied "$(connect agent-claude-1 egress-claude-1 "$host" "$port")" || fail "claude-1 proxy allowed CONNECT to host $host:$port"
-  denied "$(connect agent-codex egress-codex "$host" "$port")" || fail "codex proxy allowed CONNECT to host $host:$port"
+refused() { [[ "$1" =~ ^403\ (host|port|method)$ ]]; }   # the proxy said no, for a policy reason
+# the proxies must refuse CONNECT to the real host addresses (hostname policy; the network-level
+# proof that the host is unreachable is deploy/check-host-isolation.sh below)
+targets=()
+for ip in "${PROTECTED_IPS[@]}"; do targets+=("$ip:22" "$ip:8000" "$ip:443"); done
+targets+=(example.com:443 1.1.1.1:443 169.254.169.254:443 10.0.0.1:443 host.docker.internal:443
+          100.64.0.1:443 100.100.100.100:443 192.168.0.1:443 172.16.0.1:443 127.0.0.1:443
+          localhost:443 "[::1]:443" api.anthropic.com:22 api.anthropic.com.evil.example:443
+          api.openai.com:80 github.com:443 claude.ai:443 statsig.anthropic.com:443)
+for pair in "${PAIRS[@]}"; do
+  read -r agent proxy _ <<<"$pair"
+  for t in "${targets[@]}"; do
+    r="$(ask "$agent" "$proxy" "CONNECT $t")"
+    refused "$r" || fail "$proxy did not refuse CONNECT $t with a policy 403 (got: $r)"
+  done
 done
-for t in "example.com 443" "1.1.1.1 443" "169.254.169.254 443" "10.0.0.1 443" "host.docker.internal 443" \
-         "100.64.0.1 443" "100.100.100.100 443" "192.168.0.1 443" "172.16.0.1 443" \
-         "127.0.0.1 443" "localhost 443" \
-         "api.anthropic.com 22" "api.anthropic.com.evil.example 443" "api.openai.com 443"; do
-  read -r host port <<<"$t"
-  denied "$(connect agent-claude-1 egress-claude-1 "$host" "$port")" || fail "claude-1 proxy allowed $host:$port"
+for t in agent-claude-1:egress-claude-1:api.openai.com agent-claude-2:egress-claude-2:api.openai.com \
+         agent-codex:egress-codex:api.anthropic.com; do
+  IFS=: read -r agent proxy host <<<"$t"
+  r="$(ask "$agent" "$proxy" "CONNECT $host:443")"
+  refused "$r" || fail "$proxy did not refuse the other provider $host (got: $r)"
 done
-denied "$(connect agent-codex egress-codex api.anthropic.com 443)" || fail "codex proxy allowed anthropic"
-ok "proxy refuses other hosts, IP literals, tailnet/LAN/metadata/loopback addresses, other ports and look-alikes"
-
-plain="$(exec_in agent-codex python - <<'PY' | tr -d '\r'
-import socket
-try:
-    s = socket.create_connection(("egress-codex", 3128), timeout=8)
-    s.sendall(b"GET http://api.openai.com/ HTTP/1.1\r\nHost: api.openai.com\r\nConnection: close\r\n\r\n")
-    print(s.recv(64).split(b" ")[1].decode())
-except Exception:
-    print("error")
-PY
-)"
-[[ "$plain" != 200 && "$plain" != 301 && "$plain" != 404 && "$plain" != 400 ]] \
-  || fail "proxy forwarded a plain-HTTP request to an allowed host (status $plain)"
-ok "proxy is CONNECT-only: plain HTTP forwarding to an allowed host is refused ($plain)"
+ok "all three proxies refuse other hosts, IP literals, tailnet/LAN/metadata/loopback addresses, other ports, look-alikes and the other provider (policy 403)"
+for pair in "${PAIRS[@]}"; do
+  read -r agent proxy host <<<"$pair"
+  r="$(ask "$agent" "$proxy" "GET http://$host/")"
+  [[ "$r" == "403 method" ]] || fail "$proxy did not refuse plain-HTTP forwarding with a policy 403 (got: $r)"
+done
+ok "all three proxies are CONNECT-only: plain HTTP forwarding is refused (403 method)"
+# Positive control, also with SMOKE_EXTERNAL=0: the allow-listed provider host must NOT be a policy
+# refusal - otherwise a deny-all proxy (a mistyped EGRESS_ALLOW) would pass every check above.
+# 200 (tunnel opened) or 502/504 (allowed, but no network here) all mean the policy said yes.
+for pair in "${PAIRS[@]}"; do
+  read -r agent proxy host <<<"$pair"
+  r="$(ask "$agent" "$proxy" "CONNECT $host:443")"
+  [[ "$r" =~ ^(200|502|504)\  ]] || fail "$proxy does not allow its own provider $host (got: $r)"
+done
+ok "each proxy allows its own provider host (policy positive control)"
 if [[ "$EXTERNAL" == 1 ]]; then
-  [[ "$(connect agent-claude-1 egress-claude-1 api.anthropic.com 443)" == 200 ]] \
-    || fail "claude-1 cannot reach its provider"
-  [[ "$(connect agent-codex egress-codex api.openai.com 443)" == 200 ]] \
-    || fail "codex cannot reach its provider"
-  ok "legitimate provider access still works (CONNECT api.anthropic.com / api.openai.com)"
+  # Real provider, real certificate, through the proxy's TLS gate: the right server name completes a
+  # verified handshake; a swapped server name (a different site on a shared CDN) is cut by the proxy
+  # before the provider sees it - and the proxy's own log says why.
+  tls_via() { # tls_via <agent> <proxy> <connect host> <TLS server name> -> "tls-ok <version>" | "cut <why>" | "error <why>"
+    exec_in "$1" python - "$2" "$3" "$4" <<'PY' | tr -d '\r'
+import socket, ssl, sys
+proxy, host, sni = sys.argv[1:4]
+try:
+    s = socket.create_connection((proxy, 3128), timeout=10)
+    s.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(1024)
+        if not chunk:
+            break
+        head += chunk
+    if head.split(b" ")[1:2] != [b"200"]:
+        print("error connect", head[:40]); sys.exit()
+    try:
+        t = ssl.create_default_context().wrap_socket(s, server_hostname=sni)
+        print("tls-ok", t.version())
+    except (ssl.SSLEOFError, ConnectionResetError, ConnectionAbortedError) as e:
+        print("cut", type(e).__name__)
+except Exception as e:
+    print("error", type(e).__name__, str(e)[:80])
+PY
+  }
+  # The swapped name is unique to this run and the log is read only from this run's start, so the
+  # evidence is THIS cut: an older line, or a cut for another reason, cannot satisfy the check.
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  for pair in "${PAIRS[@]}"; do
+    read -r agent proxy host <<<"$pair"
+    r="$(tls_via "$agent" "$proxy" "$host" "$host")"
+    [[ "$r" == "tls-ok TLSv1."* ]] || fail "$agent cannot complete a verified TLS handshake with $host through $proxy ($r)"
+    swap="smoke-$(date +%s)-$RANDOM-$proxy.example.com"
+    r="$(tls_via "$agent" "$proxy" "$host" "$swap")"
+    [[ "$r" == cut* ]] || fail "$proxy let a TLS handshake for $swap through a CONNECT to $host ($r)"
+    "${COMPOSE[@]}" logs --no-color --since "$since" "$proxy" 2>/dev/null \
+      | grep -F "$swap" | grep -qF '"reason": "tls-sni-mismatch"' \
+      || fail "$proxy did not log THIS run's cut SNI swap ($swap) as tls-sni-mismatch"
+  done
+  ok "verified TLS to each provider works through its proxy; a swapped TLS server name is cut by every proxy (tls-sni-mismatch)"
 fi
 
 # 4b. host isolation (the checks that matter most on a rootless production host) ----------------

@@ -79,9 +79,9 @@ def stub(tmp_path):
     nc = tmp_path / "bin" / "nc"
     nc.write_text(NC)
     nc.chmod(nc.stat().st_mode | stat.S_IEXEC)
-    for name in ("tinyproxy",):
+    for name in ("hunter-egress-proxy",):
         f = tmp_path / "bin" / name
-        f.write_text('#!/bin/sh\necho "tinyproxy started" >> "$STUB_DIR/started"\n')
+        f.write_text('#!/bin/sh\necho "hunter-egress-proxy started" >> "$STUB_DIR/started"\n')
         f.chmod(0o755)
     (tmp_path / "py" / "sitecustomize.py").write_text(SITECUSTOMIZE)
     return tmp_path
