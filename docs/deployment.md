@@ -522,6 +522,38 @@ Plan the migration deploy for a moment when a short outage is acceptable, take t
 too), and use `deploy-irreversible`. After it, every later release is committable and the normal restore path
 applies.
 
+**What a project container must be (`SPEC`).** Docker labels are free text: `docker run --label
+com.docker.compose.project=… --label com.docker.compose.service=agent-codex` yields a container the watchdog
+used to treat as the agent, whatever else it carried (`--cap-add NET_ADMIN`, `seccomp=unconfined`, `-v /:/host`).
+`commit` now renders, from the release's own compose files (`docker compose config`) and the image store, a
+**spec** for every service and stores it in the contract (version 2; the image is pinned by *content*: the id
+the tag had at commit). Every cycle each project container, running or stopped, is compared with it:
+
+| Compared | Rule |
+|---|---|
+| image | `Config.Image` equals the compose reference **and** the image id equals the pinned one (a moved tag is a different container); entrypoint, command and user equal the release's (or the image's own defaults) |
+| privileges | `Privileged` false; `CapAdd`/`CapDrop`, `SecurityOpt` (`no-new-privileges`, no `*=unconfined`), `ReadonlyRootfs`, devices, device cgroup rules, sysctls, `GroupAdd` equal the release's; no dangerous capability (`NET_ADMIN`, `SYS_ADMIN`, `NET_RAW`, `SYS_PTRACE`, …) even if a release asked |
+| namespaces | pid/uts/userns `""`; ipc `private`/`shareable`/`none`; cgroupns `private`; cgroup parent empty; runtime = the daemon's default (`docker info`) — unless the release says otherwise |
+| network | `NetworkMode` is one of the release's own networks (never host, `container:`, bridge); `ExtraHosts` (`host-gateway`) and published ports (`PortBindings`, `PublishAllPorts`) equal the release's; `VolumesFrom`/`Links` empty |
+| mounts | the **effective** mount list (what `-v`, `--mount`, `--tmpfs` and image `VOLUME`s produced) equals the release's volumes/binds/tmpfs, plus anonymous volumes at destinations the *image* declares; the Docker socket never |
+
+A difference is a latching `SPEC` finding naming it (`cap_add is ['NET_ADMIN'], the release says []`, `mounts
+differ: unexpected [('bind', '/', '/host', False)]`); a running impostor is stopped with the set whether it is
+supervised or not; a **stopped** impostor is caught before the watchdog can `compose start` it. Environment
+variables are not compared (see residual risk 8). `commit` refuses (exit 11) a release that itself asks for
+a dangerous capability, an unconfined security option, a device, the Docker socket, a host namespace,
+`volumes_from`/`links`, or an image missing from the store (it cannot be pinned) — `commit --check`, which
+runs before the images are loaded, skips only that last check.
+
+*Transitions.* While a deploy holds the action lock the watchdog yields, so release B's containers are never
+judged by release A's contract; once `commit` wrote B's contract they are B's containers. A rollback re-commits
+A (its own spec, its own pinned ids) before the watchdog sees A's containers again. `compose up
+--force-recreate` produces the same spec and is accepted. A container that vanishes between `docker ps` and
+`docker inspect` makes the cycle `unverified` (nothing is changed, retried), never a finding. Left behind by a
+deploy killed halfway, a stopped container of another release carrying the service label **is** a finding
+(`docker rm` it, then `reset`). A contract written before this change (version 1) is *not* enforced for the
+spec: a `SPEC-LEGACY` warning says so every cycle until the next deploy commits version 2.
+
 **Failure behaviour** (each is a test in `tests/test_runtime_containment.py` against a stateful fake daemon,
 and, where marked *real*, in `tests/test_runtime_containment_lab.py` on a genuine rootless Docker):
 guard rule deleted / guard removed / daemon restarted (*real*: stop → repair → start, never start before a
@@ -549,7 +581,10 @@ defends against compromised *containers* and mistakes, not against that user. (3
 data-tier container is outside this layer's model (it has no route to the host or the Internet). (5)
 The runtime DNS check reads Docker's `ResolvConfPath` files (readable by the daemon's owner); a Docker that
 stops writing the `ExtServers` annotation makes the OUT services `UNVERIFIED` (stop, self-healing) rather
-than passing. (6) Not verified on the production host: the unit under the real user manager, `ip monitor`
+than passing. (8) The spec does not cover the container's **environment**, its healthcheck, or who may *create* containers:
+anyone who can talk to the rootless Docker socket (the `hunter-deploy` user) can also write the contract or stop
+the watchdog — the spec defends against containers and operator mistakes, not against that user. A foreign
+container (no project label) that mounts a project *volume* is also outside it. (6) Not verified on the production host: the unit under the real user manager, `ip monitor`
 and `docker events` there, the first Tailscale-late boot. (7) `AGENT_MODE=cli` stays disabled: this layer is
 the runtime-containment prerequisite for it, not the whole of it (see "CLI mode" above: the pinned CLIs must
 still hand hostnames to the proxy, the allow-lists are still defaults, RSM stays off).

@@ -121,6 +121,12 @@ Derived checks (also run in CI against the Docker runner, in report mode, withou
       watchdog (exit 11/13), release committed only after every gate and with the isolation parameters,
       refusal = failed activation (previous release restored and re-committed), `desired: stopped` recorded
       before a teardown
+- [x] **L** CONTRACT (impostor with the project's labels): every project container is compared with the spec
+      `commit` rendered from the release's compose files and image store (image by content, process, caps,
+      security options, devices, sysctls, namespaces, ports, effective mounts); the reported container (agent
+      labels + `NET_ADMIN` + unconfined seccomp + host root mounted) and 17 compose-built lookalikes with exactly
+      one extra property are stopped and latched on a real rootless Docker, recreation by compose, a deploy
+      in progress and a rollback are not false positives (`tests/test_runtime_containment_spec_lab.py`)
 - [x] **L** re-review fixes (fake daemon + real rootless Docker + real guard in a netns): the watchdog never
       takes `deploy.lock` (a deploy is never refused by a check cycle; the action lock is held only while ACTING,
       observed again after taking it, held by a deploy for its whole duration); a host-address change is absorbed

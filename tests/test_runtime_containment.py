@@ -43,19 +43,138 @@ SUPERVISED = OUT + AGENTS
 DATA = ["postgres", "scheduler", "session-controller"]
 
 
-def template():
-    nets = {
-        n: {"internal": bool((v or {}).get("internal"))} for n, v in COMPOSE["networks"].items()
+PROJECT = "internship-hunter"
+# what the images declare themselves (docker image inspect): the defaults a service without
+# command/entrypoint/user in compose.yaml runs with
+IMAGE_BASES = {
+    "postgres:17-alpine": {
+        "Entrypoint": ["docker-entrypoint.sh"],
+        "Cmd": ["postgres"],
+        "User": "",
+        "Volumes": {"/var/lib/postgresql/data": {}},
+    },
+    "internship-hunter-app": {"Entrypoint": None, "Cmd": ["python"], "User": "hunter"},
+    "internship-hunter-agent": {"Entrypoint": None, "Cmd": ["python"], "User": "hunter"},
+    "internship-hunter-egress": {
+        "Entrypoint": ["/usr/local/bin/egress-entry.sh"],
+        "Cmd": ["python", "/app/egress_proxy.py"],
+        "User": "proxy",
+    },
+}
+
+
+def image_defaults(ref):
+    return IMAGE_BASES[ref.split(":")[0] if ref.startswith("internship") else ref]
+
+
+def render(name, svc, sha=SHA):
+    """One service as `docker compose config --format json` renders it (the subset that matters)."""
+    r = {
+        "image": svc["image"].replace("${RELEASE_SHA:-dev}", sha),
+        "restart": svc.get("restart", "unless-stopped"),
+        "networks": {n: None for n in svc.get("networks", [])},
+        "cap_drop": list(svc.get("cap_drop", [])),
+        "security_opt": list(svc.get("security_opt", [])),
+        "read_only": bool(svc.get("read_only")),
+        "tmpfs": list(svc.get("tmpfs", [])),
+        "command": svc.get("command"),
+        "entrypoint": svc.get("entrypoint"),
+        "volumes": [],
+        "ports": [],
     }
-    services = {}
-    for name, svc in COMPOSE["services"].items():
-        services[name] = {
-            "networks": {n: None for n in svc.get("networks", [])},
-            "restart": svc.get("restart", "unless-stopped"),
+    if svc.get("cap_add"):
+        r["cap_add"] = list(svc["cap_add"])
+    for v in svc.get("volumes", []):
+        src, dst = v.split(":")
+        r["volumes"].append({"type": "volume", "source": src, "target": dst, "volume": {}})
+    for port in svc.get("ports", []):
+        ip, pub, tgt = port.split(":")
+        r["ports"].append(
+            {
+                "mode": "ingress",
+                "host_ip": ip,
+                "target": int(tgt),
+                "published": pub,
+                "protocol": "tcp",
+            }
+        )
+    if svc.get("dns"):
+        r["dns"] = list(svc["dns"])
+    return r
+
+
+def template(sha=SHA):
+    nets = {
+        n: {"internal": bool((v or {}).get("internal")), "name": f"{PROJECT}_{n}"}
+        for n, v in COMPOSE["networks"].items()
+    }
+    volumes = {v: {"name": f"{PROJECT}_{v}"} for v in COMPOSE["volumes"]}
+    services = {name: render(name, svc, sha) for name, svc in COMPOSE["services"].items()}
+    return {"networks": nets, "services": services, "volumes": volumes}
+
+
+def image_id(ref):
+    return "sha256:" + (ref.encode().hex() * 4)[:64]
+
+
+def release_images(sha):
+    refs = {render(n, v, sha)["image"] for n, v in COMPOSE["services"].items()}
+    return {ref: {"Id": image_id(ref), "Config": image_defaults(ref)} for ref in refs}
+
+
+def genuine(name, sha=SHA):
+    """The (Config, HostConfig, Mounts, Image) `docker inspect` reports for a container that
+    compose created for service `name` of the release: what the assessor must accept."""
+    r = render(name, COMPOSE["services"][name], sha)
+    img = image_defaults(r["image"])
+    ports = {
+        f"{p['target']}/tcp": [{"HostIp": p["host_ip"], "HostPort": p["published"]}]
+        for p in r["ports"]
+    }
+    first = sorted(r["networks"])[0] if r["networks"] else "default"
+    hc = {
+        "NetworkMode": f"{PROJECT}_{first}",
+        "Privileged": False,
+        "CapAdd": r.get("cap_add"),
+        "CapDrop": r["cap_drop"],
+        "SecurityOpt": r["security_opt"] or None,
+        "ReadonlyRootfs": r["read_only"],
+        "PidMode": "",
+        "IpcMode": "private",
+        "UTSMode": "",
+        "UsernsMode": "",
+        "CgroupnsMode": "private",
+        "CgroupParent": "",
+        "Devices": [],
+        "DeviceCgroupRules": None,
+        "DeviceRequests": None,
+        "Sysctls": None,
+        "Runtime": "runc",
+        "VolumesFrom": None,
+        "Links": None,
+        "ExtraHosts": None,
+        "GroupAdd": None,
+        "PublishAllPorts": False,
+        "PortBindings": ports or {},
+        "Tmpfs": {t: "" for t in r["tmpfs"]} or None,
+    }
+    mounts = [
+        {
+            "Type": "volume",
+            "Name": f"{PROJECT}_{v['source']}",
+            "Source": f"/var/lib/docker/volumes/{PROJECT}_{v['source']}/_data",
+            "Destination": v["target"],
+            "RW": True,
         }
-        if svc.get("dns"):
-            services[name]["dns"] = list(svc["dns"])
-    return {"networks": nets, "services": services}
+        for v in r["volumes"]
+    ] + [{"Type": "tmpfs", "Source": "", "Destination": t, "RW": True} for t in r["tmpfs"]]
+    config = {
+        "Image": r["image"],
+        "Entrypoint": r["entrypoint"] or img["Entrypoint"],
+        "Cmd": r["command"] or img["Cmd"],
+        "User": img["User"],
+    }
+    return config, hc, mounts, image_id(r["image"])
 
 
 DOCKER = textwrap.dedent("""\
@@ -85,11 +204,14 @@ DOCKER = textwrap.dedent("""\
         nets = {}
         for nid in c["nets"]:
             nets[s["networks"][nid]["name"]] = {"NetworkID": nid}
-        return {"Id": cid, "Name": "/" + c["name"], "Config": {"Labels": labels(c)},
+        return {"Id": cid, "Name": "/" + c["name"],
+                "Config": {**c.get("config", {}), "Labels": labels(c)},
+                "Image": c.get("image_id", ""),
                 "State": {"Running": c["running"],
                           "Health": {"Status": c["health"]} if c["health"] != "none" else None},
                 "NetworkSettings": {"Networks": nets}, "HostConfig": c["host_config"],
-                "Mounts": [{"Source": m} for m in c["mounts"]], "ResolvConfPath": c["resolv"]}
+                "Mounts": [m if isinstance(m, dict) else {"Source": m} for m in c["mounts"]],
+                "ResolvConfPath": c["resolv"]}
     def network_json(s, nid):
         n = s["networks"][nid]
         lab = {}
@@ -109,6 +231,8 @@ DOCKER = textwrap.dedent("""\
         return out
     verb = args[0]
     if verb == "info":
+        if "DefaultRuntime" in " ".join(args):
+            print(os.environ.get("STUB_DEFAULT_RUNTIME", "runc")); sys.exit(0)
         print("[name=seccomp name=rootless]"); sys.exit(0)
     if verb == "events":
         while True:
@@ -123,6 +247,9 @@ DOCKER = textwrap.dedent("""\
         if n == int(os.environ["STUB_HEAL_AT_PS_CALL"]):
             s["containers"]["c-agent-codex"]["nets"] = ["net-agent_codex"]
             save(s)
+    if verb == "ps" and os.path.exists(D + "/ghost"):
+        # a container that vanishes between `ps` and `inspect` (compose recreating it)
+        print("c-ghost")
     if verb == "ps":
         want = [f.split("=", 1)[1] for f in flt(args) if f.startswith("label=")]
         everything = any(a in ("-a", "-aq") for a in args)
@@ -138,6 +265,11 @@ DOCKER = textwrap.dedent("""\
             c = s["containers"][args[3]]
             print(c["health"]); sys.exit(0)
         print(json.dumps([container_json(s, c) for c in args[1:]])); sys.exit(0)
+    if verb == "image" and args[1] == "inspect":
+        img = s.get("images", {}).get(args[2])
+        if img is None:
+            sys.exit(1)
+        print(json.dumps([img])); sys.exit(0)
     if verb == "network":
         if args[1] == "ls":
             print("\\n".join(s["networks"])); sys.exit(0)
@@ -324,6 +456,7 @@ class Rig:
                 + ("# ExtServers: [10.0.2.3]\n" if out else "# ExtServers: [host(192.168.1.1)]\n")
                 + "# Overrides: []\n"
             )
+            config, hc, mounts, img_id = genuine(name)
             containers[f"c-{name}"] = {
                 "name": f"internship-hunter-{name}-1",
                 "project": "internship-hunter",
@@ -331,8 +464,10 @@ class Rig:
                 "running": running,
                 "health": "healthy" if name.startswith(("egress", "agent", "api")) else "none",
                 "nets": [f"net-{n}" for n in svc.get("networks", [])],
-                "host_config": {"NetworkMode": "default"},
-                "mounts": [],
+                "config": config,
+                "image_id": img_id,
+                "host_config": hc,
+                "mounts": mounts,
                 "resolv": str(resolv),
             }
         # an unrelated ad hoc container on Docker's default bridge (must never be touched)
@@ -350,7 +485,8 @@ class Rig:
             "mounts": [],
             "resolv": str(adhoc),
         }
-        return {"containers": containers, "networks": nets}
+        images = release_images(SHA)
+        return {"containers": containers, "networks": nets, "images": images}
 
     def write_docker_state(self, s):
         (self.stub / "docker.json").write_text(json.dumps(s))
@@ -1591,4 +1727,437 @@ def test_ADDR_a_host_that_never_stops_changing_ends_in_a_quarantine_not_a_loop(r
     r = rig.once()
     assert r.returncode == 1 and stopped_all_supervised(rig)
     assert "kept changing" in rig.log
-    assert len([e for e in rig.events if e.startswith("guard apply")]) <= 12   # bounded
+    assert len([e for e in rig.events if e.startswith("guard apply")]) <= 12  # bounded
+
+
+# ======================================================================================
+# CONTRACT: a container that merely carries the project and service labels is not the
+# release's container
+# ======================================================================================
+# Labels are free text (`docker run --label com.docker.compose.service=agent-codex`). What
+# identifies a container of the release is everything the release's compose files say about
+# it: the image (by content), the process, the capabilities, the security options, the
+# mounts, the namespaces, the published ports.
+
+
+def container(rig, svc):
+    return rig.docker_state()["containers"][f"c-{svc}"]
+
+
+def tweak(rig, svc, fn):
+    def go(s):
+        fn(s["containers"][f"c-{svc}"])
+
+    rig.mutate(go)
+
+
+def add_cap(*caps):
+    return lambda c: c["host_config"].update(
+        CapAdd=list(c["host_config"].get("CapAdd") or []) + list(caps)
+    )
+
+
+def hc(**kw):
+    return lambda c: c["host_config"].update(kw)
+
+
+def cfg(**kw):
+    return lambda c: c["config"].update(kw)
+
+
+def add_mount(**m):
+    return lambda c: c["mounts"].append({"Type": "bind", "RW": True, **m})
+
+
+IMPOSTERS = {
+    "net_admin": add_cap("NET_ADMIN"),
+    "net_admin_spelled_CAP_": add_cap("CAP_NET_ADMIN"),
+    "sys_admin": add_cap("SYS_ADMIN"),
+    "net_raw": add_cap("NET_RAW"),
+    "sys_ptrace": add_cap("SYS_PTRACE"),
+    "caps_not_dropped": hc(CapDrop=None),
+    "only_some_caps_dropped": hc(CapDrop=["NET_BIND_SERVICE"]),
+    "privileged": hc(Privileged=True),
+    "host_root_mounted_ro": add_mount(Source="/", Destination="/host", RW=False),
+    "host_etc_mounted": add_mount(Source="/etc", Destination="/mnt/etc"),
+    "home_mounted": add_mount(Source="/home/hunter-deploy", Destination="/h"),
+    "another_agents_home": lambda c: c["mounts"].append(
+        {
+            "Type": "volume",
+            "Name": "internship-hunter_claude1_home",
+            "Source": "/v/claude1",
+            "Destination": "/other",
+            "RW": True,
+        }
+    ),
+    "docker_socket": add_mount(
+        Source="/run/user/1001/docker.sock", Destination="/var/run/docker.sock"
+    ),
+    "extra_tmpfs": lambda c: c["mounts"].append(
+        {"Type": "tmpfs", "Destination": "/dev/shm/x", "RW": True}
+    ),
+    "seccomp_unconfined": hc(SecurityOpt=["no-new-privileges:true", "seccomp=unconfined"]),
+    "apparmor_unconfined": hc(SecurityOpt=["no-new-privileges:true", "apparmor=unconfined"]),
+    "no_new_privileges_dropped": hc(SecurityOpt=None),
+    "rootfs_flipped": lambda c: c["host_config"].update(
+        ReadonlyRootfs=not c["host_config"]["ReadonlyRootfs"]
+    ),
+    "device": hc(Devices=[{"PathOnHost": "/dev/net/tun", "PathInContainer": "/dev/net/tun"}]),
+    "sysctl": hc(Sysctls={"net.ipv4.ip_forward": "1"}),
+    "host_pid": hc(PidMode="host"),
+    "host_ipc": hc(IpcMode="host"),
+    "host_uts": hc(UTSMode="host"),
+    "host_userns": hc(UsernsMode="host"),
+    "host_cgroupns": hc(CgroupnsMode="host"),
+    "cgroup_parent": hc(CgroupParent="/system.slice"),
+    "other_runtime": hc(Runtime="nvidia"),
+    "extra_group": hc(GroupAdd=["0"]),
+    "host_gateway_alias": hc(ExtraHosts=["host.docker.internal:host-gateway"]),
+    "published_port": hc(PortBindings={"22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "2222"}]}),
+    "publish_all": hc(PublishAllPorts=True),
+    "volumes_from": hc(VolumesFrom=["c-postgres"]),
+    "links": hc(Links=["c-postgres:db"]),
+    "network_mode_bridge": hc(NetworkMode="bridge"),
+    "other_image": cfg(Image="alpine-local:3.20"),
+    "same_tag_other_content": lambda c: c.update(image_id="sha256:" + "f" * 64),
+    "other_command": cfg(Cmd=["sh", "-c", "sleep 600"]),
+    "other_entrypoint": cfg(Entrypoint=["/bin/sh"]),
+    "root_user": cfg(User="root"),
+}
+# the agent of the reported reproduction, a proxy (route out), the API (published port) and two
+# services that have no route out at all
+VICTIMS = ["agent-codex", "egress-codex", "api", "postgres", "scheduler"]
+
+
+@pytest.mark.parametrize("how", sorted(IMPOSTERS))
+@pytest.mark.parametrize("svc", VICTIMS)
+def test_CONTRACT_a_container_with_the_right_labels_and_network_but_other_privileges_latches(
+    rig, svc, how
+):
+    tweak(rig, svc, IMPOSTERS[how])
+    r = rig.once()
+    assert r.returncode == 1, (how, r.stderr[-400:])
+    assert rig.latched and "SPEC" in rig.latch_reason() or "HOSTCFG" in rig.latch_reason(), (
+        rig.latch_reason()
+    )
+    assert stopped_all_supervised(rig)
+    assert not container(rig, svc)["running"], "the impostor itself must be stopped"
+    assert rig.state.startswith("latched")
+
+
+def test_CONTRACT_the_reported_impostor_next_to_the_genuine_agent_is_stopped_and_latches(rig):
+    """Labels of agent-codex, its network, plus NET_ADMIN, no seccomp, the host's root mounted."""
+
+    def add(s):
+        c = dict(container(rig, "agent-codex"), name="imposter")
+        c["host_config"] = dict(
+            c["host_config"], CapAdd=["NET_ADMIN"], SecurityOpt=["seccomp=unconfined"]
+        )
+        c["mounts"] = [{"Type": "bind", "Source": "/", "Destination": "/host", "RW": False}]
+        c["config"] = dict(c["config"], Image="alpine-local:3.20")
+        s["containers"]["c-imposter"] = c
+
+    rig.mutate(add)
+    r = rig.once()
+    assert r.returncode == 1 and rig.latched and "SPEC" in rig.latch_reason()
+    s = rig.docker_state()["containers"]
+    assert not s["c-imposter"]["running"] and not s["c-agent-codex"]["running"]
+    assert stopped_all_supervised(rig)
+
+
+def test_CONTRACT_a_genuine_container_does_not_hide_an_impostor_of_an_unsupervised_service(rig):
+    """Only supervised services are the watchdog's to start, but every project container must be
+    the release's: a `scheduler` with a host bind mount is stopped with the set."""
+    tweak(rig, "scheduler", add_mount(Source="/", Destination="/host"))
+    assert rig.once().returncode == 1
+    assert rig.latched and not container(rig, "scheduler")["running"]
+
+
+def test_CONTRACT_a_stopped_impostor_is_caught_before_the_watchdog_can_start_it(rig):
+    """`compose start <service>` starts WHICHEVER container carries the labels."""
+    rig.mutate(
+        lambda s: [
+            c.update(running=False) for c in s["containers"].values() if c["service"] in SUPERVISED
+        ]
+    )
+    tweak(rig, "agent-codex", add_cap("NET_ADMIN"))
+    r = rig.once()
+    assert r.returncode == 1 and rig.latched and "SPEC" in rig.latch_reason()
+    assert not any(" start " in e for e in rig.events if e.startswith("docker")), rig.events
+
+
+def test_CONTRACT_a_latched_impostor_stays_blocked_after_reset_until_it_is_removed(rig):
+    tweak(rig, "agent-codex", add_cap("NET_ADMIN"))
+    assert rig.once().returncode == 1 and rig.latched
+    r = rig.run("reset")
+    assert r.returncode != 0 or rig.once().returncode == 1
+    assert not container(rig, "agent-codex")["running"]
+    rig.mutate(
+        lambda s: s["containers"]["c-agent-codex"].update(host_config=genuine("agent-codex")[1])
+    )
+    r = rig.run("reset")
+    assert r.returncode == 0, r.stderr + rig.log
+    assert rig.once().returncode == 0 and not rig.latched
+
+
+def test_CONTRACT_the_finding_names_what_differs(rig):
+    tweak(rig, "agent-codex", add_cap("NET_ADMIN"))
+    tweak(rig, "agent-codex", add_mount(Source="/", Destination="/host"))
+    rig.once()
+    why = rig.latch_reason()
+    assert "cap_add" in why and "NET_ADMIN" in why and "mounts differ" in why and "/host" in why
+
+
+# ---- the genuine article is accepted, in every shape a legitimate deployment gives it ----
+
+
+def test_CONTRACT_a_container_recreated_by_compose_with_a_new_id_is_accepted(rig):
+    """`docker compose up --force-recreate`: new id, same release, same everything."""
+
+    def recreate(s):
+        c = s["containers"].pop("c-agent-codex")
+        s["containers"]["c-new0123"] = dict(c, name=c["name"])
+
+    rig.mutate(recreate)
+    assert rig.once().returncode == 0 and not rig.latched
+    assert rig.mutating_calls() == []
+
+
+def test_CONTRACT_every_service_of_the_real_compose_file_is_accepted(rig):
+    assert set(COMPOSE["services"]) == {
+        s["service"] for s in rig.docker_state()["containers"].values() if s["project"]
+    }
+    r = rig.run("check")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "SPEC" not in r.stdout
+
+
+def test_CONTRACT_an_anonymous_volume_the_image_declares_is_accepted_any_other_is_not(rig):
+    anon = {
+        "Type": "volume",
+        "Name": "a" * 64,
+        "Source": "/v/a",
+        "Destination": "/var/lib/postgresql/data",
+        "RW": True,
+    }
+    rig.mutate(
+        lambda s: s["containers"]["c-scheduler"]["mounts"].append(anon)
+    )  # not declared by the scheduler's image
+    assert rig.once().returncode == 1 and rig.latched
+    tweak(rig, "scheduler", lambda c: c["mounts"].pop())
+    assert rig.run("reset").returncode == 0
+    # the postgres image declares VOLUME /var/lib/postgresql/data: an anonymous volume at another
+    # destination is not its own
+    tweak(
+        rig,
+        "postgres",
+        lambda c: c["mounts"].append(dict(anon, Destination="/var/lib/postgresql/x")),
+    )
+    assert rig.once().returncode == 1
+    tweak(rig, "postgres", lambda c: c["mounts"].pop())
+    assert rig.run("reset").returncode == 0
+    # an anonymous volume at a destination the IMAGE declares is Docker's own doing when the release
+    # does not mount that path itself
+    path = rig.state_dir / "contract.json"
+    d = json.loads(path.read_text())
+    d["services"]["postgres"]["spec"]["volumes"] = []
+    path.write_text(json.dumps(d))
+    tweak(
+        rig,
+        "postgres",
+        lambda c: c.update(mounts=[m for m in c["mounts"] if m["Type"] == "tmpfs"] + [dict(anon)]),
+    )
+    assert rig.run("reset").returncode == 0
+    assert rig.once().returncode == 0 and not rig.latched
+
+
+def test_CONTRACT_a_deploy_in_progress_is_not_an_impostor_and_the_commit_accepts_the_new_release(
+    rig,
+):
+    """Release B's containers do not match release A's contract. While the deploy holds the lock the
+    watchdog touches nothing; once the deploy committed B they are the release."""
+    sha_b = "b" * 40
+
+    def to_b(s):
+        s["images"].update(release_images(sha_b))
+        for name in COMPOSE["services"]:
+            c = s["containers"][f"c-{name}"]
+            c["config"], c["host_config"], c["mounts"], c["image_id"] = genuine(name, sha_b)
+        return s
+
+    rig.mutate(to_b)
+    (rig.stub / "compose-template.json").write_text(json.dumps(template(sha_b)))
+    with rig.deploy_locks():
+        r = rig.once()
+        assert r.returncode == 0 and rig.mutating_calls() == [] and not rig.latched
+    # outside a deploy, release A's contract rejects release B's containers (a deploy that
+    # died before its commit) ...
+    assert rig.once().returncode == 1 and rig.latched
+    assert rig.run("reset").returncode == 1
+    # ... after the deploy committed release B they are accepted
+    r = rig.under_deploy_lock(
+        "commit", "--sha", sha_b, "--release-dir", str(rig.base / "releases" / SHA),
+        "--forbidden", "100.107.22.84:22", "--protected-ips", "100.107.22.84",
+        "--rootful", "172.17.0.2:9", "--", *rig.args,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    assert rig.run("reset").returncode == 0
+    assert rig.once().returncode == 0 and not rig.latched
+
+
+def test_CONTRACT_a_rollback_to_the_previous_release_is_accepted_by_its_own_contract(rig):
+    sha_b = "b" * 40
+    rig.mutate(lambda s: s["images"].update(release_images(sha_b)))
+    (rig.stub / "compose-template.json").write_text(json.dumps(template(sha_b)))
+    c = rig.under_deploy_lock(
+        "commit", "--sha", sha_b, "--release-dir", str(rig.base / "releases" / SHA),
+        "--forbidden", "100.107.22.84:22", "--protected-ips", "100.107.22.84",
+        "--rootful", "172.17.0.2:9", "--", *rig.args,
+    )  # fmt: skip
+    assert c.returncode == 0
+    # the stack still runs release A's containers: B's contract calls them impostors ...
+    assert rig.once().returncode == 1 and rig.latched
+    # ... and a rollback commits release A again
+    (rig.stub / "compose-template.json").write_text(json.dumps(template(SHA)))
+    assert rig.commit().returncode == 0
+    assert rig.run("reset").returncode == 0
+    assert rig.once().returncode == 0 and not rig.latched
+
+
+def test_CONTRACT_a_tag_moved_after_the_commit_is_not_the_release(rig):
+    """The contract pins the image CONTENT it saw at commit time."""
+    rig.mutate(
+        lambda s: s["images"][f"internship-hunter-agent:{SHA}"].update(Id="sha256:" + "e" * 64)
+    )
+    assert rig.once().returncode == 0, (
+        "moving the tag alone changes nothing: the containers keep their image"
+    )
+    tweak(rig, "agent-codex", lambda c: c.update(image_id="sha256:" + "e" * 64))
+    assert rig.once().returncode == 1 and "image id" in rig.latch_reason()
+
+
+def test_CONTRACT_the_runtime_is_the_daemons_default_whatever_its_name(rig):
+    assert rig.once(STUB_DEFAULT_RUNTIME="runcw").returncode == 1, (
+        "a runc container on a runcw daemon is not the default"
+    )
+    assert rig.run("reset", STUB_DEFAULT_RUNTIME="runcw").returncode == 1
+    for svc in COMPOSE["services"]:
+        tweak(rig, svc, hc(Runtime="runcw"))
+    assert rig.run("reset", STUB_DEFAULT_RUNTIME="runcw").returncode == 0
+    assert rig.once(STUB_DEFAULT_RUNTIME="runcw").returncode == 0
+
+
+def test_CONTRACT_a_leftover_container_of_another_release_is_caught_before_it_can_be_started(rig):
+    """What a deploy killed halfway can leave behind: a stopped container of the old release
+    carrying the service label."""
+
+    def leftover(s):
+        s["containers"]["c-old"] = dict(
+            s["containers"]["c-egress-codex"], name="deadbeef_internship-hunter-egress-codex-1"
+        )
+        s["containers"]["c-old"].update(running=False, image_id="sha256:" + "1" * 64)
+
+    rig.mutate(leftover)
+    assert rig.once().returncode == 1 and rig.latched and "image id" in rig.latch_reason()
+
+
+def test_CONTRACT_a_container_that_vanishes_during_the_snapshot_is_unverified_not_a_violation(rig):
+    (rig.stub / "ghost").write_text("")
+    r = rig.once()
+    assert r.returncode == 2 and not rig.latched and rig.mutating_calls() == []
+    (rig.stub / "ghost").unlink()
+    assert rig.once().returncode == 0
+
+
+def test_CONTRACT_a_contract_from_before_the_spec_existed_warns_and_does_not_stop_the_stack(rig):
+    path = rig.state_dir / "contract.json"
+    d = json.loads(path.read_text())
+    d["version"] = 1
+    for svc in d["services"].values():
+        svc.pop("spec")
+    path.write_text(json.dumps(d))
+    tweak(rig, "agent-codex", add_cap("NET_ADMIN"))  # not detectable by a legacy contract ...
+    r = rig.once()
+    assert r.returncode == 0 and not rig.latched
+    assert "SPEC-LEGACY" in rig.log  # ... but loudly said so, once per cycle
+    assert rig.mutating_calls() == []
+
+
+# ---- the contract is built from the release, and refuses a release that asks for too much ----
+
+
+def committed(rig):
+    return json.loads((rig.state_dir / "contract.json").read_text())
+
+
+def test_CONTRACT_commit_pins_what_the_release_and_the_image_store_say(rig):
+    d = committed(rig)
+    sp = d["services"]["agent-codex"]["spec"]
+    assert d["version"] == 2
+    assert sp["image"] == f"internship-hunter-agent:{SHA}"
+    assert sp["image_id"] == image_id(sp["image"])
+    assert sp["cap_drop"] == ["ALL"] and sp["cap_add"] == [] and sp["read_only"] is True
+    assert sp["security_opt"] == ["no-new-privileges:true"] and sp["tmpfs"] == ["/tmp"]
+    assert sp["volumes"] == [
+        {
+            "type": "volume",
+            "source": "internship-hunter_codex_home",
+            "target": "/home/hunter",
+            "ro": False,
+        }
+    ]
+    assert sp["network_names"] == ["internship-hunter_agent_codex"]
+    assert d["services"]["postgres"]["spec"]["cap_add"] == [
+        "CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"
+    ]  # fmt: skip
+    assert d["services"]["api"]["spec"]["ports"] == ["127.0.0.1|18000|8000/tcp"]
+
+
+@pytest.mark.parametrize(
+    "field,value,fragment",
+    [
+        ("cap_add", ["NET_ADMIN"], "NET_ADMIN"),
+        ("cap_add", ["CAP_SYS_ADMIN"], "SYS_ADMIN"),
+        ("cap_add", ["ALL"], "ALL"),
+        ("security_opt", ["seccomp=unconfined"], "unconfined"),
+        ("security_opt", ["label:disable"], "unconfined"),
+        ("devices", ["/dev/net/tun:/dev/net/tun"], "devices"),
+        ("volumes_from", ["postgres"], "volumes_from"),
+        ("links", ["postgres"], "volumes_from"),
+        ("pid", "host", "host pid"),
+        ("ipc", "host", "host ipc"),
+        ("userns_mode", "host", "host userns_mode"),
+        (
+            "volumes",
+            [{"type": "bind", "source": "/run/user/1/docker.sock", "target": "/s"}],
+            "Docker socket",
+        ),
+        ("volumes", [{"type": "npipe", "source": "x", "target": "/s"}], "cannot verify"),
+    ],
+)
+def test_CONTRACT_commit_refuses_a_release_that_asks_for_what_containment_will_not_accept(
+    rig, field, value, fragment
+):
+    t = template()
+    t["services"]["agent-codex"][field] = value
+    (rig.stub / "compose-template.json").write_text(json.dumps(t))
+    before = (rig.state_dir / "contract.json").read_text()
+    r = rig.commit()
+    assert r.returncode == 11 and fragment in r.stderr, r.stderr
+    assert (rig.state_dir / "contract.json").read_text() == before
+
+
+def test_CONTRACT_commit_refuses_an_image_the_store_does_not_have(rig):
+    rig.mutate(lambda s: s["images"].pop(f"internship-hunter-agent:{SHA}"))
+    r = rig.commit()
+    assert r.returncode == 11 and "cannot be pinned" in r.stderr
+
+
+def test_CONTRACT_commit_check_does_not_need_the_images(rig):
+    """The pre-flight runs before the release's images are loaded."""
+    rig.mutate(lambda s: s.update(images={}))
+    r = rig.run(
+        "commit", "--check", "--sha", "c" * 40, "--release-dir", str(rig.base / "releases" / SHA),
+        "--", *rig.args,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stderr

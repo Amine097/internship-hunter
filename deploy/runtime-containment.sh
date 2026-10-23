@@ -33,6 +33,12 @@
 #     ATTACH-FOREIGN     a container that is not ours is attached to a project network
 #     NET-FLAG           a project network that must be internal is not
 #     HOSTCFG            host network/pid, privileged, or the Docker socket mounted in a project container
+#     SPEC               a project container is not the container the release describes: its image (by
+#                        content), process, user, capabilities, security options, devices, sysctls, namespaces,
+#                        published ports or effective mounts differ from the SPEC `commit` rendered from the
+#                        release's compose files (labels are free text, so they identify nothing). Applies to
+#                        every project container, running or stopped (`compose start` would start whichever
+#                        container carries the labels); a RUNNING one is stopped with the set.
 #     SVC-UNKNOWN        a container claims the project but no service of the release matches
 #     DNS-RT             the RUNTIME resolver of a service differs from the contract (a service with a
 #                        route out not on the approved resolver; an internal-only one with ANY upstream)
@@ -48,6 +54,8 @@
 #     TRUST              a root-owned helper is missing, a symlink, or writable by others
 #     UNVERIFIED         Docker could not be inspected: nothing is certified
 #   WARNING (logged, shown by `status`, nothing is stopped; a deploy re-baselines it):
+#     SPEC-LEGACY        the committed contract predates the container spec (version 1): privileges and mounts
+#                        are NOT verified until the next deploy commits a version 2 contract
 #     RESOLVER           the daemon's upstream resolver list (the host's resolver) changed since the deploy
 #
 # ORDER of a quarantine: latch (the durable intent), cut the unauthorised endpoint, stop. Cutting is instant,
@@ -209,6 +217,85 @@ LP, LS, LN = "com.docker.compose.project", "com.docker.compose.service", "com.do
 out = []
 def find(level, latch, ident, msg): out.append("F\t%s\t%d\t%s\t%s" % (level, latch, ident, msg.replace("\t", " ").replace("\n", " ")))
 def act(netid, cid, what, owner): out.append("A\tdisconnect\t%s\t%s\t%s\t%s" % (netid, cid, what, owner))
+def norm_cap(x):
+    x = str(x).upper()
+    return x[4:] if x.startswith("CAP_") else x
+def norm_opt(o):
+    m = re.match(r"([^=:]+)[=:](.*)", str(o).strip(), re.S)
+    if m: return "%s=%s" % (m.group(1), m.group(2))
+    return "%s=true" % str(o).strip() if str(o).strip() == "no-new-privileges" else str(o).strip()
+def lst(v): return list(v) if v else []
+def same_set(a, b): return sorted(map(str, lst(a))) == sorted(map(str, lst(b)))
+DANGEROUS = {"ALL", "SYS_ADMIN", "NET_ADMIN", "NET_RAW", "SYS_PTRACE", "SYS_MODULE", "SYS_RAWIO", "SYS_BOOT", "SYS_TIME",
+             "DAC_READ_SEARCH", "MAC_ADMIN", "MAC_OVERRIDE", "BPF", "PERFMON", "AUDIT_CONTROL", "SETFCAP", "MKNOD",
+             "SYSLOG", "LINUX_IMMUTABLE", "NET_BROADCAST", "IPC_OWNER", "WAKE_ALARM"}
+def spec_diffs(c, sp, default_runtime="runc"):
+    """Every way the running container differs from what the release's compose files render. Exact comparisons
+    except for the fields where Docker fills in a default (then the default, and only it, is accepted)."""
+    d = []
+    cf, hc = c.get("Config") or {}, c.get("HostConfig") or {}
+    def need(label, got, want):
+        if got != want: d.append("%s is %r, the release says %r" % (label, got, want))
+    # identity: image reference AND image content
+    need("image", cf.get("Image"), sp["image"])
+    if sp.get("image_id"): need("image id", c.get("Image"), sp["image_id"])
+    ent = sp["entrypoint"] if sp.get("entrypoint") is not None else sp.get("image_entrypoint")
+    need("entrypoint", lst(cf.get("Entrypoint")), lst(ent))
+    if sp.get("command") is not None: need("command", lst(cf.get("Cmd")), lst(sp["command"]))
+    elif sp.get("entrypoint") is None: need("command", lst(cf.get("Cmd")), lst(sp.get("image_cmd")))
+    need("user", cf.get("User") or "", sp["user"] or sp.get("image_user") or "")
+    # privileges
+    need("privileged", bool(hc.get("Privileged")), sp["privileged"])
+    got_add, got_drop = sorted({norm_cap(x) for x in hc.get("CapAdd") or []}), sorted({norm_cap(x) for x in hc.get("CapDrop") or []})
+    need("cap_add", got_add, sp["cap_add"])
+    need("cap_drop", got_drop, sp["cap_drop"])
+    if set(got_add) & DANGEROUS: d.append("dangerous capabilities %s" % sorted(set(got_add) & DANGEROUS))
+    need("security_opt", sorted(norm_opt(x) for x in hc.get("SecurityOpt") or []), sorted(norm_opt(x) for x in sp["security_opt"]))
+    need("read_only", bool(hc.get("ReadonlyRootfs")), sp["read_only"])
+    if lst(hc.get("Devices")) or lst(hc.get("DeviceCgroupRules")) or lst(hc.get("DeviceRequests")):
+        if not (sp["devices"] and not lst(hc.get("DeviceCgroupRules")) and not lst(hc.get("DeviceRequests"))):
+            d.append("host devices %s" % (lst(hc.get("Devices")) + lst(hc.get("DeviceCgroupRules")) + lst(hc.get("DeviceRequests"))))
+    need("sysctls", {str(k): str(v) for k, v in (hc.get("Sysctls") or {}).items()}, sp["sysctls"])
+    # the daemon's default runtime (its name is the operator's: runc, or a wrapper of it), unless the release names one
+    want_rt = sp["runtime"] or default_runtime
+    if (hc.get("Runtime") or default_runtime) != want_rt: d.append("runtime is %r, expected %r" % (hc.get("Runtime"), want_rt))
+    need("group_add", sorted(map(str, lst(hc.get("GroupAdd")))), sp["group_add"])
+    # namespaces: the default, and only the default, unless the release says otherwise
+    for key, field, default in (("pid", "PidMode", ("",)), ("uts", "UTSMode", ("",)), ("userns_mode", "UsernsMode", ("",)),
+                                ("ipc", "IpcMode", ("", "private", "shareable", "none")), ("cgroup", "CgroupnsMode", ("", "private"))):
+        got = hc.get(field) or ""
+        if sp[key]:
+            need(field, got, sp[key])
+        elif got not in default:
+            d.append("%s is %r" % (field, got))
+    need("cgroup_parent", hc.get("CgroupParent") or "", sp["cgroup_parent"])
+    if lst(hc.get("VolumesFrom")) or lst(hc.get("Links")): d.append("volumes_from/links %s" % (lst(hc.get("VolumesFrom")) + lst(hc.get("Links"))))
+    need("extra_hosts", sorted(x.replace("=", ":", 1) for x in map(str, lst(hc.get("ExtraHosts")))), sp["extra_hosts"])
+    # network mode: one of the release's own networks
+    mode = hc.get("NetworkMode") or ""
+    if mode not in sp["network_names"]: d.append("network mode %r is not one of the release's networks %s" % (mode, sp["network_names"]))
+    # published ports
+    got_ports = sorted("%s|%s|%s" % (b.get("HostIp") or "", b.get("HostPort") or "", k)
+                       for k, bs in (hc.get("PortBindings") or {}).items() for b in (bs or []))
+    need("published ports", got_ports, sp["ports"])
+    if hc.get("PublishAllPorts"): d.append("publishes all exposed ports")
+    # mounts: the effective list, which includes what --mount, -v, --tmpfs and image VOLUMEs produced
+    want = {("volume", v["source"], v["target"], not v["ro"]) for v in sp["volumes"] if v["type"] == "volume"}
+    want |= {("bind", v["source"], v["target"], not v["ro"]) for v in sp["volumes"] if v["type"] == "bind"}
+    want_tmpfs = {v["target"] for v in sp["volumes"] if v["type"] == "tmpfs"}
+    got, got_tmpfs = set(), set()
+    for m in c.get("Mounts") or []:
+        t = m.get("Type") or "bind"
+        if t == "tmpfs": got_tmpfs.add(m.get("Destination"))
+        elif t == "volume" and re.fullmatch(r"[0-9a-f]{64}", m.get("Name") or "") and m.get("Destination") in sp.get("image_volumes", []):
+            continue                                  # an anonymous volume the IMAGE declares (VOLUME in its Dockerfile)
+        else: got.add((t, m.get("Name") if t == "volume" else m.get("Source"), m.get("Destination"), bool(m.get("RW", True))))
+    got_tmpfs |= {k.split(":")[0] for k in (hc.get("Tmpfs") or {})}
+    want_tmpfs |= {t.split(":")[0] for t in (sp.get("tmpfs") or [])}
+    if got != want:
+        d.append("mounts differ: unexpected %s, missing %s" % (sorted(map(str, got - want)), sorted(map(str, want - got))))
+    if got_tmpfs != want_tmpfs: d.append("tmpfs differ: got %s, the release says %s" % (sorted(got_tmpfs), sorted(want_tmpfs)))
+    return d
 nets = {n["Id"]: n for n in networks}
 def project_net(n): return n is not None and (n.get("Labels") or {}).get(LP) == P
 # --- networks: the flags that make a network a boundary ---
@@ -220,6 +307,8 @@ for n in networks:
     if bool(n.get("Internal")) != bool(want["internal"]):
         find("CRIT", 1, "NET-FLAG", "network %s must be %s but is %s" % (n["Name"], "internal" if want["internal"] else "non-internal", "internal" if n.get("Internal") else "NOT internal"))
 running = {}
+suspect = set()        # project containers that are not what the release describes: stopped with the set
+legacy_warned = False
 for c in containers:
     labels = (c.get("Config") or {}).get("Labels") or {}
     name = c.get("Name", "?").lstrip("/")
@@ -266,6 +355,18 @@ for c in containers:
     for m in c.get("Mounts") or []:
         if re.search(r"docker\.sock$", m.get("Source", "") or ""): bad.append("the Docker socket mounted")
     if bad: find("CRIT", 1, "HOSTCFG", "%s (%s): %s" % (name, svc_name, ", ".join(bad)))
+    # --- is it really the container the release describes? (labels are free text: anyone can copy them) ---
+    spec = svc.get("spec")
+    if spec is None:
+        if not legacy_warned:
+            find("WARN", 0, "SPEC-LEGACY", "the committed contract predates the container spec: privileges, mounts and images are NOT verified until the next deploy")
+            legacy_warned = True
+    else:
+        diffs = spec_diffs(c, spec, facts.get("runtime") or "runc")
+        if diffs:
+            find("CRIT", 1, "SPEC", "%s (%s) is not the container the release describes: %s" % (name, svc_name, "; ".join(diffs)))
+    if bad or (spec is not None and diffs):
+        suspect.add((cid, svc_name, up))
     # --- the runtime resolver state (not what compose declares); a stopped container's file is regenerated at start ---
     if not up:
         continue
@@ -292,6 +393,10 @@ for c in containers:
             find("CRIT", 1, "DNS-RT", "%s (%s): Docker forwards its DNS to %s, the contract says [%s] queried from the container (host(...) = from the daemon, outside the guard)" % (name, svc_name, ann[0][len("# ExtServers: "):], " ".join(sorted(want))))
     elif explicit:
         find("CRIT", 1, "DNS-RT", "%s (%s) is internal-only but Docker gave it explicit upstream resolver(s) %s (daemon-level dns?): an agent carries no upstream" % (name, svc_name, explicit))
+# what is not the release's is stopped with the set, supervised or not (its network position is not what makes it dangerous)
+sup_already = {cid for ids in running.values() for cid in ids}
+for cid, svc_name, up in sorted(suspect):
+    if up and cid not in sup_already: out.append("SUP\t%s\t%s" % (cid, svc_name))
 for svc_name, svc in sorted(S.items()):
     if svc["supervised"] and svc_name not in running:
         out.append("MISSING\t%s" % svc_name)
@@ -312,6 +417,7 @@ trap cleanup EXIT
 collect() { # collect: containers.json (ALL containers) and networks.json; false if Docker cannot be inspected
   local ids nets
   docker info --format '{{.SecurityOptions}}' >"$TMP/info" 2>/dev/null || return 1
+  docker info --format '{{.DefaultRuntime}}' >"$TMP/runtime" 2>/dev/null || echo runc >"$TMP/runtime"
   if [[ "$TEST_MODE" == 0 ]]; then
     grep -q rootless "$TMP/info" || { log CRIT UNVERIFIED "the Docker daemon is not rootless: refusing to act on it"; return 2; }
   fi
@@ -340,9 +446,10 @@ assess() { # assess: topology + runtime DNS from the Docker snapshot, into the a
   local facts rec kind a b c d e resolvers have_res=1
   FINDINGS=(); ACTIONS=(); SUP_IDS=(); MISSING=()
   resolvers="$(daemon_resolvers 2>/dev/null)" || have_res=0
-  facts="$(GUARD_DNS_NOW="$(guard_dns 2>/dev/null || true)" RESOLVERS_NOW="$resolvers" HAVE_RES="$have_res" python3 -c '
+  facts="$(GUARD_DNS_NOW="$(guard_dns 2>/dev/null || true)" RESOLVERS_NOW="$resolvers" HAVE_RES="$have_res" \
+           RUNTIME_NOW="$(tr -d '[:space:]' <"$TMP/runtime" 2>/dev/null)" python3 -c '
 import json, os
-print(json.dumps({"guard_dns": os.environ["GUARD_DNS_NOW"] or None,
+print(json.dumps({"guard_dns": os.environ["GUARD_DNS_NOW"] or None, "runtime": os.environ["RUNTIME_NOW"] or "runc",
                   "resolvers": os.environ["RESOLVERS_NOW"] if os.environ["HAVE_RES"] == "1" else None}))')"
   rec="$(python3 -c "$ASSESS" "$CONTRACT" "$TMP/containers.json" "$TMP/networks.json" "$facts")" \
     || { FINDINGS+=("CRIT|0|UNVERIFIED|the assessor failed: nothing is certified"); return; }
@@ -771,12 +878,87 @@ cmd_commit() {
   cfg="$( cd "$rel" && RELEASE_SHA="$sha" docker compose "${args[@]}" config --format json 2>/dev/null )" \
     || die "commit: docker compose config failed" 1
   python3 - "$PROJECT" "$sha" "$rel" "$dnsv" "$forbidden" "$ips" "$rootful" "$(daemon_resolvers 2>/dev/null || true)" "$(now)" "$cfg" "$check" "${args[@]}" >"$TMP/contract.json" <<'PY' || die "commit: the release cannot be put under containment (see the message above)" 11
-import json, sys
+import json, subprocess, sys
 project, sha, rel, dns, forbidden, ips, rootful, resolvers, ts, cfg, check = sys.argv[1:12]
 args = sys.argv[12:]
 cfg = json.loads(cfg)
 nets = cfg.get("networks") or {}
 services, bad = {}, []
+# What a container of this release MUST look like (the "spec"), rendered from the release's own compose
+# files by `docker compose config`, plus what the image store says about the images (pinned now: a tag moved
+# later does not change what this release is). The watchdog compares every project container to it.
+DANGEROUS_CAPS = {"ALL", "SYS_ADMIN", "NET_ADMIN", "NET_RAW", "SYS_PTRACE", "SYS_MODULE", "SYS_RAWIO", "SYS_BOOT",
+                  "SYS_TIME", "DAC_READ_SEARCH", "MAC_ADMIN", "MAC_OVERRIDE", "BPF", "PERFMON", "AUDIT_CONTROL",
+                  "SETFCAP", "MKNOD", "SYSLOG", "LINUX_IMMUTABLE", "NET_BROADCAST", "IPC_OWNER", "WAKE_ALARM"}
+def cap(x):
+    x = str(x).upper()
+    return x[4:] if x.startswith("CAP_") else x
+def listify(v):
+    if v is None: return []
+    if isinstance(v, dict): return ["%s:%s" % (k, x) for k, x in sorted(v.items())]
+    return [str(x) for x in v]
+def image_info(ref):
+    r = subprocess.run(["docker", "image", "inspect", ref], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0: return None
+    d = json.loads(r.stdout)[0]
+    c = d.get("Config") or {}
+    return {"id": d["Id"], "volumes": sorted((c.get("Volumes") or {}).keys()), "entrypoint": c.get("Entrypoint") or [],
+            "cmd": c.get("Cmd") or [], "user": c.get("User") or ""}
+def spec_of(name, svc):
+    bad_here = []
+    if svc.get("volumes_from") or svc.get("links") or svc.get("external_links"):
+        bad_here.append("%s uses volumes_from/links, which containment cannot verify" % name)
+    caps_add = sorted({cap(x) for x in svc.get("cap_add") or []})
+    if set(caps_add) & DANGEROUS_CAPS:
+        bad_here.append("%s adds capabilities containment will not accept: %s" % (name, sorted(set(caps_add) & DANGEROUS_CAPS)))
+    sec = [str(x) for x in svc.get("security_opt") or []]
+    if any("unconfined" in x or x.replace(":", "=").startswith("label=disable") for x in sec):
+        bad_here.append("%s has an unconfined security option %s" % (name, sec))
+    if svc.get("devices"): bad_here.append("%s maps host devices %s" % (name, svc["devices"]))
+    for v in svc.get("volumes") or []:
+        if "docker.sock" in str(v.get("source", "")): bad_here.append("%s mounts the Docker socket" % name)
+    for k in ("pid", "ipc", "uts", "userns_mode", "cgroup"):
+        if str(svc.get(k) or "") == "host": bad_here.append("%s uses the host %s namespace" % (name, k))
+    vols = []
+    for v in svc.get("volumes") or []:
+        t = v.get("type")
+        if t == "volume":
+            top = (cfg.get("volumes") or {}).get(v.get("source")) or {}
+            vols.append({"type": "volume", "source": top.get("name") or "%s_%s" % (project, v.get("source")),
+                         "target": v["target"], "ro": bool(v.get("read_only"))})
+        elif t == "bind":
+            vols.append({"type": "bind", "source": v["source"], "target": v["target"], "ro": bool(v.get("read_only"))})
+        elif t == "tmpfs":
+            vols.append({"type": "tmpfs", "source": "", "target": v["target"], "ro": bool(v.get("read_only"))})
+        else:
+            bad_here.append("%s has a %r mount, which containment cannot verify" % (name, t))
+    ports = sorted("%s|%s|%s/%s" % (p.get("host_ip") or "", p.get("published") or "", p.get("target"), p.get("protocol") or "tcp")
+                   for p in svc.get("ports") or [] if isinstance(p, dict))
+    image = svc.get("image") or "%s-%s" % (project, name)
+    spec = {"image": image, "image_id": None, "image_volumes": [], "image_entrypoint": [], "image_cmd": [], "image_user": "",
+            "entrypoint": svc.get("entrypoint"), "command": svc.get("command"), "user": str(svc.get("user") or ""),
+            "privileged": bool(svc.get("privileged")), "cap_add": caps_add,
+            "cap_drop": sorted({cap(x) for x in svc.get("cap_drop") or []}), "security_opt": sorted(sec),
+            "read_only": bool(svc.get("read_only")), "devices": listify(svc.get("devices")),
+            "tmpfs": sorted(str(x) for x in ([svc["tmpfs"]] if isinstance(svc.get("tmpfs"), str) else svc.get("tmpfs") or [])),
+            "sysctls": {str(k): str(v) for k, v in (svc.get("sysctls") or {}).items()} if isinstance(svc.get("sysctls"), dict)
+                       else dict(x.split("=", 1) for x in svc.get("sysctls") or []),
+            "volumes": sorted(vols, key=lambda v: (v["type"], v["target"])), "ports": ports,
+            "extra_hosts": sorted(x.replace("=", ":", 1) for x in listify(svc.get("extra_hosts"))),
+            "pid": str(svc.get("pid") or ""), "ipc": str(svc.get("ipc") or ""), "uts": str(svc.get("uts") or ""),
+            "userns_mode": str(svc.get("userns_mode") or ""), "cgroup": str(svc.get("cgroup") or ""),
+            "cgroup_parent": str(svc.get("cgroup_parent") or ""), "runtime": str(svc.get("runtime") or ""),
+            "group_add": sorted(str(x) for x in svc.get("group_add") or []),
+            "network_names": sorted(((nets.get(n) or {}).get("name") or "%s_%s" % (project, n))
+                                    for n in (svc.get("networks") or {"default": None}))}
+    if check != "1":
+        info = image_info(image)
+        if info is None:
+            bad_here.append("%s: image %s is not in the image store, so its identity cannot be pinned" % (name, image))
+        else:
+            spec.update(image_id=info["id"], image_volumes=info["volumes"], image_entrypoint=info["entrypoint"],
+                        image_cmd=info["cmd"], image_user=info["user"])
+    return spec, bad_here
 for name, svc in sorted((cfg.get("services") or {}).items()):
     attached = sorted((svc.get("networks") or {"default": None}).keys())
     out = any(not (nets.get(n) or {}).get("internal", False) for n in attached)
@@ -786,12 +968,15 @@ for name, svc in sorted((cfg.get("services") or {}).items()):
     if (svc.get("network_mode") or "") not in ("",):
         bad.append("%s sets network_mode=%s" % (name, svc["network_mode"]))
     if svc.get("privileged"): bad.append("%s is privileged" % name)
-    services[name] = {"networks": attached, "out": out, "supervised": supervised, "dns": list(svc.get("dns") or [])}
+    spec, bad_here = spec_of(name, svc)
+    bad += bad_here
+    services[name] = {"networks": attached, "out": out, "supervised": supervised, "dns": list(svc.get("dns") or []),
+                      "spec": spec}
 if bad:
     print("\n".join("runtime-containment: " + b for b in bad), file=sys.stderr); sys.exit(1)
 if check == "1":
     sys.exit(0)                      # pre-flight only: the release is committable
-contract = {"version": 1, "project": project, "release_sha": sha, "release_dir": rel, "compose_args": args,
+contract = {"version": 2, "project": project, "release_sha": sha, "release_dir": rel, "compose_args": args,
             "dns": dns, "forbidden_targets": forbidden, "protected_ips": ips, "rootful_targets": rootful,
             "resolver_baseline": resolvers if resolvers else None, "committed": int(ts),
             "networks": {n: {"internal": bool((v or {}).get("internal"))} for n, v in nets.items()},
