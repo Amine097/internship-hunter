@@ -271,6 +271,7 @@ For `deploy`, `deploy-irreversible` **and** `rollback`, before anything is read,
 | the **rendered** compose DNS (effective `shared/.env` values; the caller's `HUNTER_DNS` is removed) equals `DNS=` of that conf for every service with a route out and is absent for internal-only ones - checked after unpacking the release, before images are loaded or anything starts, before a rollback changes anything, and again before every `compose up` | exit 11 |
 | `host-egress-guard.sh status` exits 0: the **full** policy is installed and unmodified | exit 12 |
 | `deploy/runtime-containment.sh` is a root-owned executable, its watchdog has a fresh heartbeat and is **not latched** (`status --require-active`) | exit 11 / **13** |
+| the release being deployed is one containment can supervise; the running release (or a rollback target) is one it can take back, else `deploy-irreversible` / refusal | exit 11 / **14** |
 | `127.0.0.1:18000` is free, or held by this application's own running `api` (read-only `ss`) | exit 3 |
 
 After `compose up --wait` and the health checks, `check-host-isolation.sh` runs in **enforce**
@@ -422,7 +423,7 @@ and the Internet itself (a compromised proxy still reaches public hosts and has 
 
 | # | invariant | on violation |
 |---|---|---|
-| G | `host-egress-guard.sh status` = the **full** policy, host addresses included | stop the supervised set, re-apply the guard (the daemon's own `ExecStartPost` call), verify, restart; the *self-healing* class |
+| G | `host-egress-guard.sh status` = the **full** policy, host addresses included | `status` exit **3** (the policy is intact; only the set of host addresses it names is stale - a rootful Docker bridge or an interface address came or went): **re-apply and verify first, stop nothing** (`apply` takes about a second, less than `docker stop`'s own grace period, so stopping first closes the gap no sooner); stop the set only if that repair does not hold. A repaired drift is not a flap. Exit 1 (a rule deleted or edited, a jump missing, an ACCEPT): stop the supervised set, re-apply, verify, restart (*self-healing*) |
 | T | the protected host addresses (`EGRESS_FORBIDDEN_TARGETS`) are live, checked by `check-host-isolation.sh --verify-targets` | **before starting only** (Tailscale late): the set stays stopped, state `waiting`; a Tailscale that goes away while running is not a loss of isolation and stops nothing |
 | N | every container of the project is attached to exactly the networks its service declares (stopped ones too: `docker network connect` works on a stopped container); no foreign container is attached to a project network; every network that must be `internal` is | stop the set, **disconnect** the unauthorised endpoint (the container is kept for forensics, never removed), **latch** |
 | H | no project container with host network/pid, `privileged`, or the Docker socket; no container claiming the project that the release does not define | stop, latch |
@@ -439,6 +440,29 @@ prerequisite holds again, and **three of them in 15 minutes latch** (`FLAPPING`)
 the set from cold it runs the deploy gate's enforce-mode isolation and DNS checks once and re-judges
 N/H/D on what really runs; a failure stops the set again and latches (`POST-START`).
 
+**Order of a quarantine: latch, cut, stop.** (1) The intent is written to disk (`state/containment/latch`);
+(2) every unauthorised endpoint is removed (`docker network disconnect -f`, instant; retried once; if it cannot
+be removed and the container is ours, that container is **killed**, a foreign container is left running but
+the set is stopped anyway and the latch says the endpoint is still there); (3) only then is the set stopped
+(`docker stop -t 5`, then `kill`). Stop-first would keep a hot-attached route alive for the whole shutdown
+(measured on a real daemon by the QA review: the route outlived the first stopped container by 3.4 s); latching
+first means a watchdog that dies between (2) and (3) cannot fail open - the evidence that justified the latch
+(the extra endpoint) is already gone, but the next cycle sees the latch and finishes the job. Integrity findings
+are acted on **before** the slower prerequisite checks (guard status, compose render) run. An action is judged
+on a **fresh** snapshot (see "Locks").
+
+**Locks.** `state/deploy.lock` belongs to `remote-deploy.sh` alone (one deploy at a time, `flock -n`); the
+watchdog never takes it, so a legitimate deploy cannot be refused because a check cycle is running (it was:
+533 of 612 attempts in the QA run). The watchdog's right to *change* the stack is a second lock,
+`state/containment.action.lock`: a deploy holds it for its whole duration (waiting up to 180 s for an action
+in flight, then exit 4 "the watchdog is in the middle of stopping or starting the stack"); the watchdog takes
+it only when a cycle has something to change, without waiting, and **re-observes after taking it** (what it
+decided on may be a deploy ago); busy means `paused` (a lock older than 30 minutes is a hung deploy and does not
+disable containment). A healthy cycle - almost all of them - takes no lock at all. Children (`docker`, the guard,
+the checks) never inherit the lock descriptor, so a hung or orphaned child cannot keep it after the watchdog died.
+`docker events` is filtered to `create,start,die,destroy,connect,disconnect`: a healthcheck run is not news (nine
+10 s healthchecks used to make a 300 s poll run a cycle every ~8 s).
+
 **The supervised set** is every service with a route out (api, discovery, telegram, the three proxies) plus
 the agents: exactly the services `compose.yaml` gives `restart: "no"`, so that after a reboot or a daemon
 restart **the daemon starts none of them** (the restart race of "Startup window" is closed by
@@ -448,9 +472,8 @@ back-off. postgres, scheduler and session-controller keep `unless-stopped`: they
 The deploy script commits a release to the watchdog only **after** every gate passed (`runtime-containment.sh
 commit`, under its own lock, refused if a supervised service renders any restart policy but `no`), records
 `desired: stopped` before it tears a stack down, and refuses to deploy or roll back (exit 13) unless the
-watchdog has a fresh heartbeat and is not latched. While a deploy holds `state/deploy.lock` the watchdog
-pauses its decisions (the deploy is replacing containers on purpose; it still heartbeats); a lock older than
-30 minutes is treated as a hung deploy and does **not** disable containment.
+watchdog has a fresh heartbeat and is not latched. While a deploy holds the action lock the watchdog pauses
+its decisions (the deploy is replacing containers on purpose; it still heartbeats).
 
 **Dead man.** If the watchdog is killed, hangs (systemd's `WatchdogSec`), or is stopped
 (`systemctl --user stop`, shutdown), `ExecStopPost` runs `quarantine --no-latch`: the supervised set stops,
@@ -472,16 +495,44 @@ After an incident: investigate (`docker inspect`, `events.log`), remove the caus
 `runtime-containment.sh reset [--disconnect-foreign]` (refused while any N/H/D finding, a missing guard or an
 unreachable protected address remains) - the watchdog restarts the set within one cycle.
 
+*Recovery from a latch whose cause cannot be removed in place* (e.g. `NET-FLAG`: a project network was
+recreated without `--internal`, and `reset` keeps refusing; `remote-deploy.sh deploy|rollback` is refused with
+exit 13 while latched): as the daemon's owner, `docker compose -p internship-hunter down` (volumes are kept),
+fix or recreate the network, `runtime-containment.sh reset`, then deploy. `reset` and `deploy` never run at the
+same time (the action lock).
+
+**First deploy with runtime containment.** `remote-deploy.sh` commits a release to the watchdog only if the
+release renders `restart: "no"` for every service with a route out and every agent. Every release built
+before this change renders `unless-stopped` and is refused (`commit --check`: exit 11). Consequently:
+1. **The new release is checked before anything changes** (before images are loaded or the database is
+   dumped): a release containment cannot supervise is refused with exit 11, not discovered at the end of an
+   activation that has already migrated the schema.
+2. **A running release that predates containment cannot be restored under it.** A normal `deploy` over it is
+   refused with **exit 14** before anything changes; `deploy-irreversible` acknowledges that if the new release
+   fails there is nothing to go back to. Then, on a failed activation, nothing is restored: the stack is stopped
+   (fail closed, `desired: stopped` is recorded), `current` stays on the old release, the script says in so many
+   words that the old release was **NOT restored**, prints the manual-recovery procedure and exits 10. It never
+   prints "restored" for something it did not restore. (The same convention as an irreversible schema change.)
+3. **`rollback` to such a release is refused (exit 14) before anything is touched**, naming the release that
+   keeps running.
+4. A first deploy with no previous release is unchanged: a failure tears down and leaves nothing current.
+Plan the migration deploy for a moment when a short outage is acceptable, take the backup first (the deploy does
+too), and use `deploy-irreversible`. After it, every later release is committable and the normal restore path
+applies.
+
 **Failure behaviour** (each is a test in `tests/test_runtime_containment.py` against a stateful fake daemon,
 and, where marked *real*, in `tests/test_runtime_containment_lab.py` on a genuine rootless Docker):
 guard rule deleted / guard removed / daemon restarted (*real*: stop → repair → start, never start before a
-verified guard); hot `network connect`, foreign container on an agent network, internal flag lost, privileged /
+verified guard); host address set changed (*real*: absorbed without stopping anything, three in a row do not
+latch, a new *global* address is in the policy within seconds and refused to a container); hot `network connect`, foreign container on an agent network, internal flag lost, privileged /
 host-network container, daemon-level `dns` after a restart (*real*); Tailscale late (*real*: nothing starts
 while the targets are not live; running stacks are not stopped when they go away); an ad hoc container on
 the default bridge or an unrelated network, a replica, the exited `migrate`, a service missing a network, a
 changed host resolver (false positives: nothing happens, *real* for the first two); docker unreachable or
 hanging (`unverified`, nothing is changed, systemd's watchdog restarts a hung script); a deploy in progress
-(paused) and a hung one (acts anyway); a latched stack that someone starts by hand (stopped again); flapping.
+(paused) and a hung one (acts anyway); the deploy lock never refused by a running watchdog (*real*); the hostile
+endpoint cut before the first container stops, and a watchdog killed right after the cut (*real*); a release
+that predates containment (*real* `docker compose` render of main's compose); a latched stack that someone starts by hand (stopped again); flapping.
 
 **Rollback of this layer.** The watchdog never edits the host: `systemctl --user disable --now hunter-containment`
 stops the supervised set (dead-man) and the deploy gate then refuses; to go back to the previous behaviour

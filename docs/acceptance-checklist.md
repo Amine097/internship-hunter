@@ -121,6 +121,15 @@ Derived checks (also run in CI against the Docker runner, in report mode, withou
       watchdog (exit 11/13), release committed only after every gate and with the isolation parameters,
       refusal = failed activation (previous release restored and re-committed), `desired: stopped` recorded
       before a teardown
+- [x] **L** re-review fixes (fake daemon + real rootless Docker + real guard in a netns): the watchdog never
+      takes `deploy.lock` (a deploy is never refused by a check cycle; the action lock is held only while ACTING,
+      observed again after taking it, held by a deploy for its whole duration); a host-address change is absorbed
+      (`status` exit 3 -> re-apply and verify, nothing stopped, no flap; a new GLOBAL address is in the policy within
+      seconds and refused to a container); quarantine order latch -> cut -> stop (kill if the endpoint cannot be cut;
+      a watchdog killed after the cut still ends stopped and latched); healthchecks do not wake the loop; a release
+      containment cannot supervise is refused before anything changes, a normal deploy over one that predates it is
+      refused (exit 14) unless `deploy-irreversible`, a failed acknowledged deploy restores nothing and says so, a
+      rollback to such a release is refused before anything is touched
 - [ ] **S** on the production host: `hunter-containment` user unit installed and active (V14), restart
       policies (V15), reboot drill with Tailscale coming up late (V16)
 - [ ] **S** on the production host: V10-V13 incl. V10b/V11b (docs/deployment.md, "DNS") after the guard is

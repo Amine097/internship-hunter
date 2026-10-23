@@ -27,8 +27,11 @@ import fcntl
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -93,6 +96,7 @@ class Rig(Lab):
         for c in ("host-egress-guard.conf", "host-isolation.conf"):
             (self.base / "deploy" / c).chmod(0o644)
         self.lock = self.base / "state" / "deploy.lock"
+        self.action_lock = self.base / "state" / "containment.action.lock"
         self.state_dir = self.base / "state" / "containment"
 
     def wenv(self, **extra):
@@ -395,3 +399,279 @@ def test_the_watchdog_stopping_stops_the_set_and_the_next_instance_brings_it_bac
 
 def test_the_files_are_private(rig):
     assert stat.S_IMODE(rig.state_dir.stat().st_mode) == 0o700
+
+
+# ======== PR #13 re-review: the reported defects, reproduced on a REAL rootless Docker ========
+def wait_for(predicate, timeout, step=0.1):
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if predicate():
+            return time.monotonic() - t0
+        time.sleep(step)
+    return None
+
+
+def try_flock(path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+class Watcher:
+    """`runtime-containment.sh watch` as systemd runs it (minus the unit)."""
+
+    def __init__(self, rig, interval, path_prefix=None):
+        self.rig = rig
+        self.log = open(rig.state_dir.parent / "watch.out", "w")
+        env = {**rig.env(), **rig.wenv()}
+        if path_prefix:
+            env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
+        self.proc = subprocess.Popen(
+            ["bash", str(CONTAINMENT), "watch", "--interval", str(interval)],
+            env=env,
+            stdout=self.log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    def kill(self):
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def stop(self):
+        try:
+            os.killpg(self.proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            self.proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.kill()
+        self.log.close()
+
+    def beats(self, seconds):
+        seen, hb = set(), self.rig.state_dir / "heartbeat"
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                st = hb.stat()
+                seen.add((st.st_ino, st.st_mtime_ns))
+            except OSError:
+                pass
+            time.sleep(0.05)
+        return len(seen)
+
+
+def state_of(rig):
+    try:
+        return rig.state()
+    except OSError:
+        return ""
+
+
+def watching(rig, interval, path_prefix=None):
+    w = Watcher(rig, interval, path_prefix)
+    if wait_for(lambda: state_of(rig).startswith("ok"), 150) is None:
+        w.stop()
+        pytest.fail("the watchdog never reached 'ok' on a healthy stack:\n" + rig.log()[-1500:])
+    return w
+
+
+def health_containers(rig, n=9):
+    names = [f"hc-{i}" for i in range(n)]
+    for name in names:
+        rig.run(
+            ["docker", "run", "-d", "--name", name, "--health-cmd", "true"]
+            + ["--health-interval", "10s", "alpine-local:3.20", "sleep", "600"]
+        )
+    return names
+
+
+def drop(rig, names):
+    rig.run(["docker", "rm", "-f", *names], check=False)
+
+
+# ---- 1. LOCK ----------------------------------------------------------------------------------
+def test_LOCK_a_real_watchdog_beside_nine_healthchecking_containers_never_refuses_a_deploy(rig):
+    """The QA reproduction (533 of 612 `flock -n` attempts refused with no deploy running)."""
+    names = health_containers(rig)
+    w = None
+    try:
+        w = watching(rig, interval=5)
+        time.sleep(12)
+        attempts = refused_deploy = refused_action = 0
+        end = time.monotonic() + 45
+        while time.monotonic() < end:
+            attempts += 1
+            refused_deploy += not try_flock(rig.lock)
+            refused_action += not try_flock(rig.action_lock)
+            time.sleep(0.05)
+        print(f"\nLOCK refused: deploy lock {refused_deploy}/{attempts}, action {refused_action}")
+        assert refused_deploy == 0 and refused_action == 0
+    finally:
+        if w:
+            w.stop()
+        drop(rig, names)
+
+
+def test_QUIET_healthchecks_do_not_wake_the_watchdog(rig):
+    names = health_containers(rig)
+    w = None
+    try:
+        w = watching(rig, interval=300)
+        time.sleep(15)
+        cycles = w.beats(45)
+        print(f"\nQUIET cycles in 45 s (nine 10 s healthchecks, 300 s poll): {cycles}")
+        assert cycles <= 2
+    finally:
+        if w:
+            w.stop()
+        drop(rig, names)
+
+
+# ---- 2. ADDR ----------------------------------------------------------------------------------
+def ip_shim(tmp_path, address):
+    """`ip` that, while <dir>/flag exists, reports ONE more global IPv4 address on the host (what
+    `docker network create` on the host's ROOTFUL daemon does: a new br-* gateway)."""
+    d = tmp_path / "ipshim"
+    d.mkdir(exist_ok=True)
+    flag = d / "flag"
+    real = subprocess.run(["bash", "-c", "command -v ip"], capture_output=True, text=True)
+    (d / "ip").write_text(
+        "#!/bin/sh\n"
+        f'out=$({real.stdout.strip()} "$@"); rc=$?\n'
+        '[ -n "$out" ] && printf \'%s\\n\' "$out"\n'
+        f'if [ -e {flag} ] && [ "$*" = "-4 -o addr show scope global" ]; then\n'
+        f"  echo '99: br-qa    inet {address}/24 brd 255.255.255.255 scope global br-qa'\n"
+        "fi\n"
+        "exit $rc\n"
+    )
+    (d / "ip").chmod(0o755)
+    return d, flag
+
+
+def test_ADDR_new_host_addresses_are_absorbed_three_times_while_the_set_keeps_running(
+    rig, tmp_path
+):
+    d, flag = ip_shim(tmp_path, "172.31.77.1")  # what a rootful docker network create does
+    w = watching(rig, 5, str(d))
+    try:
+        full = len(rig.supervised_running())
+        assert full == len(SUPERVISED)
+        lowest = full
+        for i in range(1, 4):  # the old watchdog latched the stack on the third change
+            flag.write_text("")
+            assert wait_for(lambda: rig.log().count("GUARD-ADDRESS-ABSORBED") >= i, 40), rig.log()
+            lowest = min(lowest, len(rig.supervised_running()))
+            assert (
+                rig.guard("status").returncode == 0
+            )  # the applied policy matches the new address set
+            flag.unlink()
+            time.sleep(2)  # the next cycle sees the address gone: stale again, absorbed again
+        assert lowest == full, f"the set dropped to {lowest}/{full}"
+        assert not rig.latched() and not (rig.state_dir / "flaps").exists()
+    finally:
+        w.stop()
+
+
+def test_ADDR_a_new_GLOBAL_host_address_is_blocked_at_once_without_a_restart(rig, tmp_path):
+    """Protection against newly reachable host destinations is preserved: the address lands in the
+    guard's policy within about a second, and a connection to it is refused, not sent out."""
+    addr = "9.9.9.77"
+    d, flag = ip_shim(tmp_path, addr)
+    w = watching(rig, 5, str(d))
+    try:
+        flag.write_text("")
+
+        def in_policy():
+            return f"-d {addr}/32" in rig.netns("iptables", "-S", "HUNTER-EGRESS-GUARD").stdout
+
+        assert wait_for(in_policy, 40)
+        assert len(rig.supervised_running()) == len(SUPERVISED)
+        t0 = time.monotonic()
+        proxy = f"{rig.project}-egress-codex-1"
+        r = rig.run(["docker", "exec", proxy, "nc", "-z", "-w", "5", addr, "443"], check=False)
+        took = time.monotonic() - t0
+        print(
+            f"\nconnect to the new address: rc={r.returncode} in {took:.1f}s (instant=rejected)"
+        )
+        assert r.returncode != 0 and took < 3
+    finally:
+        w.stop()
+
+
+# ---- 3. ORDER ---------------------------------------------------------------------------------
+def test_ORDER_on_a_real_daemon_the_endpoint_is_cut_before_the_first_container_stops(rig):
+    agent = f"{rig.project}-agent-codex-1"
+    extra = f"{rig.project}_egress"
+    rig.run(["docker", "network", "connect", extra, agent])
+    seen = {"cut": None, "first_stop": None, "latched_at_cut": None}
+    t = threading.Thread(target=rig.once)
+    t0 = time.monotonic()
+    t.start()
+    while t.is_alive() and (seen["cut"] is None or seen["first_stop"] is None):
+        now = time.monotonic() - t0
+        if seen["cut"] is None and extra not in rig.networks_of(agent):
+            seen["cut"] = now
+            seen["latched_at_cut"] = rig.latched()
+        if seen["first_stop"] is None and len(rig.supervised_running()) < len(SUPERVISED):
+            seen["first_stop"] = now
+    t.join(60)
+    print(f"\nORDER endpoint cut at {seen['cut']}, first container gone at {seen['first_stop']}")
+    assert seen["cut"] is not None and seen["first_stop"] is not None
+    assert seen["cut"] <= seen["first_stop"], seen
+    assert seen["latched_at_cut"] is True  # the intent was on disk before the route was cut
+    assert rig.supervised_running() == [] and rig.latched()
+
+
+def test_ORDER_a_watchdog_killed_right_after_the_cut_still_ends_with_everything_stopped(rig):
+    agent = f"{rig.project}-agent-codex-1"
+    extra = f"{rig.project}_egress"
+    w = watching(rig, 300)
+    try:
+        rig.run(["docker", "network", "connect", extra, agent])
+        assert wait_for(lambda: extra not in rig.networks_of(agent), 60, step=0.02) is not None
+        w.kill()  # dies between the cut and the end of the stop
+        assert rig.latched(), "the intent must already be on disk"
+        # the evidence (the extra endpoint) is gone: only the latch makes the next cycle finish
+        rig.once()
+        assert wait_for(lambda: rig.supervised_running() == [], 60) is not None
+        assert rig.latched()
+    finally:
+        w.stop()
+
+
+# ---- 4. FIRST DEPLOY --------------------------------------------------------------------------
+def test_FIRST_DEPLOY_commit_check_on_the_real_compose_files(rig, tmp_path):
+    """The reported reproduction with the REAL docker compose: the compose.yaml of main@a15d5d8
+    (before this PR; every service `unless-stopped`) cannot be put under containment; this can."""
+    old = tmp_path / "pre13"
+    old.mkdir()
+    show = subprocess.run(
+        ["git", "show", "a15d5d8:compose.yaml"], cwd=ROOT, capture_output=True, text=True
+    )
+    if show.returncode != 0:
+        pytest.skip("a15d5d8 is not in this clone")
+    (old / "compose.yaml").write_text(show.stdout)
+    shutil.copytree(ROOT / "docker", old / "docker")
+    shutil.copytree(ROOT / "config", old / "config")
+    args = ["-p", "pre13", "-f", "compose.yaml"]
+    refused = rig.wd("commit", "--check", "--sha", "c" * 40, "--release-dir", str(old), "--", *args)
+    assert refused.returncode == 11, refused.stdout + refused.stderr
+    for svc in ("api", "discovery", "telegram", "agent-codex", "egress-codex"):
+        assert f"{svc} renders restart=unless-stopped" in refused.stderr, svc
+    ok = rig.wd(
+        "commit", "--check", "--sha", "d" * 40, "--release-dir", str(ROOT), "--",
+        "-p", "now", "-f", "compose.yaml",
+    )  # fmt: skip
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    # a check changes nothing: the rig's committed contract is untouched
+    assert json.loads((rig.state_dir / "contract.json").read_text())["release_sha"] == SHA

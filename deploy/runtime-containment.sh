@@ -8,8 +8,9 @@
 #   runtime-containment.sh status [--require-active]   read-only summary (deploy gate, operators)
 #   runtime-containment.sh quarantine --reason R [--no-latch]   stop the supervised set now
 #   runtime-containment.sh reset [--disconnect-foreign]         operator: clear the latch, after checks
-#   runtime-containment.sh commit --sha S --release-dir D [--forbidden L] [--protected-ips L]
-#                         [--rootful L] -- <compose args>       remote-deploy.sh only, under its lock
+#   runtime-containment.sh commit [--check] --sha S --release-dir D [--forbidden L] [--protected-ips L]
+#                         [--rootful L] -- <compose args>       remote-deploy.sh only, under its locks; --check is
+#                                                                a read-only pre-flight (could this release be committed?)
 #   runtime-containment.sh desired running|stopped              remote-deploy.sh only, under its lock
 #
 # WHY. The deploy gate proves isolation at deploy time. Nothing proved it afterwards: the guard
@@ -48,6 +49,15 @@
 #     UNVERIFIED         Docker could not be inspected: nothing is certified
 #   WARNING (logged, shown by `status`, nothing is stopped; a deploy re-baselines it):
 #     RESOLVER           the daemon's upstream resolver list (the host's resolver) changed since the deploy
+#
+# ORDER of a quarantine: latch (the durable intent), cut the unauthorised endpoint, stop. Cutting is instant,
+# stopping is not; and the latch first means a watchdog that dies half way cannot fail open. A guard whose only
+# defect is the SET OF HOST ADDRESSES it names (`host-egress-guard.sh status` exit 3: a rootful Docker bridge came
+# or went) is re-applied and verified FIRST - about a second, quicker than a stop - and the set is stopped only if
+# that does not hold; an absorbed drift is not a flap.
+# LOCKS: deploy.lock is remote-deploy.sh's alone; this script takes state/containment.action.lock, without
+# waiting, only when a cycle has something to CHANGE, and observes again after taking it; remote-deploy.sh holds
+# it for a whole deploy. A healthy cycle takes no lock.
 #
 # FAIL CLOSED. Stopping is never conditional on being sure of the cause; starting always is.
 # `docker stop` only: containers are never removed, so evidence survives. Endpoints that should not
